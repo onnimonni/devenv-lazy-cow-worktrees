@@ -1493,12 +1493,13 @@ impl Daemon {
         out
     }
 
-    /// Start the service serving `host` (exactly, else the closest parent host) and
-    /// its dependencies if nothing listens there.
+    /// Start the service serving `host` (exactly, else the closest parent host; a
+    /// secondary port's host starts its owner) and its dependencies if nothing listens
+    /// there.
     async fn ensure_server(&self, host: &str) -> Result<()> {
-        let mut best: Option<(usize, Arc<ProjectRt>, Checkout, String)> = None;
+        let mut best: Option<(usize, Arc<ProjectRt>, Checkout, String, u16)> = None;
         for (rt, c) in self.checkouts() {
-            for (svc, h, _) in c.routes() {
+            for (svc, h, port) in c.routes() {
                 let Some(svc) = svc else { continue };
                 let score = if h == host {
                     usize::MAX
@@ -1508,14 +1509,14 @@ impl Daemon {
                     continue;
                 };
                 if best.as_ref().is_none_or(|b| score > b.0) {
-                    best = Some((score, rt.clone(), c.clone(), svc));
+                    best = Some((score, rt.clone(), c.clone(), svc, port));
                 }
             }
         }
         match best {
-            Some((_, rt, c, svc)) => {
+            Some((_, rt, c, svc, port)) => {
                 self.servers
-                    .ensure(&rt.project, &c, &svc, &self.global)
+                    .ensure_port(&rt.project, &c, &svc, port, &self.global)
                     .await
             }
             None => Ok(()),
@@ -2226,11 +2227,13 @@ async fn lead(global: Global, project: Option<Project>, listener: UnixListener) 
     let ensure: proxy::Ensure = Arc::new(move |host| {
         let weak = weak.clone();
         Box::pin(async move {
-            if let Some(d) = weak.upgrade()
-                && let Err(e) = d.ensure_server(&host).await
-            {
+            let Some(d) = weak.upgrade() else {
+                return Ok(());
+            };
+            d.ensure_server(&host).await.map_err(|e| {
                 warn!("{host}: {e:#}");
-            }
+                format!("{e:#}")
+            })
         })
     });
     let weak = Arc::downgrade(&d);

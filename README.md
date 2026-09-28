@@ -193,9 +193,38 @@ Service options:
 | `env` | `{}` | extra environment |
 | `restart` | `"no"` | when it exits on its own: `"no"`, `"on-failure"` (non-zero exit) or `"always"`; backs off 1–30 s, `localforest service stop` keeps it down |
 | `restartOnPull` | `false` | restart it (if running) after the base branch was pulled into its checkout and migrated; for servers without a code reloader |
+| `ports.<name>` | `{}` | further ports it listens on; see below |
 
 Commands are split like a shell would, then run directly (no shell) with the
 service's environment and the project's `PATH`. Logs: `localforest service log -s <name>`.
+
+Named ports, for a service that listens on more than `$PORT` (a debugger, a test
+endpoint), so the app reads a variable instead of computing an offset:
+
+```nix
+localforest.services.web = {
+  exec = "mix phx.server";
+  ports = {
+    debugger = { env = "LIVE_DEBUGGER_PORT"; http = true; };  # https://[<worktree>.]debugger.<project>.localhost
+    test.env = "TEST_PORT";                                   # no hostname
+  };
+};
+```
+
+| | default | |
+|---|---|---|
+| `env` | `<NAME>_PORT` | variable with the port, in every environment of the checkout (plus `LOCALFOREST_<SERVICE>_<NAME>_PORT`, and `_URL` with `http`) |
+| `http` | `false` | gets `https://[<worktree>.]<name>.<project>.localhost`; its first request starts the service and waits for this port |
+| `offset` | highest free | port = checkout base port + offset (0–9) |
+
+They share the checkout's 10-port block with the services: services keep their
+offsets, the rest are filled from the top down (9, 8, …) by service and port name.
+With only `web` on base 4000: web 4000, debugger 4009, test 4008. Adding a port or
+service can shift the others, so give `offset` to any port whose number is written
+down anywhere instead of read from its variable. `env` may not name a variable
+localforest sets (`PORT`, `DATABASE_URL`, `PG*`, `REDIS_URL`, `PHX_HOST`, …,
+`LOCALFOREST_*`). An `http` port's first request waits 5 s for it once the service's
+main port listens, then answers 502.
 
 ## Environment
 
@@ -211,6 +240,7 @@ needed), e.g. for services `web` (default), `api` and
 | `TEST_DATABASE_URL` | `myapp_test` | `myapp_test_fix_login` |
 | `REDIS_URL` | password `myapp` | password `myapp--fix-login` |
 | `LOCALFOREST_<SERVICE>_URL`, `_PORT` | every service's | every service's |
+| named ports' `env`, `LOCALFOREST_<SERVICE>_<NAME>_PORT`, `_URL` | every service's | every service's |
 | `LOCALFOREST_SERVICE`, `LOCALFOREST_WORKTREE`, `LOCALFOREST_PROJECT` | | |
 | `NODE_EXTRA_CA_CERTS` | the local CA | |
 
