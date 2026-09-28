@@ -595,6 +595,7 @@ impl Daemon {
                     head,
                     history::Reason::Deleted,
                     None,
+                    Vec::new(),
                 );
             }
         }
@@ -606,8 +607,9 @@ impl Daemon {
         }
         Ok(())
     }
-
-    /// Record a removed worktree in the main checkout's history.
+    /// Record a removed worktree in the main checkout's history; `lost`: gitignored
+    /// files deleted with it.
+    #[allow(clippy::too_many_arguments)]
     fn remember(
         &self,
         rt: &ProjectRt,
@@ -616,6 +618,7 @@ impl Daemon {
         head: Option<String>,
         reason: history::Reason,
         pr: Option<u64>,
+        lost: Vec<String>,
     ) {
         let rec = history::Removed {
             branch,
@@ -624,12 +627,14 @@ impl Daemon {
             reason,
             pr,
             preview_closed: None,
+            lost: lost.clone(),
         };
         if let Err(e) = history::History::update(&rt.project.root, |h| {
             // A closed preview keeps why it was gone in the first place.
             let rec = match h.previews.remove(name) {
                 Some(p) => history::Removed {
                     preview_closed: Some(history::now()),
+                    lost,
                     ..p.original
                 },
                 None => rec,
@@ -866,7 +871,7 @@ impl Daemon {
         }
     }
 
-    async fn remove_worktree(&self, req: RemoveReq) -> Result<()> {
+    async fn remove_worktree(&self, req: RemoveReq) -> Result<Vec<String>> {
         let rt = self.project(&req.root)?;
         let _g = rt.lock.lock().await;
         let root = rt.project.root.clone();
@@ -937,6 +942,7 @@ impl Daemon {
         Ok(Some(number))
     }
 
+    /// Ok(warnings about what the removal deleted, for the caller).
     async fn remove_locked(
         &self,
         rt: &ProjectRt,
@@ -944,11 +950,28 @@ impl Daemon {
         keep: &[i32],
         reason: history::Reason,
         pr: Option<u64>,
-    ) -> Result<()> {
+    ) -> Result<Vec<String>> {
         let head = Repository::open(&info.path)
             .ok()
             .and_then(|r| r.head().ok()?.target())
             .map(|o| o.to_string());
+        let (root, path) = (rt.project.root.clone(), info.path.clone());
+        let lost = tokio::task::spawn_blocking(move || worktree::ignored_files(&root, &path))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
+        let mut warnings = Vec::new();
+        if !lost.is_empty() {
+            let w = format!(
+                "{}: deleting gitignored {}{}",
+                info.name,
+                lost.iter().take(20).cloned().collect::<Vec<_>>().join(", "),
+                if lost.len() > 20 { ", …" } else { "" }
+            );
+            warn!("{w}");
+            warnings.push(w);
+        }
         let c = rt.project.checkout(Some(&info.name), info.path.clone());
         self.servers.stop_checkout(&c).await;
         // Whatever else runs there: a server started by hand, iex, watchers.
@@ -957,9 +980,9 @@ impl Daemon {
         rt.known.lock().unwrap().remove(&info.name);
         let (root, i) = (rt.project.root.clone(), info.clone());
         tokio::task::spawn_blocking(move || worktree::remove_files(&root, &i)).await??;
-        self.remember(rt, &info.name, info.branch.clone(), head, reason, pr);
+        self.remember(rt, &info.name, info.branch.clone(), head, reason, pr, lost);
         info!("removed worktree {}", info.name);
-        Ok(())
+        Ok(warnings)
     }
 
     /// Remove every worktree whose branch's PR merged with nothing left unmerged
@@ -1531,8 +1554,8 @@ fn api(d: Arc<Daemon>) -> Router {
         .route(
             "/worktrees/remove",
             post(|State(d): State<Arc<Daemon>>, Json(r): Json<RemoveReq>| async move {
-                d.remove_worktree(r).await?;
-                ApiResult::Ok(Json(serde_json::json!({})))
+                let warnings = d.remove_worktree(r).await?;
+                ApiResult::Ok(Json(serde_json::json!({ "warnings": warnings })))
             }),
         )
         .route(
@@ -1744,6 +1767,12 @@ fn gone_page(
     let mut error = error
         .map(|m| format!("<p class=\"error\">Recreating failed: {}</p>", e(m)))
         .unwrap_or_default();
+    if !rec.lost.is_empty() {
+        error = format!(
+            "<p class=\"muted\">Deleted with it (gitignored): {}</p>{error}",
+            e(&rec.lost.join(", "))
+        );
+    }
     if let Some(at) = rec.preview_closed {
         error = format!(
             "<p class=\"muted\">A preview of it was closed {} for inactivity.</p>{error}",

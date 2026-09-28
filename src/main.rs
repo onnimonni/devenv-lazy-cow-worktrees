@@ -184,7 +184,7 @@ async fn create(root: PathBuf, name: String, base: Option<String>) -> Result<dae
 
 async fn remove(root: PathBuf, name: String, force: bool) -> Result<()> {
     let keep = vec![std::process::id() as i32, unsafe { libc::getppid() }];
-    client::post::<Value>(
+    let r: Value = client::post(
         "/worktrees/remove",
         &daemon::RemoveReq {
             root,
@@ -194,6 +194,9 @@ async fn remove(root: PathBuf, name: String, force: bool) -> Result<()> {
         },
     )
     .await?;
+    for w in r["warnings"].as_array().into_iter().flatten() {
+        eprintln!("warning: {}", w.as_str().unwrap_or_default());
+    }
     Ok(())
 }
 

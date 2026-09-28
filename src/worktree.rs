@@ -533,6 +533,106 @@ pub fn is_dirty(path: &Path) -> Result<bool> {
         .any(|e| e.status() != Status::CURRENT))
 }
 
+/// Rebuilt or regenerated on their own: never reported as lost.
+const REBUILDABLE: &[&str] = &[
+    "_build",
+    "deps",
+    "node_modules",
+    "target",
+    ".git",
+    ".devenv",
+    ".direnv",
+    ".venv",
+    "venv",
+];
+
+/// Gitignored paths in the worktree at `path` that removal would delete for good:
+/// not build caches or per-checkout indexes, and not copies of the primary checkout
+/// at `root` (same file contents; directories with the same files and sizes).
+/// Sockets and fifos are skipped.
+pub fn ignored_files(root: &Path, path: &Path) -> Result<Vec<String>> {
+    let repo = Repository::open(path)?;
+    let mut opts = StatusOptions::new();
+    opts.include_untracked(false)
+        .include_ignored(true)
+        .recurse_ignored_dirs(false)
+        .exclude_submodules(true);
+    Ok(repo
+        .statuses(Some(&mut opts))?
+        .iter()
+        .filter(|e| e.status().contains(Status::IGNORED))
+        .filter_map(|e| e.path().ok().map(str::to_string))
+        .filter(|p| {
+            let top = p.split('/').next().unwrap_or_default();
+            let rel = p.trim_end_matches('/');
+            !REBUILDABLE.contains(&top)
+                && !PER_CHECKOUT.contains(&top)
+                && !is_copy(&path.join(rel), &root.join(rel)).unwrap_or(false)
+        })
+        .collect())
+}
+
+/// Ok(true): `a` is the same as `b` (or not a file worth reporting: a socket, fifo).
+fn is_copy(a: &Path, b: &Path) -> Result<bool> {
+    let ma = std::fs::symlink_metadata(a)?;
+    let kind = ma.file_type();
+    if !(kind.is_file() || kind.is_dir() || kind.is_symlink()) {
+        return Ok(true);
+    }
+    let Ok(mb) = std::fs::symlink_metadata(b) else {
+        return Ok(false);
+    };
+    if kind.is_symlink() {
+        return Ok(mb.file_type().is_symlink() && std::fs::read_link(a)? == std::fs::read_link(b)?);
+    }
+    if kind.is_dir() {
+        return Ok(mb.is_dir() && tree_sizes(a)? == tree_sizes(b)?);
+    }
+    if !mb.is_file() || ma.len() != mb.len() {
+        return Ok(false);
+    }
+    if ma.modified()? == mb.modified()? {
+        // Cloned or copied with its mtime: git-cow, copy_tree.
+        return Ok(true);
+    }
+    same_bytes(a, b)
+}
+
+/// Every regular file under `dir` (relative path, size), sorted.
+fn tree_sizes(dir: &Path) -> Result<Vec<(PathBuf, u64)>> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d)?.flatten() {
+            let meta = entry.metadata()?;
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else if meta.is_file() {
+                let rel = entry.path().strip_prefix(dir)?.to_path_buf();
+                out.push((rel, meta.len()));
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn same_bytes(a: &Path, b: &Path) -> Result<bool> {
+    use std::io::Read;
+    let (mut fa, mut fb) = (std::fs::File::open(a)?, std::fs::File::open(b)?);
+    let (mut ba, mut bb) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
+    loop {
+        let n = fa.read(&mut ba)?;
+        if n == 0 {
+            return Ok(fb.read(&mut bb)? == 0);
+        }
+        fb.read_exact(&mut bb[..n])?;
+        if ba[..n] != bb[..n] {
+            return Ok(false);
+        }
+    }
+}
+
 pub enum Safety {
     /// Nothing can be lost.
     Safe,
@@ -1091,6 +1191,35 @@ mod tests {
         repo.reference("refs/remotes/origin/feat-x", head, true, "push")
             .unwrap();
         assert_eq!(unpushed(&info, "origin", "main").unwrap(), 0);
+    }
+
+    #[test]
+    fn lists_ignored_files_only_the_worktree_has() {
+        let (_d, project, syncer) = fixture();
+        let path = create(&project, &syncer, "feat-x", None).unwrap();
+        // Carried from the primary (cache/), build caches: quiet.
+        std::fs::create_dir(path.join("node_modules")).unwrap();
+        std::fs::write(path.join("node_modules/x"), "").unwrap();
+        let exclude = project.root.join(".git/info/exclude");
+        std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        std::fs::write(&exclude, "*.local\n.env\n").unwrap();
+        std::fs::write(project.root.join("same.local"), "x\n").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(path.join("same.local"), "x\n").unwrap();
+        let fifo = CString::new(path.join("pipe.local").as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+        assert_eq!(
+            ignored_files(&project.root, &path).unwrap(),
+            Vec::<String>::new()
+        );
+        // Own files, edited copies, a carried dir with more in it, .env: reported.
+        std::fs::write(path.join("secrets.local"), "mine\n").unwrap();
+        std::fs::write(path.join("same.local"), "edit\n").unwrap();
+        std::fs::write(path.join("cache/notes"), "mine\n").unwrap();
+        std::fs::write(path.join(".env"), "KEY=1\n").unwrap();
+        let mut files = ignored_files(&project.root, &path).unwrap();
+        files.sort();
+        assert_eq!(files, vec![".env", "cache/", "same.local", "secrets.local"]);
     }
 
     #[test]

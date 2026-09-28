@@ -35,6 +35,9 @@ pub struct Removed {
     /// Recreated as a preview since, and closed again (unix seconds).
     #[serde(default)]
     pub preview_closed: Option<u64>,
+    /// Gitignored files deleted with it (not build caches or copies of the primary's).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lost: Vec<String>,
 }
 
 /// A worktree recreated from `removed` to preview its branch.
@@ -238,6 +241,7 @@ mod tests {
             reason: Reason::Merged,
             pr: Some(7),
             preview_closed: None,
+            lost: vec!["notes.local".into()],
         };
         History::update(dir.path(), |h| {
             h.removed.insert("fix".into(), rec.clone());
