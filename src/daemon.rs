@@ -920,7 +920,12 @@ impl Daemon {
                 Ok(!worktree::is_dirty(&i.path)?
                     && worktree::covered_by_pr(&i, pr_head, &remote, &base)?)
             })
-            .await??;
+            .await?;
+            // One unreadable worktree (a shallow clone's missing parent) keeps only itself.
+            let ok = ok.unwrap_or_else(|e| {
+                warn!("{branch}: checking {} against #{number}: {e:#}", info.name);
+                false
+            });
             if !ok {
                 info!("{branch}: #{number} merged, but the worktree has newer work; keeping it");
                 continue;
