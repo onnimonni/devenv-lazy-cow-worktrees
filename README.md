@@ -316,8 +316,9 @@ these differences:
   or on NixOS `boot.kernel.sysctl."net.ipv4.ip_unprivileged_port_start" = 80;`.
   (`setcap cap_net_bind_service` doesn't survive a read-only Nix store or rebuilds.)
 - **No RAM disk:** PostgreSQL lives in `~/.local/state/localforest/pg`. Databases
-  are still cloned copy-on-write on btrfs / XFS (reflinks), plain copies elsewhere;
-  git-cow clones worktrees the same way.
+  and worktrees are cloned copy-on-write on btrfs / XFS (reflinks). On ext4 and
+  other filesystems without them, worktrees are regular checkouts and localforest
+  copies the build caches in (mtimes kept); databases are plain copies.
 - **CA:** `localforest trust` is macOS only; add `~/.local/state/localforest/ca/ca.pem`
   to the system (`sudo cp … /usr/local/share/ca-certificates/localforest.crt &&
   sudo update-ca-certificates`) and the browser's store (`certutil -d sql:$HOME/.pki/nssdb

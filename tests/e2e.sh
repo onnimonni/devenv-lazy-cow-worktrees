@@ -39,7 +39,7 @@ daemon=
 cleanup() {
   status=$?
   "$bin" down --eject >/dev/null 2>&1 || true
-  [[ -n $daemon ]] && kill "$daemon" 2>/dev/null
+  [[ -n $daemon ]] && kill "$daemon" 2>/dev/null || true
   if ((status)); then
     echo "--- daemon log" >&2
     sed 's/\x1b\[[0-9;]*m//g' "$work/daemon.log" >&2 || true

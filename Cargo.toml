@@ -45,6 +45,8 @@ tokio-rustls = "0.26"
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+reflink-copy = "0.1"
+filetime = "0.2"
 
 [dev-dependencies]
 tempfile = "3.27.0"

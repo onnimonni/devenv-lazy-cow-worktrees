@@ -198,7 +198,7 @@ fn populate(root: &Path, path: &Path, name: &str) -> Result<()> {
         settle: false,
     };
     match git_cow::populate(path, &opts) {
-        Ok(r) => {
+        Ok(r) if r.cloned > 0 => {
             for w in &r.warnings {
                 warn!("git-cow: {w}");
             }
@@ -209,10 +209,13 @@ fn populate(root: &Path, path: &Path, name: &str) -> Result<()> {
                 git_cow::join_paths(&r.carried)
             );
         }
+        // A regular checkout (no copy-on-write here): the caches are ours to bring.
+        Ok(_) => copy_caches(root, path, name)?,
         Err(e) => {
             warn!("git-cow: {e:#}; falling back to a regular checkout");
             let wt = Repository::open(path)?;
             wt.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))?;
+            copy_caches(root, path, name)?;
         }
     }
     for dir in PER_CHECKOUT {
@@ -223,6 +226,78 @@ fn populate(root: &Path, path: &Path, name: &str) -> Result<()> {
     }
     // Never again for this worktree (its git admin dir goes away with it).
     std::fs::write(populated_marker(path)?, "")?;
+    Ok(())
+}
+
+/// Top-level gitignored directories of the primary checkout (build caches) that
+/// `dest` lacks; with a `.worktreeinclude`, only the ones it names.
+fn missing_caches(root: &Path, dest: &Path) -> Result<Vec<String>> {
+    let primary = Repository::open(root)?;
+    let include = worktree_include(root);
+    let mut missing = Vec::new();
+    for entry in std::fs::read_dir(root)?.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !entry.file_type().is_ok_and(|t| t.is_dir())
+            || include
+                .as_ref()
+                .is_some_and(|inc| !inc.contains(name_str.as_ref()))
+            || NOT_CACHES.contains(&name_str.as_ref())
+            || dest.join(&name).exists()
+            || !primary.status_should_ignore(Path::new(&name)).unwrap_or(false)
+            // Nested worktrees (.claude/worktrees) and other repositories.
+            || entry.path().join(".git").exists()
+            || dest.starts_with(entry.path())
+        {
+            continue;
+        }
+        missing.push(name_str.into_owned());
+    }
+    Ok(missing)
+}
+
+/// Copy a directory tree: reflinks where the filesystem has them, else bytes; keeps
+/// modes, mtimes (build tools compare them) and symlinks.
+fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)?.flatten() {
+        let (from, to) = (entry.path(), dst.join(entry.file_name()));
+        let meta = std::fs::symlink_metadata(&from)?;
+        let kind = meta.file_type();
+        if kind.is_symlink() {
+            std::os::unix::fs::symlink(std::fs::read_link(&from)?, &to)?;
+        } else if kind.is_dir() {
+            copy_tree(&from, &to)?;
+        } else if kind.is_file() {
+            reflink_copy::reflink_or_copy(&from, &to)?;
+            std::fs::set_permissions(&to, meta.permissions())?;
+        } else {
+            // Sockets, fifos: live state, never cache.
+            continue;
+        }
+        if !kind.is_symlink() {
+            filetime::set_file_mtime(&to, filetime::FileTime::from_last_modification_time(&meta))?;
+        }
+    }
+    Ok(())
+}
+
+/// git-cow couldn't clone (no copy-on-write on this filesystem, e.g. ext4): copy the
+/// build caches ourselves, so the worktree still needs no fresh install/compile.
+fn copy_caches(root: &Path, path: &Path, name: &str) -> Result<()> {
+    let missing = missing_caches(root, path)?;
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let t = std::time::Instant::now();
+    for dir in &missing {
+        copy_tree(&root.join(dir), &path.join(dir))?;
+    }
+    info!(
+        "worktree {name}: no copy-on-write clone here; copied {} in {:?}",
+        missing.join(", "),
+        t.elapsed()
+    );
     Ok(())
 }
 
@@ -382,28 +457,7 @@ pub fn carry_caches(root: &Path, info: &Info) -> Result<bool> {
     if populated_marker(&info.path)?.exists() {
         return Ok(false);
     }
-    let primary = Repository::open(root)?;
-    let include = worktree_include(root);
-    let mut missing = Vec::new();
-    for entry in std::fs::read_dir(root)?.flatten() {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        // Caches are directories; with a .worktreeinclude, only the ones it names.
-        if !entry.file_type().is_ok_and(|t| t.is_dir())
-            || include
-                .as_ref()
-                .is_some_and(|inc| !inc.contains(name_str.as_ref()))
-            || NOT_CACHES.contains(&name_str.as_ref())
-            || info.path.join(&name).exists()
-            || !primary.status_should_ignore(Path::new(&name)).unwrap_or(false)
-            // Nested worktrees (.claude/worktrees) and other repositories.
-            || entry.path().join(".git").exists()
-            || info.path.starts_with(entry.path())
-        {
-            continue;
-        }
-        missing.push(name_str.into_owned());
-    }
+    let missing = missing_caches(root, &info.path)?;
     if missing.is_empty() {
         return Ok(false);
     }
@@ -817,6 +871,38 @@ mod tests {
         assert!(repo.find_branch("feat-x", BranchType::Local).is_err());
         // Can be created again.
         create(&project, &syncer, "feat-x", None).unwrap();
+    }
+
+    #[test]
+    fn copies_trees_keeping_mtimes_modes_and_links() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = TempDir::new().unwrap();
+        let src = d.path().join("src");
+        std::fs::create_dir_all(src.join("lib")).unwrap();
+        std::fs::write(src.join("lib/a.beam"), "beam").unwrap();
+        std::fs::write(src.join("run"), "#!/bin/sh").unwrap();
+        std::fs::set_permissions(src.join("run"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink("lib/a.beam", src.join("link")).unwrap();
+        let old = filetime::FileTime::from_unix_time(1_600_000_000, 0);
+        filetime::set_file_mtime(src.join("lib/a.beam"), old).unwrap();
+
+        let dst = d.path().join("dst");
+        copy_tree(&src, &dst).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dst.join("lib/a.beam")).unwrap(),
+            "beam"
+        );
+        let meta = std::fs::metadata(dst.join("lib/a.beam")).unwrap();
+        assert_eq!(filetime::FileTime::from_last_modification_time(&meta), old);
+        let mode = std::fs::metadata(dst.join("run"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755);
+        assert_eq!(
+            std::fs::read_link(dst.join("link")).unwrap(),
+            Path::new("lib/a.beam")
+        );
     }
 
     #[test]
