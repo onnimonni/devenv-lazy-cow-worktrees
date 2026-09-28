@@ -747,7 +747,8 @@ impl Daemon {
             };
             c.map(|c| (rt, c))
         });
-        let create_dev = pg_access(user, found.as_ref().map(|(_, c)| c), db)?;
+        let others = self.all_checkouts();
+        let create_dev = pg_access(user, found.as_ref().map(|(_, c)| c), db, &others)?;
         if let Some((rt, c)) = found {
             self.activity.touch(&c.id());
             if create_dev {
@@ -755,6 +756,11 @@ impl Daemon {
             }
         }
         Ok(())
+    }
+
+    /// Every registered checkout, without their runtimes.
+    fn all_checkouts(&self) -> Vec<Checkout> {
+        self.checkouts().into_iter().map(|(_, o)| o).collect()
     }
 
     /// Kill the checkout's services and redis-server, drop its routes, databases and role.
@@ -768,11 +774,24 @@ impl Daemon {
             rt.migrate_failures.lock().unwrap().remove(&c.id());
             rt.migrating.lock().unwrap().remove(&c.id());
         }
+        // Only what's unambiguously its own: its name (no registered checkout has an
+        // equal or closer claim) and made by its role, so a database another checkout
+        // (unregistered, failed to provision) could claim by name survives.
+        let others = self.all_checkouts();
         for db in self.pg.databases().await? {
-            if c.owns_db(&db) {
-                self.pg.drop(&db).await?;
-                info!("dropped database {db}");
+            if !c.owns_db(&db) {
+                continue;
             }
+            if !config::db_owner(&db, others.iter().chain([c])).is_some_and(|o| o.same(c)) {
+                warn!("{db}: another checkout claims it too; left in place");
+                continue;
+            }
+            if self.pg.owner(&db).await?.as_deref() != Some(&c.id()) {
+                warn!("{db}: not made by {}; left in place", c.id());
+                continue;
+            }
+            self.pg.drop(&db).await?;
+            info!("dropped database {db}");
         }
         self.pg.drop_role(&c.id()).await?;
         Ok(())
@@ -2356,7 +2375,7 @@ fn dashboard(d: &Daemon) -> String {
 /// checkout whose role `user` is: Err refuses, Ok(true) lets a worktree through to its
 /// dev database (created first if missing), Ok(false) lets it through as is. Fails
 /// closed: users that are no registered checkout's role never reach the server.
-fn pg_access(user: &str, c: Option<&Checkout>, db: &str) -> Result<bool> {
+fn pg_access(user: &str, c: Option<&Checkout>, db: &str, others: &[Checkout]) -> Result<bool> {
     if user == "postgres" {
         anyhow::bail!(
             "connect as your checkout's role (PGUSER in `localforest env`), not postgres"
@@ -2370,10 +2389,24 @@ fn pg_access(user: &str, c: Option<&Checkout>, db: &str) -> Result<bool> {
     if db == "postgres" || db == "template1" {
         return Ok(false);
     }
-    if !c.owns_db(db) {
+    // Only what it owns by name with no equal or closer claim from another checkout
+    // (`config::db_owner`).
+    if !config::db_owner(db, others.iter().chain([c])).is_some_and(|o| o.same(c)) {
+        if c.owns_db(db) {
+            let rivals: Vec<String> = others
+                .iter()
+                .filter(|o| !o.same(c) && o.owns_db(db))
+                .map(Checkout::id)
+                .collect();
+            anyhow::bail!(
+                "{db} is also the name of {}'s database; rename the worktree to use it",
+                rivals.join(", ")
+            );
+        }
         anyhow::bail!(
-            "{user} may only open its own databases ({}, {}), not {db}",
+            "{user} may only open its own databases ({}, {}, MIX_TEST_PARTITION's {}<N>), not {db}",
             c.dev_db(),
+            c.test_db(),
             c.test_db()
         );
     }
@@ -2614,17 +2647,39 @@ mod tests {
         let wt = co(Some("wt"));
         // Not a registered checkout's role: refused, whatever the database.
         for db in ["postgres", "demo_dev", "anything"] {
-            let e = pg_access("stranger", None, db).unwrap_err();
+            let e = pg_access("stranger", None, db, &[]).unwrap_err();
             assert!(e.to_string().contains("not the role of a checkout"), "{e}");
         }
-        assert!(pg_access("postgres", None, "postgres").is_err());
-        assert!(pg_access("postgres", Some(&co(None)), "postgres").is_err());
+        assert!(pg_access("postgres", None, "postgres", &[]).is_err());
+        assert!(pg_access("postgres", Some(&co(None)), "postgres", &[]).is_err());
         // Registered: maintenance and own databases, the worktree's dev one created.
-        assert!(!pg_access("demo-wt", Some(&wt), "postgres").unwrap());
-        assert!(!pg_access("demo-wt", Some(&wt), "template1").unwrap());
-        assert!(pg_access("demo-wt", Some(&wt), "demo_dev_wt").unwrap());
-        assert!(!pg_access("demo-wt", Some(&wt), "demo_test_wt").unwrap());
-        assert!(!pg_access("demo", Some(&co(None)), "demo_dev").unwrap());
-        assert!(pg_access("demo-wt", Some(&wt), "demo_dev").is_err());
+        assert!(!pg_access("demo--wt", Some(&wt), "postgres", &[]).unwrap());
+        assert!(!pg_access("demo--wt", Some(&wt), "template1", &[]).unwrap());
+        assert!(pg_access("demo--wt", Some(&wt), "demo_dev_wt", &[]).unwrap());
+        assert!(!pg_access("demo--wt", Some(&wt), "demo_test_wt", &[]).unwrap());
+        assert!(!pg_access("demo", Some(&co(None)), "demo_dev", &[]).unwrap());
+        assert!(pg_access("demo--wt", Some(&wt), "demo_dev", &[]).is_err());
+        // Partitions: a registered worktree's own name wins; others (and itself) listed.
+        let (x, x2) = (co(Some("x")), co(Some("x2")));
+        let all = [x.clone(), x2.clone()];
+        assert!(pg_access("demo--x", Some(&x), "demo_test_x3", &all).is_ok());
+        let e = pg_access("demo--x", Some(&x), "demo_test_x2", &all).unwrap_err();
+        assert!(e.to_string().contains("demo--x2"), "{e}");
+        assert!(pg_access("demo--x2", Some(&x2), "demo_test_x2", &all).is_ok());
+        // Cross-project tie: nobody may open it.
+        let a = Checkout {
+            project: "shop".into(),
+            db_prefix: "shop".into(),
+            ..co(Some("dev-x"))
+        };
+        let b = Checkout {
+            project: "shop-dev".into(),
+            db_prefix: "shop_dev".into(),
+            ..co(Some("x"))
+        };
+        assert_eq!(a.dev_db(), b.dev_db());
+        let both = [a.clone(), b.clone()];
+        assert!(pg_access("shop-dev-x", Some(&a), "shop_dev_dev_x", &both).is_err());
+        assert!(pg_access("shop-dev-x", Some(&b), "shop_dev_dev_x", &both).is_err());
     }
 }

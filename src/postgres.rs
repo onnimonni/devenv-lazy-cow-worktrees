@@ -209,6 +209,19 @@ impl Postgres {
         Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 
+    /// Owner of `db`, None if it doesn't exist.
+    pub async fn owner(&self, db: &str) -> Result<Option<String>> {
+        Ok(self
+            .admin()
+            .await?
+            .query_opt(
+                "SELECT pg_get_userbyid(datdba)::text FROM pg_database WHERE datname = $1",
+                &[&db],
+            )
+            .await?
+            .map(|r| r.get(0)))
+    }
+
     pub async fn exists(&self, db: &str) -> Result<bool> {
         Ok(self
             .admin()

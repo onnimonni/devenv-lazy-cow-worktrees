@@ -263,7 +263,15 @@ base port.
 
 Point your apps at `DATABASE_URL` / `REDIS_URL` (Ecto: `url: System.fetch_env!("DATABASE_URL")`).
 Test databases (and `MIX_TEST_PARTITION` ones) are the app's to create (`mix ecto.create`
-works through the proxy); only the dev database is cloned from the template.
+works through the proxy); only the dev database is cloned from the template. A checkout
+owns its dev and test databases and partitions named `<test db><N>` (Ecto's usual
+`System.get_env("TEST_DATABASE_URL") <> System.get_env("MIX_TEST_PARTITION", "")`:
+`myapp_test_fix_login2`) or `<prefix>_test<N>_<worktree>` (`myapp_test2_fix_login`).
+`<test db><N>` is ambiguous when a worktree is named like another plus digits (`x2`
+vs `x` + 2): the exact name, then the longest test database, wins among existing
+checkouts. An equal claim (project `shop` worktree `dev-x` and project `shop-dev`
+worktree `x` both get `shop_dev_dev_x`) is nobody's: refused, never dropped. Removing
+a checkout drops only databases its role created.
 
 All services of a checkout share its `DATABASE_URL` and `REDIS_URL` for now
 (FIXME: databases and redis-servers per service).
