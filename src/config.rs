@@ -210,29 +210,35 @@ pub fn ca_cert_path() -> PathBuf {
 /// Per-machine random secret that checkout passwords derive from, created on first
 /// use (0600), so `localforest env` and the daemon agree without talking.
 pub fn secret() -> Result<Vec<u8>> {
+    secret_in(&home())
+}
+
+fn secret_in(dir: &Path) -> Result<Vec<u8>> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    let path = home().join("secret");
+    let path = dir.join("secret");
     if let Ok(s) = std::fs::read(&path)
         && s.len() >= 32
     {
         return Ok(s);
     }
-    std::fs::create_dir_all(home())?;
+    std::fs::create_dir_all(dir)?;
     let mut s = vec![0u8; 32];
     std::fs::File::open("/dev/urandom")
         .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut s))
         .context("reading /dev/urandom")?;
-    match std::fs::OpenOptions::new()
+    // Written in full, then linked into place: a racing reader never sees it partial.
+    let tmp = dir.join(format!("secret.{}.tmp", hex::encode(&s[..8])));
+    std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(&path)
-    {
-        Ok(mut f) => {
-            f.write_all(&s)?;
-            Ok(s)
-        }
+        .open(&tmp)?
+        .write_all(&s)?;
+    let linked = std::fs::hard_link(&tmp, &path);
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => Ok(s),
         // Another process won the race.
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(std::fs::read(&path)?),
         Err(e) => Err(e.into()),
@@ -863,6 +869,21 @@ mod tests {
         assert_eq!(co(None).test_db(), "my_app_test");
         let p = worktree_port("a", "b");
         assert!((20000..29000).contains(&p) && p.is_multiple_of(10));
+    }
+
+    #[test]
+    fn secret_created_once_under_races() {
+        for _ in 0..20 {
+            let dir = tempfile::TempDir::new().unwrap();
+            let secrets: Vec<Vec<u8>> = std::thread::scope(|sc| {
+                let hs: Vec<_> = (0..8)
+                    .map(|_| sc.spawn(|| secret_in(dir.path()).unwrap()))
+                    .collect();
+                hs.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            assert!(secrets.iter().all(|s| s.len() == 32 && *s == secrets[0]));
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        }
     }
 
     #[test]
