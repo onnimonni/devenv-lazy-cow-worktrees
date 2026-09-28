@@ -292,11 +292,20 @@ impl Daemon {
                 (None, None)
             }
         };
+        // An earlier registration's worktrees stay connectable (the PostgreSQL proxy
+        // refuses unknown roles) until reconcile has provisioned them again.
+        let known = self
+            .projects
+            .lock()
+            .unwrap()
+            .get(&root)
+            .map(|old| old.known.lock().unwrap().clone())
+            .unwrap_or_default();
         let rt = Arc::new(ProjectRt {
             project,
             base,
             lock: Default::default(),
-            known: Default::default(),
+            known: Mutex::new(known),
             gh,
             token,
             pending: Pending::default(),
@@ -392,14 +401,19 @@ impl Daemon {
     }
 
     /// A worktree seen for the first time: clone build caches into it when it was made
-    /// by plain `git worktree add`, then run the setup command once.
-    async fn prepare_new(&self, rt: &ProjectRt, info: &worktree::Info, c: &Checkout) {
+    /// by plain `git worktree add`. Before `provision`, which writes its `.env`.
+    async fn carry_caches(&self, rt: &ProjectRt, info: &worktree::Info, c: &Checkout) {
         let (root, i) = (rt.project.root.clone(), info.clone());
         match tokio::task::spawn_blocking(move || worktree::carry_caches(&root, &i)).await {
             Ok(Err(e)) => warn!("{}: cloning caches: {e:#}", c.id()),
             Err(e) => warn!("{}: {e}", c.id()),
             Ok(Ok(_)) => {}
         }
+    }
+
+    /// Run the setup command once in a new worktree, after `provision` (its role and
+    /// `.env` exist, so setup may use the database).
+    async fn run_setup(&self, rt: &ProjectRt, info: &worktree::Info, c: &Checkout) {
         let Some(cmd) = rt.project.settings.setup.clone() else {
             return;
         };
@@ -536,21 +550,30 @@ impl Daemon {
             .collect();
         let known = rt.known.lock().unwrap().clone();
         for (name, c) in &current {
-            if !known.contains_key(name) && !initializing.contains(name) {
-                if let Some(info) = infos.iter().find(|i| &i.name == name) {
-                    self.prepare_new(rt, info, c).await;
-                }
-                match self.provision(c).await {
-                    Ok(_) => {
-                        info!(
-                            "worktree {name}: https://{} -> 127.0.0.1:{}",
-                            c.host(),
-                            c.port
-                        );
-                        rt.known.lock().unwrap().insert(name.clone(), c.clone());
+            // Known with the same settings: nothing to do. Carried over from an earlier
+            // registration of the project (so still connectable meanwhile) but
+            // changed: provisioned again.
+            if known.get(name) == Some(c) || initializing.contains(name) {
+                continue;
+            }
+            let fresh = !known.contains_key(name);
+            let info = infos.iter().find(|i| &i.name == name);
+            if fresh && let Some(info) = info {
+                self.carry_caches(rt, info, c).await;
+            }
+            match self.provision(c).await {
+                Ok(_) => {
+                    info!(
+                        "worktree {name}: https://{} -> 127.0.0.1:{}",
+                        c.host(),
+                        c.port
+                    );
+                    rt.known.lock().unwrap().insert(name.clone(), c.clone());
+                    if fresh && let Some(info) = info {
+                        self.run_setup(rt, info, c).await;
                     }
-                    Err(e) => warn!("provisioning {name}: {e:#}"),
                 }
+                Err(e) => warn!("provisioning {name}: {e:#}"),
             }
         }
         for (name, c) in &known {
@@ -644,9 +667,10 @@ impl Daemon {
             path: path.clone(),
             branch: Some(name.to_string()),
         };
-        self.prepare_new(rt, &info, &c).await;
+        self.carry_caches(rt, &info, &c).await;
         self.provision(&c).await?;
         rt.known.lock().unwrap().insert(name.to_string(), c.clone());
+        self.run_setup(rt, &info, &c).await;
         if let Err(e) = history::History::update(&rt.project.root, |h| {
             h.removed.remove(name);
         }) {
