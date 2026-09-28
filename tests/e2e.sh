@@ -171,7 +171,7 @@ git -C "$wt" check-ignore -q .env || fail ".env not gitignored"
 pass ".env written and gitignored"
 
 "$bin" worktree new broken >/dev/null 2>&1 || fail "worktree new failed on a failing migration"
-"$bin" status | grep -q "migrations failed" || fail "failed migration not in status"
+[[ $("$bin" status) == *"migrations failed"* ]] || fail "failed migration not in status"
 out=$(curl_lf "https://broken.web.demo.localhost:8443/" 2>&1) || true
 [[ $out == *"migrations failed"* ]] || fail "failed migration not on its page: $out"
 [[ ! -f $(git -C .claude/worktrees/broken rev-parse --absolute-git-dir)/localforest-migrated ]] ||
