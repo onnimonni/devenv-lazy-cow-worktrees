@@ -241,7 +241,7 @@ the primary's paths.
 
 Every worktree gets its environment in `.env` too (a marked block at the top,
 rewritten on each start; keys of a `.env` cloned from the primary are commented
-out). If `.env` isn't gitignored it's added to `.git/info/exclude`; a tracked `.env`
+out). Values are single-quoted, which dotenvy, Ruby/Node dotenv, docker compose, direnv and `set -a; . .env` read literally; a value holding `'` or a line break is double-quoted instead, with `\\ \" \$ \n` escaped and backticks as single-quoted pieces so sourcing it runs nothing (loaders differ there: Node dotenv keeps the backslashes, Ruby dotenv and docker compose don't join quoted pieces, sh reads `\n` literally). Bun expands `$VAR` even in single quotes, so a value containing `$` is logged as a warning. If `.env` isn't gitignored it's added to `.git/info/exclude`; a tracked `.env`
 is left alone. Then `localforest.setup` runs once in it.
 
 ## Removed worktrees and previews

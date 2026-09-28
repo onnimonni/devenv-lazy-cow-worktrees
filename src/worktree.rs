@@ -326,6 +326,35 @@ fn worktree_include(root: &Path) -> Option<HashSet<String>> {
 const ENV_BEGIN: &str = "# >>> localforest: this worktree's environment (regenerated) >>>";
 const ENV_END: &str = "# <<< localforest <<<";
 
+/// A `.env` value. Single-quoted, which dotenvy, Node and Ruby dotenv, docker compose,
+/// direnv and `set -a; . .env` read verbatim (no escapes, no `$` expansion; Bun
+/// still expands `$VAR` in single quotes), unless it holds `'` or a line break,
+/// which single quotes can't carry; then double-quoted with `\\`, `\"`, `\$` and `\n`
+/// escaped, the escapes dotenvy, Ruby dotenv and docker compose share (a `\r` stays
+/// raw: dotenvy rejects the escape), and each backtick as a single-quoted piece
+/// (`"a"'`'"b"`: dotenvy has no `` \` `` escape), so a shell sourcing it runs nothing.
+/// Loaders differ on that fallback: Node dotenv keeps its backslashes, Ruby dotenv
+/// and docker compose don't join quoted pieces, sh reads `\n` as backslash-n.
+fn dotenv_quote(v: &str) -> String {
+    if !v.contains(['\'', '\n', '\r']) {
+        return format!("'{v}'");
+    }
+    let mut out = String::from("\"");
+    for c in v.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '$' => out.push_str("\\$"),
+            // No escape for it that dotenvy takes: a single-quoted piece.
+            '`' => out.push_str("\"'`'\""),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Write `env` into the worktree's `.env` (as a block at the top, so first-wins
 /// loaders see it), making sure `.env` is gitignored (`.git/info/exclude` if not)
 /// and never touching a tracked one. Keys of the rest of the file (e.g. a `.env`
@@ -369,10 +398,13 @@ pub fn write_env(path: &Path, env: &[(String, String)]) -> Result<()> {
     let ours: HashSet<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
     let mut out = format!("{ENV_BEGIN}\n");
     for (k, v) in env {
-        out.push_str(&format!(
-            "{k}=\"{}\"\n",
-            v.replace('\\', "\\\\").replace('"', "\\\"")
-        ));
+        if v.contains('$') {
+            warn!(
+                "{}: .env value of {k} contains '$', which some loaders (Bun) expand",
+                path.display()
+            );
+        }
+        out.push_str(&format!("{k}={}\n", dotenv_quote(v)));
     }
     out.push_str(ENV_END);
     out.push('\n');
@@ -773,6 +805,44 @@ mod tests {
     use git2::{Signature, WorktreeAddOptions};
     use tempfile::TempDir;
 
+    #[test]
+    fn env_values_read_back_verbatim() {
+        let values = [
+            "postgres://u:pw@127.0.0.1:55432/db",
+            "a $HOME ${HOME} $(id) `id` b",
+            "it's",
+            "say \"hi\" \\ back\\slash",
+            "two\nlines",
+            "it's $HOME\nand \"more\"\\n",
+            "it's `id` $(id)",
+            "cr\r\nlf",
+            "",
+            "#not a comment",
+        ];
+        assert_eq!(dotenv_quote("a $B"), "'a $B'");
+        assert_eq!(dotenv_quote("it's $B\n"), "\"it's \\$B\\n\"");
+        // Backticks in single-quoted pieces: `set -a; . .env` must not run them.
+        assert_eq!(
+            dotenv_quote("it's `id` $(id) \"q\" \\"),
+            r#""it's "'`'"id"'`'" \$(id) \"q\" \\""#
+        );
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join(".env");
+        let text: String = values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| format!("K{i}={}\n", dotenv_quote(v)))
+            .collect();
+        std::fs::write(&file, text).unwrap();
+        let parsed: HashMap<String, String> = dotenvy::from_path_iter(&file)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        for (i, v) in values.iter().enumerate() {
+            assert_eq!(parsed[&format!("K{i}")], *v, "value {i}");
+        }
+    }
+
     fn settings() -> ProjectSettings {
         ProjectSettings {
             name: Some("app".into()),
@@ -958,7 +1028,7 @@ mod tests {
         assert_eq!(
             text,
             format!(
-                "{ENV_BEGIN}\nDATABASE_URL=\"postgres://wt\"\nPORT=\"20000\"\n{ENV_END}\n\
+                "{ENV_BEGIN}\nDATABASE_URL='postgres://wt'\nPORT='20000'\n{ENV_END}\n\
                  # overridden by localforest: DATABASE_URL=postgres://primary\nOTHER=1\n"
             )
         );

@@ -49,6 +49,7 @@ reflink-copy = "0.1"
 filetime = "0.2"
 
 [dev-dependencies]
+dotenvy = "0.15.7"
 tempfile = "3.27.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
