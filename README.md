@@ -50,7 +50,7 @@ the project's services, started on demand; the environment comes from
 | **Worktrees** | `git worktree add` without a checkout, then filled with copy-on-write clones of the primary checkout, build caches included ([git-cow](https://github.com/onnimonni/git-cow)): ~0 disk, nothing to recompile. In `.claude/worktrees/<name>`, where Claude Code puts its own. |
 | **File watcher** | Watches `.git/worktrees`: a worktree made any way (plain `git`, git-cow, Claude Code) is provisioned; one deleted by hand is cleaned up. |
 | **Services** | Every checkout runs the project's services (`localforest.services`), each with its own port and `https://<worktree>.<service>.<project>.localhost` (`<service>.<project>.localhost` in the primary). The first request to a service starts it, after the services it depends on; workers without http run as dependencies. |
-| **PostgreSQL** | One PostgreSQL 18 on an APFS RAM disk, `fsync=off`. localforest is a proxy in front of it: the user in the connection picks the checkout, a database is created on first connect as a copy-on-write clone of its template (always `SET file_copy_method = clone` + `STRATEGY FILE_COPY`: 200 MB in ~40 ms instead of ~450 ms), and a checkout can only open its own databases. Every checkout has its own role and password. |
+| **PostgreSQL** | One PostgreSQL 18 on an APFS RAM disk, `fsync=off`. localforest is a proxy in front of it: the user in the connection picks the checkout, a database is created on first connect as a copy-on-write clone of its template (always `SET file_copy_method = clone` + `STRATEGY FILE_COPY`: 200 MB in ~40 ms instead of ~450 ms), and a checkout can only open its own databases; users that are no checkout's role are refused. Every checkout has its own role and password. |
 | **Redis** | One port; the password picks the checkout's own `redis-server`, on a private unix socket, started on first use and killed with the worktree. Real Redis: pub/sub, Lua, streams, `FLUSHALL` only touch that one. |
 | **HTTPS** | Local CA, websockets included. `https://localforest.localhost` lists everything. |
 | **GitHub** | Webhook websocket (polling without repo admin rights): pushes pull every branch and merge the base branch into worktrees (conflict-free merges only, dirty worktrees skipped). A worktree whose PR merged is removed unless it has newer work. |
@@ -224,7 +224,15 @@ base port.
 
 Point your apps at `DATABASE_URL` / `REDIS_URL` (Ecto: `url: System.fetch_env!("DATABASE_URL")`).
 Test databases (and `MIX_TEST_PARTITION` ones) are the app's to create (`mix ecto.create`
-works through the proxy); only the dev database is cloned from the template.
+works through the proxy); only the dev database is cloned from the template. A checkout
+owns its dev and test databases and partitions named `<test db><N>` (Ecto's usual
+`System.get_env("TEST_DATABASE_URL") <> System.get_env("MIX_TEST_PARTITION", "")`:
+`myapp_test_fix_login2`) or `<prefix>_test<N>_<worktree>` (`myapp_test2_fix_login`).
+`<test db><N>` is ambiguous when a worktree is named like another plus digits (`x2`
+vs `x` + 2): the exact name, then the longest test database, wins among existing
+checkouts. An equal claim (project `shop` worktree `dev-x` and project `shop-dev`
+worktree `x` both get `shop_dev_dev_x`) is nobody's: refused, never dropped. Removing
+a checkout drops only databases its role created.
 
 All services of a checkout share its `DATABASE_URL` and `REDIS_URL` for now
 (FIXME: databases and redis-servers per service).

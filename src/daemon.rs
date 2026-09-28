@@ -292,11 +292,20 @@ impl Daemon {
                 (None, None)
             }
         };
+        // An earlier registration's worktrees stay connectable (the PostgreSQL proxy
+        // refuses unknown roles) until reconcile has provisioned them again.
+        let known = self
+            .projects
+            .lock()
+            .unwrap()
+            .get(&root)
+            .map(|old| old.known.lock().unwrap().clone())
+            .unwrap_or_default();
         let rt = Arc::new(ProjectRt {
             project,
             base,
             lock: Default::default(),
-            known: Default::default(),
+            known: Mutex::new(known),
             gh,
             token,
             pending: Pending::default(),
@@ -400,14 +409,19 @@ impl Daemon {
     }
 
     /// A worktree seen for the first time: clone build caches into it when it was made
-    /// by plain `git worktree add`, then run the setup command once.
-    async fn prepare_new(&self, rt: &ProjectRt, info: &worktree::Info, c: &Checkout) {
+    /// by plain `git worktree add`. Before `provision`, which writes its `.env`.
+    async fn carry_caches(&self, rt: &ProjectRt, info: &worktree::Info, c: &Checkout) {
         let (root, i) = (rt.project.root.clone(), info.clone());
         match tokio::task::spawn_blocking(move || worktree::carry_caches(&root, &i)).await {
             Ok(Err(e)) => warn!("{}: cloning caches: {e:#}", c.id()),
             Err(e) => warn!("{}: {e}", c.id()),
             Ok(Ok(_)) => {}
         }
+    }
+
+    /// Run the setup command once in a new worktree, after `provision` (its role and
+    /// `.env` exist, so setup may use the database).
+    async fn run_setup(&self, rt: &ProjectRt, info: &worktree::Info, c: &Checkout) {
         let Some(cmd) = rt.project.settings.setup.clone() else {
             return;
         };
@@ -482,19 +496,14 @@ impl Daemon {
 
     /// PostgreSQL proxy, before the connection is handed to the server (which checks
     /// the password): a checkout's role may open its own databases (its dev database is
-    /// created on the spot) and the maintenance ones, unless another checkout's role made it.
-    /// Other users pass through.
+    /// created on the spot) and the maintenance ones, unless another checkout's role
+    /// made it. Every other user is refused.
     async fn resolve_pg(&self, user: &str, db: &str) -> Result<()> {
-        if user == "postgres" {
-            anyhow::bail!(
-                "connect as your checkout's role (PGUSER in `localforest env`), not postgres"
-            );
-        }
         let projects: Vec<Arc<ProjectRt>> =
             self.projects.lock().unwrap().values().cloned().collect();
-        for rt in projects {
+        let found = projects.into_iter().find_map(|rt| {
             let primary = rt.primary();
-            let found = if primary.id() == user {
+            let c = if primary.id() == user {
                 Some(primary)
             } else {
                 rt.known
@@ -504,32 +513,32 @@ impl Daemon {
                     .find(|c| c.id() == user)
                     .cloned()
             };
-            let Some(c) = found else { continue };
+            c.map(|c| (rt, c))
+        });
+        let others = self.all_checkouts();
+        let create_dev = pg_access(user, found.as_ref().map(|(_, c)| c), db, &others)?;
+        if let Some((rt, c)) = found {
             self.activity.touch(&c.id());
-            if db == "postgres" || db == "template1" {
-                return Ok(());
-            }
-            if !c.owns_db(db) {
-                anyhow::bail!(
-                    "{user} may only open its own databases ({}, {}), not {db}",
-                    c.dev_db(),
-                    c.test_db()
-                );
-            }
             // A database squatted by another checkout's role (CREATEDB lets it make
             // any name) would hand it this checkout's data.
-            if let Some(owner) = self.pg.owner(db).await?
+            if db != "postgres"
+                && db != "template1"
+                && let Some(owner) = self.pg.owner(db).await?
                 && owner != c.id()
-                && self.checkouts().iter().any(|(_, o)| o.id() == owner)
+                && others.iter().any(|o| o.id() == owner)
             {
                 anyhow::bail!("{db} belongs to {owner}, not {user}; drop it from {owner}");
             }
-            if c.worktree.is_some() && db == c.dev_db() {
+            if create_dev {
                 self.ensure_dev_db(&rt, &c).await?;
             }
-            return Ok(());
         }
         Ok(())
+    }
+
+    /// Every registered checkout, without their runtimes.
+    fn all_checkouts(&self) -> Vec<Checkout> {
+        self.checkouts().into_iter().map(|(_, o)| o).collect()
     }
 
     /// Kill the checkout's services and redis-server, drop its routes, databases and role.
@@ -539,11 +548,24 @@ impl Daemon {
         }
         self.servers.stop_checkout(c).await;
         self.redis.remove(&c.id()).await;
+        // Only what's unambiguously its own: its name (no registered checkout has an
+        // equal or closer claim) and made by its role, so a database another checkout
+        // (unregistered, failed to provision) could claim by name survives.
+        let others = self.all_checkouts();
         for db in self.pg.databases().await? {
-            if c.owns_db(&db) {
-                self.pg.drop(&db).await?;
-                info!("dropped database {db}");
+            if !c.owns_db(&db) {
+                continue;
             }
+            if !config::db_owner(&db, others.iter().chain([c])).is_some_and(|o| o.same(c)) {
+                warn!("{db}: another checkout claims it too; left in place");
+                continue;
+            }
+            if self.pg.owner(&db).await?.as_deref() != Some(&c.id()) {
+                warn!("{db}: not made by {}; left in place", c.id());
+                continue;
+            }
+            self.pg.drop(&db).await?;
+            info!("dropped database {db}");
         }
         self.pg.drop_role(&c.id()).await?;
         Ok(())
@@ -585,21 +607,30 @@ impl Daemon {
             .collect();
         let known = rt.known.lock().unwrap().clone();
         for (name, c) in &current {
-            if !known.contains_key(name) && !initializing.contains(name) {
-                if let Some(info) = infos.iter().find(|i| &i.name == name) {
-                    self.prepare_new(rt, info, c).await;
-                }
-                match self.provision(c).await {
-                    Ok(_) => {
-                        info!(
-                            "worktree {name}: https://{} -> 127.0.0.1:{}",
-                            c.host(),
-                            c.port
-                        );
-                        rt.known.lock().unwrap().insert(name.clone(), c.clone());
+            // Known with the same settings: nothing to do. Carried over from an earlier
+            // registration of the project (so still connectable meanwhile) but
+            // changed: provisioned again.
+            if known.get(name) == Some(c) || initializing.contains(name) {
+                continue;
+            }
+            let fresh = !known.contains_key(name);
+            let info = infos.iter().find(|i| &i.name == name);
+            if fresh && let Some(info) = info {
+                self.carry_caches(rt, info, c).await;
+            }
+            match self.provision(c).await {
+                Ok(_) => {
+                    info!(
+                        "worktree {name}: https://{} -> 127.0.0.1:{}",
+                        c.host(),
+                        c.port
+                    );
+                    rt.known.lock().unwrap().insert(name.clone(), c.clone());
+                    if fresh && let Some(info) = info {
+                        self.run_setup(rt, info, c).await;
                     }
-                    Err(e) => warn!("provisioning {name}: {e:#}"),
                 }
+                Err(e) => warn!("provisioning {name}: {e:#}"),
             }
         }
         for (name, c) in &known {
@@ -693,9 +724,10 @@ impl Daemon {
             path: path.clone(),
             branch: Some(name.to_string()),
         };
-        self.prepare_new(rt, &info, &c).await;
+        self.carry_caches(rt, &info, &c).await;
         self.provision(&c).await?;
         rt.known.lock().unwrap().insert(name.to_string(), c.clone());
+        self.run_setup(rt, &info, &c).await;
         if let Err(e) = history::History::update(&rt.project.root, |h| {
             h.removed.remove(name);
         }) {
@@ -1774,6 +1806,48 @@ fn dashboard(d: &Daemon) -> String {
 
 // ---------- entry point
 
+/// The PostgreSQL proxy's decision for `user` opening `db`, `c` being the registered
+/// checkout whose role `user` is: Err refuses, Ok(true) lets a worktree through to its
+/// dev database (created first if missing), Ok(false) lets it through as is. Fails
+/// closed: users that are no registered checkout's role never reach the server.
+fn pg_access(user: &str, c: Option<&Checkout>, db: &str, others: &[Checkout]) -> Result<bool> {
+    if user == "postgres" {
+        anyhow::bail!(
+            "connect as your checkout's role (PGUSER in `localforest env`), not postgres"
+        );
+    }
+    let Some(c) = c else {
+        anyhow::bail!(
+            "{user:?} is not the role of a checkout localforest serves; use PGUSER / DATABASE_URL from `localforest env` in the checkout (and `localforest serve` in its project)"
+        );
+    };
+    if db == "postgres" || db == "template1" {
+        return Ok(false);
+    }
+    // Only what it owns by name with no equal or closer claim from another checkout
+    // (`config::db_owner`).
+    if !config::db_owner(db, others.iter().chain([c])).is_some_and(|o| o.same(c)) {
+        if c.owns_db(db) {
+            let rivals: Vec<String> = others
+                .iter()
+                .filter(|o| !o.same(c) && o.owns_db(db))
+                .map(Checkout::id)
+                .collect();
+            anyhow::bail!(
+                "{db} is also the name of {}'s database; rename the worktree to use it",
+                rivals.join(", ")
+            );
+        }
+        anyhow::bail!(
+            "{user} may only open its own databases ({}, {}, MIX_TEST_PARTITION's {}<N>), not {db}",
+            c.dev_db(),
+            c.test_db(),
+            c.test_db()
+        );
+    }
+    Ok(c.worktree.is_some() && db == c.dev_db())
+}
+
 async fn daemon_alive() -> bool {
     crate::client::get::<serde_json::Value>("/status")
         .await
@@ -1971,4 +2045,61 @@ async fn lead(global: Global, project: Option<Project>, listener: UnixListener) 
     tokio::time::sleep(Duration::from_millis(500)).await;
     d.pg.stop().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn co(wt: Option<&str>) -> Checkout {
+        Checkout {
+            project: "demo".into(),
+            db_prefix: "demo".into(),
+            worktree: wt.map(str::to_string),
+            path: "/x".into(),
+            port: 20000,
+            services: Default::default(),
+        }
+    }
+
+    #[test]
+    fn pg_access_fails_closed() {
+        let wt = co(Some("wt"));
+        // Not a registered checkout's role: refused, whatever the database.
+        for db in ["postgres", "demo_dev", "anything"] {
+            let e = pg_access("stranger", None, db, &[]).unwrap_err();
+            assert!(e.to_string().contains("not the role of a checkout"), "{e}");
+        }
+        assert!(pg_access("postgres", None, "postgres", &[]).is_err());
+        assert!(pg_access("postgres", Some(&co(None)), "postgres", &[]).is_err());
+        // Registered: maintenance and own databases, the worktree's dev one created.
+        assert!(!pg_access("demo-wt", Some(&wt), "postgres", &[]).unwrap());
+        assert!(!pg_access("demo-wt", Some(&wt), "template1", &[]).unwrap());
+        assert!(pg_access("demo-wt", Some(&wt), "demo_dev_wt", &[]).unwrap());
+        assert!(!pg_access("demo-wt", Some(&wt), "demo_test_wt", &[]).unwrap());
+        assert!(!pg_access("demo", Some(&co(None)), "demo_dev", &[]).unwrap());
+        assert!(pg_access("demo-wt", Some(&wt), "demo_dev", &[]).is_err());
+        // Partitions: a registered worktree's own name wins; others (and itself) listed.
+        let (x, x2) = (co(Some("x")), co(Some("x2")));
+        let all = [x.clone(), x2.clone()];
+        assert!(pg_access("demo-x", Some(&x), "demo_test_x3", &all).is_ok());
+        let e = pg_access("demo-x", Some(&x), "demo_test_x2", &all).unwrap_err();
+        assert!(e.to_string().contains("demo-x2"), "{e}");
+        assert!(pg_access("demo-x2", Some(&x2), "demo_test_x2", &all).is_ok());
+        // Cross-project tie: nobody may open it.
+        let a = Checkout {
+            project: "shop".into(),
+            db_prefix: "shop".into(),
+            ..co(Some("dev-x"))
+        };
+        let b = Checkout {
+            project: "shop-dev".into(),
+            db_prefix: "shop_dev".into(),
+            ..co(Some("x"))
+        };
+        assert_eq!(a.dev_db(), b.dev_db());
+        let both = [a.clone(), b.clone()];
+        assert!(pg_access("shop-dev-x", Some(&a), "shop_dev_dev_x", &both).is_err());
+        assert!(pg_access("shop-dev-x", Some(&b), "shop_dev_dev_x", &both).is_err());
+    }
 }
