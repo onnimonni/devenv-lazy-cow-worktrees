@@ -574,7 +574,9 @@ pub fn safety(info: &Info, remote: &str, base: &str) -> Result<Safety> {
 }
 
 /// Commits in `head` not in `hidden`, ignoring conflict-free merges of the base
-/// branch that localforest made (they add nothing of the branch's own).
+/// branch that localforest made (they add nothing of the branch's own). One with that
+/// message but a tree other than the clean merge of its parents (edited, conflicts
+/// resolved by hand) counts.
 pub fn ahead(
     repo: &Repository,
     head: Oid,
@@ -591,12 +593,63 @@ pub fn ahead(
     let mut n = 0;
     for id in walk {
         let c = repo.find_commit(id?)?;
-        if c.parent_count() > 1 && c.message().is_ok_and(|m| m.starts_with(&auto)) {
+        if c.message().is_ok_and(|m| m.starts_with(&auto)) && is_clean_merge(repo, &c) {
             continue;
         }
         n += 1;
     }
     Ok(n)
+}
+
+/// Does a two-parent merge add nothing of its own? Every path it changed relative to
+/// its first parent must match the second parent, or else the conflict-free merge
+/// libgit2 computes. Cheap (tree diff; the merge is computed only when needed), and
+/// tolerant of merges `git merge` made differently (renames, criss-cross): a path
+/// taken from either side as is never counts. A path matching neither side nor the
+/// clean merge (an edit, a conflict resolved by hand) does. Anything unreadable
+/// (a parent missing in a shallow clone) counts as work. Cached per commit.
+fn is_clean_merge(repo: &Repository, c: &git2::Commit) -> bool {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<Oid, bool>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(v) = cache.lock().unwrap().get(&c.id()) {
+        return *v;
+    }
+    let clean = merge_adds_nothing(repo, c).unwrap_or(false);
+    cache.lock().unwrap().insert(c.id(), clean);
+    clean
+}
+
+fn merge_adds_nothing(repo: &Repository, c: &git2::Commit) -> Result<bool> {
+    if c.parent_count() != 2 {
+        return Ok(false);
+    }
+    let (p1, p2) = (c.parent(0)?, c.parent(1)?);
+    let (t1, t2, tm) = (p1.tree()?, p2.tree()?, c.tree()?);
+    let diff = repo.diff_tree_to_tree(Some(&t1), Some(&tm), None)?;
+    let blob = |t: &git2::Tree, p: &Path| t.get_path(p).ok().map(|e| e.id());
+    let mut clean: Option<Option<git2::Tree>> = None;
+    for delta in diff.deltas() {
+        let Some(p) = delta.new_file().path().or(delta.old_file().path()) else {
+            return Ok(false);
+        };
+        let ours = blob(&tm, p);
+        if ours == blob(&t2, p) {
+            continue;
+        }
+        let merged = clean.get_or_insert_with(|| {
+            let mut index = repo.merge_commits(&p1, &p2, None).ok()?;
+            if index.has_conflicts() {
+                return None;
+            }
+            repo.find_tree(index.write_tree_to(repo).ok()?).ok()
+        });
+        match merged {
+            Some(t) if blob(t, p) == ours => {}
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
 }
 
 /// After a PR merged `branch` at `pr_head`: is everything in the worktree in it?
@@ -941,6 +994,58 @@ mod tests {
         assert!(repo.find_branch("feat-x", BranchType::Local).is_err());
         // Can be created again.
         create(&project, &syncer, "feat-x", None).unwrap();
+    }
+
+    #[test]
+    fn counts_auto_merges_with_changes_of_their_own() {
+        let d = TempDir::new().unwrap();
+        let repo = Repository::init(d.path()).unwrap();
+        let sig = Signature::now("T", "t@example.com").unwrap();
+        let commit = |files: &[(&str, &str)], parents: &[Oid], msg: &str| {
+            let mut tb = repo.treebuilder(None).unwrap();
+            for (name, content) in files {
+                tb.insert(name, repo.blob(content.as_bytes()).unwrap(), 0o100644)
+                    .unwrap();
+            }
+            let tree = repo.find_tree(tb.write().unwrap()).unwrap();
+            let parents: Vec<_> = parents
+                .iter()
+                .map(|p| repo.find_commit(*p).unwrap())
+                .collect();
+            let parents: Vec<_> = parents.iter().collect();
+            repo.commit(None, &sig, &sig, msg, &tree, &parents).unwrap()
+        };
+        let a = commit(&[("a", "1")], &[], "init");
+        let own = commit(&[("a", "1"), ("b", "own")], &[a], "own");
+        let main = commit(&[("a", "2")], &[a], "main");
+        let msg = "Merge remote-tracking branch 'origin/main' into x";
+        let clean = commit(&[("a", "2"), ("b", "own")], &[own, main], msg);
+        assert_eq!(
+            ahead(&repo, clean, &[own, main], "origin", "main").unwrap(),
+            0
+        );
+        let evil = commit(
+            &[("a", "2"), ("b", "own"), ("c", "extra")],
+            &[own, main],
+            msg,
+        );
+        assert_eq!(
+            ahead(&repo, evil, &[own, main], "origin", "main").unwrap(),
+            1
+        );
+        // Not what libgit2 would make, but every path is one side's as is (as a
+        // `git merge` with other rename detection might do): nothing of its own.
+        let other = commit(&[("a", "1"), ("b", "own")], &[own, main], msg);
+        assert_eq!(
+            ahead(&repo, other, &[own, main], "origin", "main").unwrap(),
+            0
+        );
+        // A hand-resolved path, in neither side nor the clean merge: work.
+        let resolved = commit(&[("a", "3"), ("b", "own")], &[own, main], msg);
+        assert_eq!(
+            ahead(&repo, resolved, &[own, main], "origin", "main").unwrap(),
+            1
+        );
     }
 
     #[test]
