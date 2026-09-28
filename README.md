@@ -240,7 +240,7 @@ the primary's paths.
 
 Every worktree gets its environment in `.env` too (a marked block at the top,
 rewritten on each start; keys of a `.env` cloned from the primary are commented
-out). If `.env` isn't gitignored it's added to `.git/info/exclude`; a tracked `.env`
+out; values are single-quoted, so `$` is never expanded). If `.env` isn't gitignored it's added to `.git/info/exclude`; a tracked `.env`
 is left alone. Then `localforest.setup` runs once in it.
 
 ## Removed worktrees and previews
