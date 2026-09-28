@@ -115,6 +115,13 @@ pass "MIX_TEST_PARTITION database opened"
 if out=$(PGUSER=stranger PGPASSWORD=x psql -d postgres -tAc "select 1" 2>&1); then fail "unknown user got through"; fi
 [[ $out == *"not the role of a checkout"* ]] || fail "unknown user not refused by the proxy: $out"
 pass "users that are no checkout's role refused"
+[[ $(psql -tAc "select rolsuper::text from pg_roles where rolname = current_user") == false ]] || fail "checkout role is a superuser"
+psql -qc "ALTER TABLE seeds ADD COLUMN y int" || fail "worktree can't migrate the template's tables"
+for sql in "DROP DATABASE demo_dev" "ALTER ROLE demo SUPERUSER" "COPY (SELECT 1) TO PROGRAM 'true'"; do
+  if psql -d postgres -qc "$sql" 2>/dev/null; then fail "worktree role could: $sql"; fi
+done
+[[ $(admin_psql "select 1 from pg_database where datname = 'demo_dev'") == 1 ]] || fail "primary's database gone"
+pass "worktree role owns its clone, can't touch other checkouts"
 
 redis-cli --no-auth-warning -u "$REDIS_URL" set k worktree >/dev/null
 primary_redis=$(cd "$work/app" && "$bin" env --json | jq -r .REDIS_URL)

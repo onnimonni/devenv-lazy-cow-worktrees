@@ -165,7 +165,16 @@ in
         type = types.nullOr (types.functionTo (types.listOf types.package));
         default = null;
         example = lib.literalExpression "extensions: [ extensions.postgis extensions.pgvector ]";
-        description = "Extensions to install, as in devenv's services.postgres.extensions (`package.withPackages`). Enable them with CREATE EXTENSION (checkout roles are superusers).";
+        description = "Extensions to install, as in devenv's services.postgres.extensions (`package.withPackages`). Checkout roles aren't superusers: they can CREATE EXTENSION trusted ones (pgcrypto, citext, ...); list the others in createExtensions.";
+      };
+      createExtensions = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        example = [
+          "postgis"
+          "vector"
+        ];
+        description = "Extensions the daemon creates as superuser in template1 (so in every database made afterwards) and the primaries' databases: the untrusted ones checkout roles can't create. Migrations' CREATE EXTENSION IF NOT EXISTS is then a no-op.";
       };
       settings = mkOption {
         type = types.attrsOf (
@@ -284,6 +293,7 @@ in
       LOCALFOREST_RAMDISK_MB = toString cfg.postgres.ramdiskMB;
       LOCALFOREST_POSTGRES_BIN = "${postgres}/bin";
       LOCALFOREST_POSTGRES_SETTINGS = builtins.toJSON cfg.postgres.settings;
+      LOCALFOREST_POSTGRES_EXTENSIONS = lib.concatStringsSep "," cfg.postgres.createExtensions;
       LOCALFOREST_REDIS_SERVER = lib.getExe' cfg.redis "redis-server";
     }
     // lib.optionalAttrs (cfg.httpsPort != null) { LOCALFOREST_HTTPS_PORT = toString cfg.httpsPort; }

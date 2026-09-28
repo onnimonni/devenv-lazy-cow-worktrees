@@ -57,6 +57,8 @@ pub struct Daemon {
     pg: Postgres,
     /// Serialises on-demand CREATE DATABASE and swapping in a new template.
     create_lock: tokio::sync::Mutex<()>,
+    /// Per dev database: its first connects wait until it's cloned and adopted.
+    dev_locks: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
     redis: Arc<Redis>,
     servers: Servers,
     routes: Routes,
@@ -477,14 +479,26 @@ impl Daemon {
         self.pg.ensure_role(&c.id(), &c.pg_password()?).await?;
         let mut created = false;
         if c.worktree.is_none() {
+            let extensions = self.global.postgres_extensions();
             for db in [c.dev_db(), c.test_db()] {
                 if !self.pg.exists(&db).await? {
                     self.pg.create(&db, None, Some(&c.id())).await?;
                     info!("{db}: created empty");
                     created |= db == c.dev_db();
                 }
+                // Made before they were listed.
+                if let Err(e) = self.pg.create_extensions(&db, &extensions).await {
+                    warn!("{e:#}");
+                }
             }
         }
+        // Databases from before: made by a role of an earlier naming scheme, or cloned
+        // while checkout roles were superusers (objects still the primary's). Fails
+        // provisioning (retried by the next reconcile) rather than leave a checkout
+        // that can't migrate.
+        self.adopt_databases(c)
+            .await
+            .with_context(|| format!("{}: handing its databases to its role", c.id()))?;
         for (_, host, port) in c.routes() {
             self.routes.set(host, port, c.worktree.is_some(), c.id());
         }
@@ -641,10 +655,20 @@ impl Daemon {
     /// Ok(true) when it was created.
     async fn ensure_dev_db(&self, rt: &ProjectRt, c: &Checkout) -> Result<bool> {
         let dev = c.dev_db();
-        let _g = self.create_lock.lock().await;
+        // This database's connects wait until it's cloned and adopted; others only
+        // for the clone itself (create_lock), not for `adopt`'s object locks.
+        let lock = self
+            .dev_locks
+            .lock()
+            .unwrap()
+            .entry(dev.clone())
+            .or_default()
+            .clone();
+        let _dev = lock.lock().await;
         if self.pg.exists(&dev).await? {
             return Ok(false);
         }
+        let create = self.create_lock.lock().await;
         let template = c.template_db();
         let primary = rt.primary().dev_db();
         let source = if self.pg.exists(&template).await? {
@@ -658,6 +682,12 @@ impl Daemon {
         self.pg
             .create(&dev, source.as_deref(), Some(&c.id()))
             .await?;
+        drop(create);
+        if let Err(e) = self.adopt_dev_db(c).await {
+            // Cloned objects its role can't migrate: better none at all.
+            let _ = self.pg.drop(&dev).await;
+            return Err(e);
+        }
         match &source {
             Some(s) => info!("{dev}: cloned from {s} in {:?}", t.elapsed()),
             None => info!("{dev}: created empty (no template yet)"),
@@ -727,9 +757,50 @@ impl Daemon {
         }
     }
 
+    /// Give a worktree's role the objects its dev database was cloned with: owned by the
+    /// template's owner role, or by the primary's role (cloned from its database, or
+    /// before templates had their own).
+    async fn adopt_dev_db(&self, c: &Checkout) -> Result<()> {
+        let primary = Checkout {
+            worktree: None,
+            ..c.clone()
+        };
+        if c.worktree.is_some() {
+            for from in [c.template_db(), primary.id()] {
+                self.pg.adopt(&c.dev_db(), &from, &c.id()).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Hand the checkout's role the databases it owns by name (`config::db_owner`) but
+    /// another, unregistered role made: e.g. its role under an earlier naming scheme,
+    /// with everything in them. Then `adopt_dev_db`.
+    async fn adopt_databases(&self, c: &Checkout) -> Result<()> {
+        let others = self.all_checkouts();
+        for db in self.pg.databases().await? {
+            if !c.owns_db(&db)
+                || !config::db_owner(&db, others.iter().chain([c])).is_some_and(|o| o.same(c))
+            {
+                continue;
+            }
+            let Some(old) = self.pg.owner(&db).await? else {
+                continue;
+            };
+            if old == c.id() || old == "postgres" || others.iter().any(|o| o.id() == old) {
+                continue;
+            }
+            self.pg.set_owner(&db, &c.id()).await?;
+            self.pg.adopt(&db, &old, &c.id()).await?;
+            info!("{db}: handed from {old} to {}", c.id());
+        }
+        self.adopt_dev_db(c).await
+    }
+
     /// PostgreSQL proxy, before the connection is handed to the server (which checks
     /// the password): a checkout's role may open its own databases (its dev database is
-    /// created on the spot) and the maintenance ones. Every other user is refused.
+    /// created on the spot) and the maintenance ones, unless another checkout's role
+    /// made it. Every other user is refused.
     async fn resolve_pg(&self, user: &str, db: &str) -> Result<()> {
         let projects: Vec<Arc<ProjectRt>> =
             self.projects.lock().unwrap().values().cloned().collect();
@@ -751,6 +822,16 @@ impl Daemon {
         let create_dev = pg_access(user, found.as_ref().map(|(_, c)| c), db, &others)?;
         if let Some((rt, c)) = found {
             self.activity.touch(&c.id());
+            // A database squatted by another checkout's role (CREATEDB lets it make
+            // any name) would hand it this checkout's data.
+            if db != "postgres"
+                && db != "template1"
+                && let Some(owner) = self.pg.owner(db).await?
+                && owner != c.id()
+                && others.iter().any(|o| o.id() == owner)
+            {
+                anyhow::bail!("{db} belongs to {owner}, not {user}; drop it from {owner}");
+            }
             if create_dev {
                 self.ensure_dev_db(&rt, &c).await?;
             }
@@ -1919,6 +2000,8 @@ async fn ticker(rt: Arc<ProjectRt>) {
         if !rt.migrate_failures.lock().unwrap().is_empty() {
             rt.trigger(&rt.pending.migrate_worktrees);
         }
+        // Retries checkouts whose provisioning failed.
+        rt.trigger(&rt.pending.reconcile);
         if !rt.ws_ok.load(Ordering::SeqCst) || n.is_multiple_of(10) {
             rt.pending.merged.store(true, Ordering::SeqCst);
             rt.trigger(&rt.pending.sync);
@@ -2477,11 +2560,16 @@ async fn lead(global: Global, project: Option<Project>, listener: UnixListener) 
         global.postgres_settings()?,
     )
     .await?;
+    // Fatal: without it roles from before could still be superusers.
+    pg.prepare_templates(&global.postgres_extensions())
+        .await
+        .context("preparing PostgreSQL")?;
     let activity = history::Activity::default();
     let d = Arc::new(Daemon {
         global: global.clone(),
         pg,
         create_lock: Default::default(),
+        dev_locks: Default::default(),
         redis: Arc::new(Redis::new(
             crate::redis::dir(),
             activity.clone(),

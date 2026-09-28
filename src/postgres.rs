@@ -32,6 +32,13 @@ pub fn which(name: &str) -> Option<PathBuf> {
 /// roles with scram passwords, checked by this server through the proxy.
 const HBA: &str = "local all postgres trust\nlocal all all scram-sha-256\n";
 
+async fn role_exists(client: &tokio_postgres::Client, role: &str) -> Result<bool> {
+    Ok(client
+        .query_opt("SELECT 1 FROM pg_roles WHERE rolname = $1", &[&role])
+        .await?
+        .is_some())
+}
+
 pub fn quote_ident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
@@ -296,34 +303,197 @@ impl Postgres {
         Ok(())
     }
 
-    /// Create or update a checkout's login role. SUPERUSER: dev tooling expects it
-    /// (CREATE EXTENSION, ecto.create, objects owned by the primary's role in cloned
-    /// databases); which databases it can open is enforced by the proxy.
+    /// Create or update a checkout's login role: CREATEDB (`mix ecto.create` / `drop`
+    /// of its own databases) and nothing more. Not a superuser, so it can't drop or
+    /// alter other checkouts' databases and roles, or run programs (COPY TO PROGRAM).
+    /// It owns its databases and, after `adopt`, everything in its cloned dev database;
+    /// trusted extensions (pgcrypto, citext, ...) need only that.
     pub async fn ensure_role(&self, role: &str, password: &str) -> Result<()> {
-        let admin = self.admin().await?;
-        let exists = admin
-            .query_opt("SELECT 1 FROM pg_roles WHERE rolname = $1", &[&role])
-            .await?
-            .is_some();
-        let verb = if exists { "ALTER" } else { "CREATE" };
-        admin
-            .batch_execute(&format!(
-                "{verb} ROLE {} WITH LOGIN SUPERUSER PASSWORD '{}'",
-                quote_ident(role),
+        self.upsert_role(
+            role,
+            &format!(
+                "LOGIN NOSUPERUSER CREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD '{}'",
                 password.replace('\'', "''")
-            ))
+            ),
+        )
+        .await
+    }
+
+    /// The role objects in a template database belong to (named like the database):
+    /// no login, no members, never owns a database, so REASSIGN OWNED from it (`adopt`)
+    /// only moves objects.
+    async fn ensure_owner_role(&self, role: &str) -> Result<()> {
+        self.upsert_role(
+            role,
+            "NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT",
+        )
+        .await
+    }
+
+    async fn upsert_role(&self, role: &str, options: &str) -> Result<()> {
+        let admin = self.admin().await?;
+        let verb = if role_exists(&admin, role).await? {
+            "ALTER"
+        } else {
+            "CREATE"
+        };
+        admin
+            .batch_execute(&format!("{verb} ROLE {} WITH {options}", quote_ident(role)))
             .await
             .with_context(|| format!("creating role {role}"))?;
         Ok(())
     }
 
-    pub async fn drop_role(&self, role: &str) -> Result<()> {
-        let admin = self.admin().await?;
-        let exists = admin
-            .query_opt("SELECT 1 FROM pg_roles WHERE rolname = $1", &[&role])
+    /// In `db`, give everything `from` owns to `to` (tables, sequences, types,
+    /// functions, schemas, extensions, default privileges), so `to` can migrate a
+    /// cloned database. REASSIGN OWNED also moves the databases `from` owns, cluster
+    /// wide: they are handed back in the same transaction, with CREATE DATABASE
+    /// blocked meanwhile. Nothing to do when `from` doesn't exist.
+    pub async fn adopt(&self, db: &str, from: &str, to: &str) -> Result<()> {
+        if from == to || from == "postgres" {
+            return Ok(());
+        }
+        let mut client = self.connect(db).await?;
+        // The usual case, `from` owns nothing here (or doesn't exist): no locks at all.
+        let owns = client
+            .query_opt(
+                "SELECT 1 FROM pg_shdepend d JOIN pg_roles r ON r.oid = d.refobjid
+                 WHERE r.rolname = $1 AND d.deptype = 'o'
+                   AND d.dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+                 LIMIT 1",
+                &[&from],
+            )
             .await?
             .is_some();
-        if exists {
+        if !owns {
+            return Ok(());
+        }
+        let tx = client.transaction().await?;
+        // Not stuck behind a client's open transaction for long. SHARE ROW EXCLUSIVE
+        // conflicts with itself: concurrent adopts queue here instead of deadlocking.
+        tx.batch_execute(
+            "SET LOCAL lock_timeout = '10s';
+             LOCK TABLE pg_catalog.pg_database IN SHARE ROW EXCLUSIVE MODE",
+        )
+        .await?;
+        // Event triggers must belong to a superuser (made by checkout roles back when
+        // they were ones): to postgres, not to `to`.
+        let triggers: Vec<String> = tx
+            .query(
+                "SELECT evtname::text FROM pg_event_trigger WHERE evtowner = (SELECT oid FROM pg_roles WHERE rolname = $1)",
+                &[&from],
+            )
+            .await?
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        for t in &triggers {
+            tx.batch_execute(&format!(
+                "ALTER EVENT TRIGGER {} OWNER TO postgres",
+                quote_ident(t)
+            ))
+            .await?;
+        }
+        let owned: Vec<String> = tx
+            .query(
+                "SELECT datname::text FROM pg_database WHERE datdba = (SELECT oid FROM pg_roles WHERE rolname = $1)",
+                &[&from],
+            )
+            .await?
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        let mut sql = format!(
+            "REASSIGN OWNED BY {} TO {};",
+            quote_ident(from),
+            quote_ident(to)
+        );
+        for d in &owned {
+            sql += &format!(
+                "ALTER DATABASE {} OWNER TO {};",
+                quote_ident(d),
+                quote_ident(from)
+            );
+        }
+        tx.batch_execute(&sql)
+            .await
+            .with_context(|| format!("{db}: giving {from}'s objects to {to}"))?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Every new database starts from template1: close `public` in it (and in
+    /// `postgres`) to checkout roles (the default since PostgreSQL 15), since they may
+    /// connect to both, and create `extensions` there as superuser, for extensions that
+    /// aren't trusted (postgis, vector): databases made later have them, and apps'
+    /// `CREATE EXTENSION IF NOT EXISTS` is a no-op.
+    pub async fn prepare_templates(&self, extensions: &[String]) -> Result<()> {
+        let admin = self.admin().await?;
+        // Checkout roles were superusers before; nothing but the daemon's is now.
+        let supers: Vec<String> = admin
+            .query(
+                "SELECT rolname::text FROM pg_roles WHERE rolsuper AND rolname <> 'postgres'",
+                &[],
+            )
+            .await?
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        for r in &supers {
+            admin
+                .batch_execute(&format!("ALTER ROLE {} NOSUPERUSER", quote_ident(r)))
+                .await
+                .with_context(|| format!("revoking SUPERUSER from {r}"))?;
+            info!("{r}: no longer a superuser");
+        }
+        for db in ["template1", "postgres"] {
+            self.connect(db)
+                .await?
+                .batch_execute("REVOKE CREATE ON SCHEMA public FROM PUBLIC")
+                .await
+                .with_context(|| format!("{db}: revoking CREATE on public"))?;
+        }
+        if let Err(e) = self.create_extensions("template1", extensions).await {
+            warn!("{e:#}");
+        }
+        Ok(())
+    }
+
+    /// Make `role` the owner of database `db`.
+    pub async fn set_owner(&self, db: &str, role: &str) -> Result<()> {
+        self.admin()
+            .await?
+            .batch_execute(&format!(
+                "ALTER DATABASE {} OWNER TO {}",
+                quote_ident(db),
+                quote_ident(role)
+            ))
+            .await
+            .with_context(|| format!("giving database {db} to {role}"))?;
+        Ok(())
+    }
+
+    /// `CREATE EXTENSION IF NOT EXISTS` each of `extensions` in `db`, as superuser.
+    pub async fn create_extensions(&self, db: &str, extensions: &[String]) -> Result<()> {
+        if extensions.is_empty() {
+            return Ok(());
+        }
+        let client = self.connect(db).await?;
+        for e in extensions {
+            client
+                .batch_execute(&format!(
+                    "CREATE EXTENSION IF NOT EXISTS {} CASCADE",
+                    quote_ident(e)
+                ))
+                .await
+                .with_context(|| format!("{db}: CREATE EXTENSION {e}"))?;
+        }
+        Ok(())
+    }
+
+    pub async fn drop_role(&self, role: &str) -> Result<()> {
+        let admin = self.admin().await?;
+        if role_exists(&admin, role).await? {
             let r = quote_ident(role);
             admin
                 .batch_execute(&format!(
@@ -431,9 +601,11 @@ impl Postgres {
 
     /// Replace `dst` with a clone of `src`, closing `src`'s connections (PostgreSQL
     /// refuses to copy a database in use; clients reconnect). The clone is built as
-    /// `<dst>_next`; the old `dst` is only dropped and the new one renamed in while
-    /// holding `lock` (the one clones of `dst` are made under), so a clone never finds
-    /// `dst` missing.
+    /// `<dst>_next`, its objects given to the NOLOGIN role named `dst`
+    /// (`ensure_owner_role`), not `src`'s owner: clones of `dst` hand them to their
+    /// checkout's role (`adopt`). Only then are the old `dst` dropped and the new one
+    /// renamed in, holding `lock` (the one clones of `dst` are made under), so a clone
+    /// never finds `dst` missing.
     pub async fn snapshot(&self, src: &str, dst: &str, lock: &Mutex<()>) -> Result<()> {
         let tmp = format!("{dst}_next");
         self.drop(&tmp).await?;
@@ -453,6 +625,10 @@ impl Postgres {
         if let Some(e) = last {
             return Err(e);
         }
+        if let Some(from) = self.owner(src).await? {
+            self.ensure_owner_role(dst).await?;
+            self.adopt(&tmp, &from, dst).await?;
+        }
         let _g = lock.lock().await;
         self.drop(dst).await?;
         self.admin()
@@ -464,5 +640,221 @@ impl Postgres {
             ))
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A throwaway cluster from `initdb` / `postgres` in PATH (skipped without them,
+    /// e.g. CI's unit test job; the e2e job covers the daemon).
+    async fn cluster() -> Option<(Postgres, tempfile::TempDir)> {
+        let bin = which("initdb")?.parent()?.to_path_buf();
+        // Short: unix socket paths are limited to ~104 bytes.
+        let tmp = tempfile::Builder::new()
+            .prefix("lfpg")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let data = tmp.path().join("data");
+        let out = std::process::Command::new(bin.join("initdb"))
+            .arg("-D")
+            .arg(&data)
+            .args(["--username=postgres", "--auth=trust", "--no-sync"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let child = tokio::process::Command::new(bin.join("postgres"))
+            .arg("-D")
+            .arg(&data)
+            .args(["-c", "listen_addresses=", "-c", "fsync=off", "-c"])
+            .arg(format!("unix_socket_directories={}", tmp.path().display()))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pg = Postgres {
+            dir: tmp.path().to_path_buf(),
+            port: 5432,
+            child: Mutex::new(Some(child)),
+            file_copy_method: "copy".into(),
+        };
+        for _ in 0..100 {
+            if pg.connect("postgres").await.is_ok() {
+                return Some((pg, tmp));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("test cluster did not start");
+    }
+
+    async fn as_role(pg: &Postgres, role: &str, db: &str) -> tokio_postgres::Client {
+        let (client, conn) = tokio_postgres::Config::new()
+            .host_path(&pg.dir)
+            .port(pg.port)
+            .user(role)
+            .dbname(db)
+            .connect(tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(conn);
+        client
+    }
+
+    async fn owners(pg: &Postgres, db: &str) -> Vec<String> {
+        pg.connect(db)
+            .await
+            .unwrap()
+            .query(
+                "SELECT DISTINCT pg_get_userbyid(relowner)::text FROM pg_class WHERE relnamespace = 'public'::regnamespace
+                 UNION SELECT pg_get_userbyid(typowner)::text FROM pg_type WHERE typnamespace = 'public'::regnamespace
+                 UNION SELECT pg_get_userbyid(extowner)::text FROM pg_extension WHERE extname <> 'plpgsql'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get(0))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn checkout_roles_are_no_superusers() {
+        let Some((pg, _tmp)) = cluster().await else {
+            eprintln!("no initdb in PATH; skipped");
+            return;
+        };
+        // From before: a superuser checkout role (another naming scheme) with a
+        // database, tables and an event trigger in it.
+        let admin = pg.connect("postgres").await.unwrap();
+        admin
+            .batch_execute("CREATE ROLE old LOGIN SUPERUSER")
+            .await
+            .unwrap();
+        pg.create("app_old_x", None, Some("old")).await.unwrap();
+        as_role(&pg, "old", "app_old_x")
+            .await
+            .batch_execute(
+                "CREATE TABLE t(id int); CREATE TABLE u(id int);
+                 CREATE FUNCTION evt() RETURNS event_trigger LANGUAGE plpgsql AS 'BEGIN END';
+                 CREATE EVENT TRIGGER et ON ddl_command_start EXECUTE FUNCTION evt()",
+            )
+            .await
+            .unwrap();
+        pg.prepare_templates(&[]).await.unwrap();
+        let supers = admin
+            .query(
+                "SELECT 1 FROM pg_roles WHERE rolsuper AND rolname <> 'postgres'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert!(supers.is_empty(), "superusers left");
+        for role in ["app", "app-x", "app-y"] {
+            pg.ensure_role(role, "pw").await.unwrap();
+        }
+        pg.create("app_dev", None, Some("app")).await.unwrap();
+        pg.create("app_test", None, Some("app")).await.unwrap();
+        // The primary's migrations, with a trusted extension.
+        as_role(&pg, "app", "app_dev")
+            .await
+            .batch_execute(
+                "CREATE EXTENSION pgcrypto; CREATE TYPE mood AS ENUM ('ok');
+                 CREATE TABLE seeds(id serial PRIMARY KEY, m mood); INSERT INTO seeds(m) VALUES ('ok')",
+            )
+            .await
+            .unwrap();
+
+        pg.snapshot("app_dev", "app_template", &Mutex::new(()))
+            .await
+            .unwrap();
+        assert_eq!(owners(&pg, "app_template").await, ["app_template"]);
+        // REASSIGN OWNED moved the primary's databases too; they were handed back.
+        assert_eq!(pg.owner("app_dev").await.unwrap().as_deref(), Some("app"));
+        assert_eq!(pg.owner("app_test").await.unwrap().as_deref(), Some("app"));
+
+        // A worktree's clone: its role can migrate what came from the template.
+        pg.create("app_dev_x", Some("app_template"), Some("app-x"))
+            .await
+            .unwrap();
+        pg.adopt("app_dev_x", "app_template", "app-x")
+            .await
+            .unwrap();
+        pg.adopt("app_dev_x", "app", "app-x").await.unwrap();
+        assert_eq!(owners(&pg, "app_dev_x").await, ["app-x"]);
+        assert_eq!(pg.owner("app_dev").await.unwrap().as_deref(), Some("app"));
+        let x = as_role(&pg, "app-x", "app_dev_x").await;
+        x.batch_execute(
+            "ALTER TABLE seeds ADD COLUMN y int; ALTER TYPE mood ADD VALUE 'meh';
+             DROP EXTENSION pgcrypto; CREATE EXTENSION citext",
+        )
+        .await
+        .unwrap();
+
+        // Its own databases: yes. Anything else: no.
+        let x = as_role(&pg, "app-x", "postgres").await;
+        x.batch_execute("CREATE DATABASE app_test_x").await.unwrap();
+        x.batch_execute("DROP DATABASE app_test_x").await.unwrap();
+        for sql in [
+            "DROP DATABASE app_dev",
+            "DROP DATABASE app_template",
+            "ALTER DATABASE app_dev OWNER TO \"app-x\"",
+            "ALTER ROLE app SUPERUSER",
+            "ALTER ROLE \"app-y\" PASSWORD 'mine'",
+            "DROP ROLE \"app-y\"",
+            "SET ROLE app_template",
+            "COPY (SELECT 1) TO PROGRAM 'true'",
+            "SELECT pg_read_file('postgresql.conf')",
+            "CREATE TABLE evil(x int)",
+        ] {
+            assert!(x.batch_execute(sql).await.is_err(), "{sql} went through");
+        }
+        let t1 = as_role(&pg, "app-x", "template1").await;
+        assert!(t1.batch_execute("CREATE TABLE evil(x int)").await.is_err());
+        // The old role's database goes to the checkout's role, event trigger to postgres.
+        pg.set_owner("app_old_x", "app-x").await.unwrap();
+        pg.adopt("app_old_x", "old", "app-x").await.unwrap();
+        assert_eq!(owners(&pg, "app_old_x").await, ["app-x"]);
+        let evt: String = pg
+            .connect("app_old_x")
+            .await
+            .unwrap()
+            .query_one(
+                "SELECT pg_get_userbyid(evtowner)::text FROM pg_event_trigger",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(evt, "postgres");
+        as_role(&pg, "app-x", "app_old_x")
+            .await
+            .batch_execute("ALTER TABLE t ADD COLUMN y int; DROP TABLE u")
+            .await
+            .unwrap();
+        // Nothing left to hand over: no-op.
+        pg.adopt("app_old_x", "old", "app-x").await.unwrap();
+
+        // Concurrent adopts queue on pg_database instead of deadlocking.
+        for (db, role) in [("app_dev_y", "app-y"), ("app_dev_z", "app-z")] {
+            pg.ensure_role(role, "pw").await.unwrap();
+            pg.create(db, Some("app_template"), Some(role))
+                .await
+                .unwrap();
+        }
+        let (a, b) = tokio::join!(
+            pg.adopt("app_dev_y", "app_template", "app-y"),
+            pg.adopt("app_dev_z", "app_template", "app-z"),
+        );
+        a.unwrap();
+        b.unwrap();
+        assert_eq!(owners(&pg, "app_dev_y").await, ["app-y"]);
+        assert_eq!(owners(&pg, "app_dev_z").await, ["app-z"]);
+        pg.stop().await;
     }
 }
