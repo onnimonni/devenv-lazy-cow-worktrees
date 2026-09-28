@@ -194,19 +194,20 @@ Service options:
 | `env` | `{}` | extra environment |
 | `restart` | `"no"` | when it exits on its own: `"no"`, `"on-failure"` (non-zero exit) or `"always"`; backs off 1–30 s, `localforest service stop` keeps it down |
 | `restartOnPull` | `false` | restart it (if running) after the base branch was pulled into its checkout and migrated; for servers without a code reloader |
-| `restartOnMixChange` | `true` | a command running `mix`: restart it (if running) when `mix.exs`, `mix.lock` or `config/*.exs` change; see below |
+| `restartOnChange` | Mix: `[ "mix.exs" "mix.lock" "config/*.exs" ]`, else `[]` | files (relative to `cwd`, `*` / `?` in the file name) whose content changing restarts it if running; see below |
 | `ports.<name>` | `{}` | further ports it listens on; see below |
 
 Commands are split like a shell would, then run directly (no shell) with the
 service's environment and the project's `PATH`. Logs: `localforest service log -s <name>`.
 
-A running service whose command runs `mix` (`mix phx.server`, `iex -S mix …`) is
-restarted when the content of `mix.exs`, `mix.lock` or `config/*.exs` in its `cwd`
-changes (a pull, `mix deps.get`, an agent's edit), after a second without further
-changes: Phoenix's code reloader refuses to compile after that until the server restarts.
-When `mix.exs` or `mix.lock` changed, `localforest.setup` (e.g. `mix deps.get`) runs
-in the checkout first, once for all its services. `restartOnMixChange = false` turns
-this off for a service.
+A running service is restarted when the content of a `restartOnChange` file changes
+(a pull, a dependency update, an agent's edit), after a second without further changes
+and after `localforest.setup` (`mix deps.get`, `bundle install`, …) ran in the checkout,
+once for all its services. For a command running `mix` (`mix phx.server`,
+`iex -S mix …`) it defaults to `mix.exs`, `mix.lock` and `config/*.exs`: Phoenix's code
+reloader refuses to compile after those change until the server restarts. Others opt
+in, e.g. Rails with `restartOnChange = [ "Gemfile.lock" "config/*.rb" ]`; `[ ]` turns it
+off.
 
 Named ports, for a service that listens on more than `$PORT` (a debugger, a test
 endpoint), so the app reads a variable instead of computing an offset:

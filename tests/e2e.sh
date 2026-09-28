@@ -206,13 +206,13 @@ eventually 30 mix_starts 2 || fail "mix service not restarted after mix.lock cha
 setups $((before + 1)) || fail "setup did not run before the restart"
 mkdir -p config && echo 'import Config' > config/dev.exs
 eventually 30 mix_starts 3 || fail "mix service not restarted after config/dev.exs appeared"
-setups $((before + 1)) || fail "setup ran for a config change"
+setups $((before + 2)) || fail "setup did not run for a config change"
 rm -r config
 eventually 30 mix_starts 4 || fail "mix service not restarted after config/dev.exs was removed"
 eventually 30 curl_lf -f -o /dev/null "https://phx.demo.localhost:8443/" || fail "mix service down after restart"
 git checkout -q mix.lock
 eventually 30 mix_starts 5 || fail "mix service not restarted after mix.lock was restored"
-pass "mix service restarted when mix.lock or config changed, setup first for mix.lock"
+pass "mix service restarted, after setup, when mix.lock or config changed"
 
 # A fresh primary database (as after a reboot) while the primary is on a feature
 # branch: migrated anyway, but the template is not made from the feature branch.
