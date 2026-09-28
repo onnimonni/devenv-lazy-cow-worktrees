@@ -97,7 +97,7 @@ impl MigrateFailure {
 /// Marker of a checkout's succeeded setup, in its git admin dir (a worktree's goes
 /// away with it).
 fn setup_marker(path: &Path) -> Result<PathBuf> {
-    Ok(Repository::open(path)?.path().join("localforest-setup"))
+    Ok(Repository::open(path)?.path().join(worktree::SETUP_MARKER))
 }
 
 #[derive(Debug, PartialEq)]
