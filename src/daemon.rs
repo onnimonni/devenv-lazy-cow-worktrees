@@ -864,6 +864,23 @@ impl Daemon {
             .ok()
             .and_then(|r| r.head().ok()?.target())
             .map(|o| o.to_string());
+        let (root, path) = (rt.project.root.clone(), info.path.clone());
+        if let Ok(Ok(files)) =
+            tokio::task::spawn_blocking(move || worktree::ignored_files(&root, &path)).await
+            && !files.is_empty()
+        {
+            warn!(
+                "{}: deleting gitignored {}{}",
+                info.name,
+                files
+                    .iter()
+                    .take(20)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if files.len() > 20 { ", …" } else { "" }
+            );
+        }
         let c = rt.project.checkout(Some(&info.name), info.path.clone());
         self.servers.stop_checkout(&c).await;
         // Whatever else runs there: a server started by hand, iex, watchers.

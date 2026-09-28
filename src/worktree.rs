@@ -501,6 +501,37 @@ pub fn is_dirty(path: &Path) -> Result<bool> {
         .any(|e| e.status() != Status::CURRENT))
 }
 
+/// Build caches whose loss costs only a rebuild.
+const REBUILDABLE: &[&str] = &["_build", "deps", "node_modules", "target"];
+
+/// Gitignored paths in the worktree at `path` that removal would delete for good:
+/// not build caches or per-checkout state, and not copies of the primary checkout
+/// at `root` (directories it has too, files identical to its own). Ignored
+/// directories are not looked into.
+pub fn ignored_files(root: &Path, path: &Path) -> Result<Vec<String>> {
+    let repo = Repository::open(path)?;
+    let mut opts = StatusOptions::new();
+    opts.include_untracked(false)
+        .include_ignored(true)
+        .recurse_ignored_dirs(false)
+        .exclude_submodules(true);
+    Ok(repo
+        .statuses(Some(&mut opts))?
+        .iter()
+        .filter(|e| e.status().contains(Status::IGNORED))
+        .filter_map(|e| e.path().ok().map(str::to_string))
+        .filter(|p| {
+            let top = p.split('/').next().unwrap_or_default();
+            let copy = match p.strip_suffix('/') {
+                Some(dir) => root.join(dir).is_dir(),
+                None => std::fs::read(root.join(p))
+                    .is_ok_and(|a| std::fs::read(path.join(p)).is_ok_and(|b| a == b)),
+            };
+            !REBUILDABLE.contains(&top) && !NOT_CACHES.contains(&top) && !copy
+        })
+        .collect())
+}
+
 pub enum Safety {
     /// Nothing can be lost.
     Safe,
@@ -871,6 +902,27 @@ mod tests {
         assert!(repo.find_branch("feat-x", BranchType::Local).is_err());
         // Can be created again.
         create(&project, &syncer, "feat-x", None).unwrap();
+    }
+
+    #[test]
+    fn lists_ignored_files_only_the_worktree_has() {
+        let (_d, project, syncer) = fixture();
+        let path = create(&project, &syncer, "feat-x", None).unwrap();
+        // Carried from the primary (cache/big), build caches, localforest's .env: quiet.
+        std::fs::create_dir(path.join("node_modules")).unwrap();
+        std::fs::write(path.join("node_modules/x"), "").unwrap();
+        std::fs::write(path.join(".env"), "A=1\n").unwrap();
+        let exclude = project.root.join(".git/info/exclude");
+        std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        std::fs::write(&exclude, "*.local\n").unwrap();
+        std::fs::write(project.root.join("same.local"), "x\n").unwrap();
+        std::fs::write(path.join("same.local"), "x\n").unwrap();
+        assert!(ignored_files(&project.root, &path).unwrap().is_empty());
+        std::fs::write(path.join("secrets.local"), "mine\n").unwrap();
+        std::fs::write(path.join("same.local"), "edited\n").unwrap();
+        let mut files = ignored_files(&project.root, &path).unwrap();
+        files.sort();
+        assert_eq!(files, vec!["same.local", "secrets.local"]);
     }
 
     #[test]
