@@ -339,23 +339,31 @@ fn parse(buf: &mut BytesMut) -> std::result::Result<Option<Vec<Vec<u8>>>, String
     Ok(Some(args))
 }
 
-/// Whether `args` (a process's command line) is a redis-server (`names`) listening on
-/// `socket`. redis-server rewrites its title to `<argv0> unixsocket:<socket>`, so
-/// both forms count.
+/// Whether `args` (a process's argv) is a redis-server (`names`) listening on
+/// `socket`: as started (`--unixsocket <socket>` as whole argv entries), or with the
+/// title redis-server rewrites its argv to, one entry
+/// `<argv0> unixsocket:<socket>[ <server mode>]`. Paths may contain spaces.
 fn ours(args: &[String], names: &[String], socket: &Path) -> bool {
-    let line = args.join(" ");
-    let Some(prog) = line.split_whitespace().next() else {
+    let socket = socket.to_string_lossy();
+    let prog_ok = |p: &str| {
+        Path::new(p)
+            .file_name()
+            .is_some_and(|n| names.iter().any(|m| **m == *n.to_string_lossy()))
+    };
+    let Some(first) = args.first() else {
         return false;
     };
-    let prog = Path::new(prog)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let socket = socket.to_string_lossy();
-    names.contains(&prog)
-        && line
-            .split_whitespace()
-            .any(|w| w == socket || w.strip_prefix("unixsocket:") == Some(&socket))
+    if prog_ok(first) && args[1..].iter().any(|a| *a == *socket) {
+        return true;
+    }
+    const TAG: &str = " unixsocket:";
+    first.match_indices(TAG).any(|(i, _)| {
+        let rest = &first[i + TAG.len()..];
+        prog_ok(&first[..i])
+            && rest
+                .strip_prefix(&*socket)
+                .is_some_and(|r| r.is_empty() || r.starts_with(' '))
+    })
 }
 
 /// Command line of process `pid`, None if it is gone or unreadable.
@@ -435,20 +443,20 @@ mod tests {
         let sock = Path::new("/state/redis/abc.sock");
         let names = ["redis-server".to_string()];
         let args = |s: &str| s.split(' ').map(str::to_string).collect::<Vec<_>>();
-        // As started, and with its rewritten title.
+        // As started (argv entries), and with its rewritten title (one entry).
         assert!(ours(
             &args("/nix/store/x/bin/redis-server --port 0 --unixsocket /state/redis/abc.sock"),
             &names,
             sock
         ));
         assert!(ours(
-            &args("/nix/store/x/bin/redis-server unixsocket:/state/redis/abc.sock"),
+            &["/nix/store/x/bin/redis-server unixsocket:/state/redis/abc.sock".to_string()],
             &names,
             sock
         ));
         // Another checkout's, another program, nothing.
         assert!(!ours(
-            &args("redis-server unixsocket:/state/redis/def.sock"),
+            &["redis-server unixsocket:/state/redis/def.sock".to_string()],
             &names,
             sock
         ));
@@ -458,6 +466,35 @@ mod tests {
             sock
         ));
         assert!(!ours(&[], &names, sock));
+
+        // Whole argv entries: a socket path with a space.
+        let spaced = Path::new("/Users/me/My State/redis/abc.sock");
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(ours(
+            &argv(&[
+                "/opt/my bin/redis-server",
+                "--unixsocket",
+                "/Users/me/My State/redis/abc.sock"
+            ]),
+            &names,
+            spaced
+        ));
+        assert!(ours(
+            &argv(&["redis-server unixsocket:/Users/me/My State/redis/abc.sock "]),
+            &names,
+            spaced
+        ));
+        // A prefix of the path, or its pieces as separate words, isn't it.
+        assert!(!ours(
+            &argv(&["redis-server", "--unixsocket", "/Users/me/My"]),
+            &names,
+            spaced
+        ));
+        assert!(!ours(
+            &argv(&["redis-server unixsocket:/Users/me/My State/redis/abc.sock2"]),
+            &names,
+            spaced
+        ));
     }
 
     #[test]
