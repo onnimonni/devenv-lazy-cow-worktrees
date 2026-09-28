@@ -8,7 +8,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, RwLock},
     time::Duration,
@@ -77,13 +77,7 @@ impl Redis {
         }
         std::fs::create_dir_all(&self.dir)?;
         let pidfile = self.stem(id).with_extension("pid");
-        // A redis-server left by a crashed daemon.
-        if let Ok(pid) = std::fs::read_to_string(&pidfile)
-            && let Ok(pid) = pid.trim().parse::<i32>()
-        {
-            unsafe { libc::kill(pid, libc::SIGKILL) };
-        }
-        let _ = std::fs::remove_file(&socket);
+        self.kill_stale(&pidfile, &socket);
         let server = match &self.server {
             Some(s) => s.clone(),
             None => crate::postgres::which("redis-server")
@@ -122,6 +116,40 @@ impl Redis {
         bail!("redis-server for {id} did not start")
     }
 
+    /// Kill a redis-server left by a crashed daemon: only when the pidfile's process
+    /// is still a redis-server on this checkout's socket, as the pid may have been
+    /// reused (the pidfile outlives reboots).
+    fn kill_stale(&self, pidfile: &Path, socket: &Path) {
+        if let Ok(pid) = std::fs::read_to_string(pidfile)
+            && let Ok(pid) = pid.trim().parse::<i32>()
+            && pid > 0
+        {
+            let names = self.server_names();
+            match process_args(pid) {
+                Some(args) if ours(&args, &names, socket) => {
+                    info!("killing stale redis-server {pid} on {}", socket.display());
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+                Some(_) => warn!(
+                    "{}: pid {pid} is not our redis-server; leaving it",
+                    pidfile.display()
+                ),
+                None => {}
+            }
+        }
+        let _ = std::fs::remove_file(pidfile);
+        let _ = std::fs::remove_file(socket);
+    }
+
+    /// Program names a redis-server of ours runs as.
+    fn server_names(&self) -> Vec<String> {
+        let mut names = vec!["redis-server".to_string()];
+        if let Some(n) = self.server.as_deref().and_then(Path::file_name) {
+            names.push(n.to_string_lossy().into_owned());
+        }
+        names
+    }
+
     /// Stop and forget a checkout's redis-server (its data is gone).
     pub async fn remove(&self, id: &str) {
         self.known.write().unwrap().remove(id);
@@ -134,8 +162,12 @@ impl Redis {
     }
 
     pub async fn stop_all(&self) {
-        for (_, mut c) in self.procs.lock().await.drain() {
+        for (id, mut c) in self.procs.lock().await.drain() {
             let _ = c.kill().await;
+            // SIGKILL leaves them behind.
+            for ext in ["sock", "pid"] {
+                let _ = std::fs::remove_file(self.stem(&id).with_extension(ext));
+            }
         }
     }
 
@@ -307,6 +339,97 @@ fn parse(buf: &mut BytesMut) -> std::result::Result<Option<Vec<Vec<u8>>>, String
     Ok(Some(args))
 }
 
+/// Whether `args` (a process's argv) is a redis-server (`names`) listening on
+/// `socket`: as started (`--unixsocket <socket>` as whole argv entries), or with the
+/// title redis-server rewrites its argv to, one entry
+/// `<argv0> unixsocket:<socket>[ <server mode>]`. Paths may contain spaces.
+fn ours(args: &[String], names: &[String], socket: &Path) -> bool {
+    let socket = socket.to_string_lossy();
+    let prog_ok = |p: &str| {
+        Path::new(p)
+            .file_name()
+            .is_some_and(|n| names.iter().any(|m| **m == *n.to_string_lossy()))
+    };
+    let Some(first) = args.first() else {
+        return false;
+    };
+    if prog_ok(first) && args[1..].iter().any(|a| *a == *socket) {
+        return true;
+    }
+    const TAG: &str = " unixsocket:";
+    first.match_indices(TAG).any(|(i, _)| {
+        let rest = &first[i + TAG.len()..];
+        prog_ok(&first[..i])
+            && rest
+                .strip_prefix(&*socket)
+                .is_some_and(|r| r.is_empty() || r.starts_with(' '))
+    })
+}
+
+/// Command line of process `pid`, None if it is gone or unreadable.
+#[cfg(target_os = "linux")]
+fn process_args(pid: i32) -> Option<Vec<String>> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    Some(
+        raw.split(|b| *b == 0)
+            .filter(|a| !a.is_empty())
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect(),
+    )
+}
+
+/// Command line of process `pid` (sysctl KERN_PROCARGS2), None if it is gone or
+/// unreadable.
+#[cfg(target_os = "macos")]
+fn process_args(pid: i32) -> Option<Vec<String>> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let mut size: libc::size_t = 0;
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || size < 4 {
+        return None;
+    }
+    let mut buf = vec![0u8; size];
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buf.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || size < 4 {
+        return None;
+    }
+    buf.truncate(size);
+    // argc, the executable's path, NUL padding, then argc NUL-terminated arguments.
+    let argc = i32::from_ne_bytes(buf[..4].try_into().ok()?).max(0) as usize;
+    let mut parts = buf[4..].split(|b| *b == 0).filter(|a| !a.is_empty());
+    parts.next()?;
+    Some(
+        parts
+            .take(argc)
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect(),
+    )
+}
+
+/// Unknown platform: never trust a pidfile.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_args(_pid: i32) -> Option<Vec<String>> {
+    None
+}
+
 pub fn dir() -> PathBuf {
     crate::config::home().join("redis")
 }
@@ -314,6 +437,116 @@ pub fn dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recognises_our_redis_server() {
+        let sock = Path::new("/state/redis/abc.sock");
+        let names = ["redis-server".to_string()];
+        let args = |s: &str| s.split(' ').map(str::to_string).collect::<Vec<_>>();
+        // As started (argv entries), and with its rewritten title (one entry).
+        assert!(ours(
+            &args("/nix/store/x/bin/redis-server --port 0 --unixsocket /state/redis/abc.sock"),
+            &names,
+            sock
+        ));
+        assert!(ours(
+            &["/nix/store/x/bin/redis-server unixsocket:/state/redis/abc.sock".to_string()],
+            &names,
+            sock
+        ));
+        // Another checkout's, another program, nothing.
+        assert!(!ours(
+            &["redis-server unixsocket:/state/redis/def.sock".to_string()],
+            &names,
+            sock
+        ));
+        assert!(!ours(
+            &args("/usr/bin/vim /state/redis/abc.sock"),
+            &names,
+            sock
+        ));
+        assert!(!ours(&[], &names, sock));
+
+        // Whole argv entries: a socket path with a space.
+        let spaced = Path::new("/Users/me/My State/redis/abc.sock");
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(ours(
+            &argv(&[
+                "/opt/my bin/redis-server",
+                "--unixsocket",
+                "/Users/me/My State/redis/abc.sock"
+            ]),
+            &names,
+            spaced
+        ));
+        assert!(ours(
+            &argv(&["redis-server unixsocket:/Users/me/My State/redis/abc.sock "]),
+            &names,
+            spaced
+        ));
+        // A prefix of the path, or its pieces as separate words, isn't it.
+        assert!(!ours(
+            &argv(&["redis-server", "--unixsocket", "/Users/me/My"]),
+            &names,
+            spaced
+        ));
+        assert!(!ours(
+            &argv(&["redis-server unixsocket:/Users/me/My State/redis/abc.sock2"]),
+            &names,
+            spaced
+        ));
+    }
+
+    #[test]
+    fn reads_process_args() {
+        let me = process_args(std::process::id() as i32).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let name = exe.file_name().unwrap().to_string_lossy();
+        assert!(me[0].ends_with(&*name), "{me:?}");
+        assert!(process_args(i32::MAX).is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_pidfile_of_another_process_is_left_alone() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let r = Redis::new(dir.path().into(), crate::history::Activity::default(), None);
+        let pidfile = dir.path().join("x.pid");
+        let socket = dir.path().join("x.sock");
+        // This test process: not a redis-server, so it survives.
+        std::fs::write(&pidfile, std::process::id().to_string()).unwrap();
+        std::fs::write(&socket, "").unwrap();
+        r.kill_stale(&pidfile, &socket);
+        assert!(!pidfile.exists() && !socket.exists());
+    }
+
+    #[tokio::test]
+    async fn kills_stale_redis_server_of_crashed_daemon() {
+        if crate::postgres::which("redis-server").is_none() {
+            eprintln!("skipped: no redis-server in PATH");
+            return;
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let crashed = Redis::new(dir.path().into(), crate::history::Activity::default(), None);
+        let socket = crashed.ensure("a").await.unwrap();
+        let pidfile = crashed.stem("a").with_extension("pid");
+        let mut pid = String::new();
+        for _ in 0..250 {
+            pid = std::fs::read_to_string(&pidfile).unwrap_or_default();
+            if !pid.trim().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let pid: i32 = pid.trim().parse().unwrap();
+        // The daemon dies without killing its child.
+        std::mem::forget(crashed);
+        let next = Redis::new(dir.path().into(), crate::history::Activity::default(), None);
+        next.kill_stale(&pidfile, &socket);
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL);
+        assert!(!pidfile.exists());
+    }
 
     #[test]
     fn parses_resp_and_inline() {
