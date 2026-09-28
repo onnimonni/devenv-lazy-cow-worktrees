@@ -416,6 +416,25 @@ const NOT_CACHES: &[&str] = &[
     ".expert",
 ];
 
+/// `git worktree lock`ed: automatic removal leaves it alone.
+pub fn is_locked(root: &Path, info: &Info) -> bool {
+    let Ok(repo) = Repository::open(root) else {
+        return false;
+    };
+    repo.worktrees()
+        .ok()
+        .into_iter()
+        .flat_map(|names| {
+            names
+                .iter()
+                .filter_map(|n| n.ok().flatten().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .filter_map(|n| repo.find_worktree(&n).ok())
+        .find(|wt| wt.path().canonicalize().ok().as_deref() == Some(info.path.as_path()))
+        .is_some_and(|wt| matches!(wt.is_locked(), Ok(git2::WorktreeLockStatus::Locked(_))))
+}
+
 /// `git worktree add` is still creating it (git locks it meanwhile).
 pub fn initializing(root: &Path, info: &Info) -> bool {
     let Ok(repo) = Repository::open(root) else {
@@ -605,8 +624,9 @@ pub fn remove_files(root: &Path, info: &Info) -> Result<()> {
     } else {
         trash
     };
-    // Only this worktree's admin dir: other invalid (e.g. locked, on an unmounted
-    // volume) worktrees are left alone.
+    // Ours (even if locked), then any other stale unlocked admin dir (what `git
+    // worktree prune` does: worktrees deleted by hand). Locked ones, e.g. on an
+    // unmounted volume, are left alone.
     let own = repo
         .worktrees()?
         .iter()
@@ -623,6 +643,14 @@ pub fn remove_files(root: &Path, info: &Info) -> Result<()> {
     {
         let _ = wt.unlock();
         wt.prune(Some(WorktreePruneOptions::new().locked(true)))?;
+    }
+    for admin in repo.worktrees()?.iter().filter_map(|n| n.ok().flatten()) {
+        if let Ok(wt) = repo.find_worktree(admin)
+            && wt.validate().is_err()
+            && matches!(wt.is_locked(), Ok(git2::WorktreeLockStatus::Unlocked))
+        {
+            wt.prune(None)?;
+        }
     }
     if let Some(b) = &info.branch
         && *b == info.name
@@ -882,9 +910,10 @@ mod tests {
     }
 
     #[test]
-    fn removal_leaves_other_locked_worktrees_alone() {
+    fn removal_prunes_stale_unlocked_but_not_locked_worktrees() {
         let (_d, project, syncer) = fixture();
         let away = create(&project, &syncer, "away", None).unwrap();
+        let by_hand = create(&project, &syncer, "by-hand", None).unwrap();
         create(&project, &syncer, "gone", None).unwrap();
         let repo = Repository::open(&project.root).unwrap();
         // Locked on purpose, its volume unmounted: invalid, but not ours to prune.
@@ -892,20 +921,21 @@ mod tests {
             .unwrap()
             .lock(Some("on a usb disk"))
             .unwrap();
-        let info = list(&project.root)
-            .unwrap()
-            .into_iter()
-            .find(|i| i.name == "gone")
-            .unwrap();
+        let infos = list(&project.root).unwrap();
+        let find = |n: &str| infos.iter().find(|i| i.name == n).unwrap();
+        assert!(is_locked(&project.root, find("away")));
+        assert!(!is_locked(&project.root, find("gone")));
         std::fs::rename(&away, away.with_file_name("away-unmounted")).unwrap();
+        std::fs::remove_dir_all(&by_hand).unwrap();
 
-        remove_files(&project.root, &info).unwrap();
+        remove_files(&project.root, find("gone")).unwrap();
         let wt = repo.find_worktree("away").unwrap();
         assert!(matches!(
             wt.is_locked().unwrap(),
             git2::WorktreeLockStatus::Locked(_)
         ));
         assert!(repo.find_worktree("gone").is_err());
+        assert!(repo.find_worktree("by-hand").is_err());
     }
 
     #[test]

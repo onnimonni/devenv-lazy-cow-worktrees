@@ -767,6 +767,10 @@ impl Daemon {
             let Some(info) = infos.iter().find(|i| i.name == name) else {
                 continue;
             };
+            if worktree::is_locked(&rt.project.root, info) {
+                debug!("keeping idle preview {name}: its worktree is locked");
+                continue;
+            }
             info!(
                 "closing preview {name}: no activity for {} h",
                 rt.project.settings.preview_ttl_hours
@@ -903,6 +907,13 @@ impl Daemon {
                 || !info.path.starts_with(&managed)
                 || previews.contains_key(&info.name)
             {
+                continue;
+            }
+            if worktree::is_locked(&rt.project.root, &info) {
+                info!(
+                    "{branch}: worktree {} is locked; not auto-removing it",
+                    info.name
+                );
                 continue;
             }
             let Some((number, pr_head)) = gh.merged_pr(&branch).await? else {
