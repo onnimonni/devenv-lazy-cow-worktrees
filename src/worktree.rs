@@ -542,7 +542,9 @@ pub fn safety(info: &Info, remote: &str, base: &str) -> Result<Safety> {
 }
 
 /// Commits in `head` not in `hidden`, ignoring conflict-free merges of the base
-/// branch that localforest made (they add nothing of the branch's own).
+/// branch that localforest made (they add nothing of the branch's own). One with that
+/// message but a tree other than the clean merge of its parents (edited, conflicts
+/// resolved by hand) counts.
 pub fn ahead(
     repo: &Repository,
     head: Oid,
@@ -559,12 +561,24 @@ pub fn ahead(
     let mut n = 0;
     for id in walk {
         let c = repo.find_commit(id?)?;
-        if c.parent_count() > 1 && c.message().is_ok_and(|m| m.starts_with(&auto)) {
+        if c.message().is_ok_and(|m| m.starts_with(&auto)) && is_clean_merge(repo, &c)? {
             continue;
         }
         n += 1;
     }
     Ok(n)
+}
+
+/// A two-parent merge whose tree is exactly the conflict-free merge of its parents.
+fn is_clean_merge(repo: &Repository, c: &git2::Commit) -> Result<bool> {
+    if c.parent_count() != 2 {
+        return Ok(false);
+    }
+    let mut index = repo.merge_commits(&c.parent(0)?, &c.parent(1)?, None)?;
+    if index.has_conflicts() {
+        return Ok(false);
+    }
+    Ok(index.write_tree_to(repo)? == c.tree_id())
 }
 
 /// After a PR merged `branch` at `pr_head`: is everything in the worktree in it?
@@ -871,6 +885,45 @@ mod tests {
         assert!(repo.find_branch("feat-x", BranchType::Local).is_err());
         // Can be created again.
         create(&project, &syncer, "feat-x", None).unwrap();
+    }
+
+    #[test]
+    fn counts_auto_merges_with_changes_of_their_own() {
+        let d = TempDir::new().unwrap();
+        let repo = Repository::init(d.path()).unwrap();
+        let sig = Signature::now("T", "t@example.com").unwrap();
+        let commit = |files: &[(&str, &str)], parents: &[Oid], msg: &str| {
+            let mut tb = repo.treebuilder(None).unwrap();
+            for (name, content) in files {
+                tb.insert(name, repo.blob(content.as_bytes()).unwrap(), 0o100644)
+                    .unwrap();
+            }
+            let tree = repo.find_tree(tb.write().unwrap()).unwrap();
+            let parents: Vec<_> = parents
+                .iter()
+                .map(|p| repo.find_commit(*p).unwrap())
+                .collect();
+            let parents: Vec<_> = parents.iter().collect();
+            repo.commit(None, &sig, &sig, msg, &tree, &parents).unwrap()
+        };
+        let a = commit(&[("a", "1")], &[], "init");
+        let own = commit(&[("a", "1"), ("b", "own")], &[a], "own");
+        let main = commit(&[("a", "2")], &[a], "main");
+        let msg = "Merge remote-tracking branch 'origin/main' into x";
+        let clean = commit(&[("a", "2"), ("b", "own")], &[own, main], msg);
+        assert_eq!(
+            ahead(&repo, clean, &[own, main], "origin", "main").unwrap(),
+            0
+        );
+        let evil = commit(
+            &[("a", "2"), ("b", "own"), ("c", "extra")],
+            &[own, main],
+            msg,
+        );
+        assert_eq!(
+            ahead(&repo, evil, &[own, main], "origin", "main").unwrap(),
+            1
+        );
     }
 
     #[test]
