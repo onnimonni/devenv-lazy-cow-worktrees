@@ -311,6 +311,18 @@ All configurable (`--pg-port`, `--redis-port`, `--https-port`, `--http-port` or
   constraint triggers (Rails fixtures' `disable_referential_integrity` warns) and
   `COMMENT ON EXTENSION` for pre-created extensions in a `structure.sql`. Keep
   `dblink` / `postgres_fdw` out of `createExtensions`: they connect past the proxy.
+- This boundary covers SQL through the proxy only. The real server's socket
+  (`~/.local/state/localforest/pg`) trusts `postgres` without a password: any local
+  process that finds it is a superuser. It isolates checkouts from each other (agents,
+  tools), not from other programs running as you.
+- On start the daemon revokes `SUPERUSER` from every role but `postgres` (checkout
+  roles used to be superusers), and on provisioning hands a checkout's role the
+  databases it owns by name that an unregistered role made (its role under an older
+  naming scheme), with their objects; event triggers, which need a superuser owner,
+  go to `postgres`. If that fails, provisioning fails and is retried a minute later.
+  Handing over locks every object of a database in one transaction: with many
+  thousands of objects raise `max_locks_per_transaction` in
+  `localforest.postgres.settings` if it runs out of shared memory.
 - macOS has no API for RAM disks, so `hdiutil`/`diskutil` are run for it; PostgreSQL,
   redis-server, the migrate and service commands and language servers are also
   separate processes. Everything else (git, GitHub, certificates, keychain) is

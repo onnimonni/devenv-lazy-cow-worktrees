@@ -340,16 +340,50 @@ impl Postgres {
     /// wide: they are handed back in the same transaction, with CREATE DATABASE
     /// blocked meanwhile. Nothing to do when `from` doesn't exist.
     pub async fn adopt(&self, db: &str, from: &str, to: &str) -> Result<()> {
+        if from == to || from == "postgres" {
+            return Ok(());
+        }
         let mut client = self.connect(db).await?;
-        if from == to || from == "postgres" || !role_exists(&client, from).await? {
+        // The usual case, `from` owns nothing here (or doesn't exist): no locks at all.
+        let owns = client
+            .query_opt(
+                "SELECT 1 FROM pg_shdepend d JOIN pg_roles r ON r.oid = d.refobjid
+                 WHERE r.rolname = $1 AND d.deptype = 'o'
+                   AND d.dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+                 LIMIT 1",
+                &[&from],
+            )
+            .await?
+            .is_some();
+        if !owns {
             return Ok(());
         }
         let tx = client.transaction().await?;
-        // Not stuck behind a client's open transaction for long.
+        // Not stuck behind a client's open transaction for long. SHARE ROW EXCLUSIVE
+        // conflicts with itself: concurrent adopts queue here instead of deadlocking.
         tx.batch_execute(
-            "SET LOCAL lock_timeout = '10s'; LOCK TABLE pg_catalog.pg_database IN SHARE MODE",
+            "SET LOCAL lock_timeout = '10s';
+             LOCK TABLE pg_catalog.pg_database IN SHARE ROW EXCLUSIVE MODE",
         )
         .await?;
+        // Event triggers must belong to a superuser (made by checkout roles back when
+        // they were ones): to postgres, not to `to`.
+        let triggers: Vec<String> = tx
+            .query(
+                "SELECT evtname::text FROM pg_event_trigger WHERE evtowner = (SELECT oid FROM pg_roles WHERE rolname = $1)",
+                &[&from],
+            )
+            .await?
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        for t in &triggers {
+            tx.batch_execute(&format!(
+                "ALTER EVENT TRIGGER {} OWNER TO postgres",
+                quote_ident(t)
+            ))
+            .await?;
+        }
         let owned: Vec<String> = tx
             .query(
                 "SELECT datname::text FROM pg_database WHERE datdba = (SELECT oid FROM pg_roles WHERE rolname = $1)",
@@ -384,6 +418,24 @@ impl Postgres {
     /// aren't trusted (postgis, vector): databases made later have them, and apps'
     /// `CREATE EXTENSION IF NOT EXISTS` is a no-op.
     pub async fn prepare_templates(&self, extensions: &[String]) -> Result<()> {
+        let admin = self.admin().await?;
+        // Checkout roles were superusers before; nothing but the daemon's is now.
+        let supers: Vec<String> = admin
+            .query(
+                "SELECT rolname::text FROM pg_roles WHERE rolsuper AND rolname <> 'postgres'",
+                &[],
+            )
+            .await?
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        for r in &supers {
+            admin
+                .batch_execute(&format!("ALTER ROLE {} NOSUPERUSER", quote_ident(r)))
+                .await
+                .with_context(|| format!("revoking SUPERUSER from {r}"))?;
+            info!("{r}: no longer a superuser");
+        }
         for db in ["template1", "postgres"] {
             self.connect(db)
                 .await?
@@ -391,7 +443,24 @@ impl Postgres {
                 .await
                 .with_context(|| format!("{db}: revoking CREATE on public"))?;
         }
-        self.create_extensions("template1", extensions).await
+        if let Err(e) = self.create_extensions("template1", extensions).await {
+            warn!("{e:#}");
+        }
+        Ok(())
+    }
+
+    /// Make `role` the owner of database `db`.
+    pub async fn set_owner(&self, db: &str, role: &str) -> Result<()> {
+        self.admin()
+            .await?
+            .batch_execute(&format!(
+                "ALTER DATABASE {} OWNER TO {}",
+                quote_ident(db),
+                quote_ident(role)
+            ))
+            .await
+            .with_context(|| format!("giving database {db} to {role}"))?;
+        Ok(())
     }
 
     /// `CREATE EXTENSION IF NOT EXISTS` each of `extensions` in `db`, as superuser.
@@ -568,7 +637,32 @@ mod tests {
             eprintln!("no initdb in PATH; skipped");
             return;
         };
+        // From before: a superuser checkout role (another naming scheme) with a
+        // database, tables and an event trigger in it.
+        let admin = pg.connect("postgres").await.unwrap();
+        admin
+            .batch_execute("CREATE ROLE old LOGIN SUPERUSER")
+            .await
+            .unwrap();
+        pg.create("app_old_x", None, Some("old")).await.unwrap();
+        as_role(&pg, "old", "app_old_x")
+            .await
+            .batch_execute(
+                "CREATE TABLE t(id int); CREATE TABLE u(id int);
+                 CREATE FUNCTION evt() RETURNS event_trigger LANGUAGE plpgsql AS 'BEGIN END';
+                 CREATE EVENT TRIGGER et ON ddl_command_start EXECUTE FUNCTION evt()",
+            )
+            .await
+            .unwrap();
         pg.prepare_templates(&[]).await.unwrap();
+        let supers = admin
+            .query(
+                "SELECT 1 FROM pg_roles WHERE rolsuper AND rolname <> 'postgres'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert!(supers.is_empty(), "superusers left");
         for role in ["app", "app-x", "app-y"] {
             pg.ensure_role(role, "pw").await.unwrap();
         }
@@ -630,6 +724,45 @@ mod tests {
         }
         let t1 = as_role(&pg, "app-x", "template1").await;
         assert!(t1.batch_execute("CREATE TABLE evil(x int)").await.is_err());
+        // The old role's database goes to the checkout's role, event trigger to postgres.
+        pg.set_owner("app_old_x", "app-x").await.unwrap();
+        pg.adopt("app_old_x", "old", "app-x").await.unwrap();
+        assert_eq!(owners(&pg, "app_old_x").await, ["app-x"]);
+        let evt: String = pg
+            .connect("app_old_x")
+            .await
+            .unwrap()
+            .query_one(
+                "SELECT pg_get_userbyid(evtowner)::text FROM pg_event_trigger",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(evt, "postgres");
+        as_role(&pg, "app-x", "app_old_x")
+            .await
+            .batch_execute("ALTER TABLE t ADD COLUMN y int; DROP TABLE u")
+            .await
+            .unwrap();
+        // Nothing left to hand over: no-op.
+        pg.adopt("app_old_x", "old", "app-x").await.unwrap();
+
+        // Concurrent adopts queue on pg_database instead of deadlocking.
+        for (db, role) in [("app_dev_y", "app-y"), ("app_dev_z", "app-z")] {
+            pg.ensure_role(role, "pw").await.unwrap();
+            pg.create(db, Some("app_template"), Some(role))
+                .await
+                .unwrap();
+        }
+        let (a, b) = tokio::join!(
+            pg.adopt("app_dev_y", "app_template", "app-y"),
+            pg.adopt("app_dev_z", "app_template", "app-z"),
+        );
+        a.unwrap();
+        b.unwrap();
+        assert_eq!(owners(&pg, "app_dev_y").await, ["app-y"]);
+        assert_eq!(owners(&pg, "app_dev_z").await, ["app-z"]);
         pg.stop().await;
     }
 }
