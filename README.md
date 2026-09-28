@@ -62,7 +62,8 @@ Removing a worktree SIGKILLs everything running in it (each service's process gr
 plus any process whose working directory or executable is inside it, with all
 descendants: the BEAM, esbuild, tailwind, node, …), stops its redis-server, drops
 its databases and role, deletes its branch and moves the files away for background
-deletion.
+deletion. Gitignored files it deletes that are neither build caches nor copies of the
+primary checkout's are printed as warnings and listed on its gone page.
 
 ## Install
 
