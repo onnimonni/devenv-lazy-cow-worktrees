@@ -109,6 +109,9 @@ template_seeded || fail "template lost by the snapshot"
 pass "worktree database cloned from the template and migrated"
 if psql -d demo_dev -tAc "select 1" >/dev/null 2>&1; then fail "worktree could open the primary's database"; fi
 pass "other checkouts' databases refused"
+if out=$(PGUSER=stranger PGPASSWORD=x psql -d postgres -tAc "select 1" 2>&1); then fail "unknown user got through"; fi
+[[ $out == *"not the role of a checkout"* ]] || fail "unknown user not refused by the proxy: $out"
+pass "users that are no checkout's role refused"
 
 redis-cli --no-auth-warning -u "$REDIS_URL" set k worktree >/dev/null
 primary_redis=$(cd "$work/app" && "$bin" env --json | jq -r .REDIS_URL)

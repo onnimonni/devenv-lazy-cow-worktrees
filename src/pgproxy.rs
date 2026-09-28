@@ -7,7 +7,8 @@
 //! piped through, the database it asks for is created if missing (a copy-on-write
 //! clone of the project's template), and a checkout may only open its own databases
 //! (plus `postgres` and `template1` for tools like `mix ecto.create`). The real server
-//! then authenticates the password (scram) over the piped connection.
+//! then authenticates the password (scram) over the piped connection. Users that are
+//! no registered checkout's role are refused before reaching the server.
 
 use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc};
 
