@@ -829,7 +829,11 @@ impl Daemon {
                 rt.base
             )
         })?;
-        let (number, pr_head) = gh.merged_pr(&branch).await?.ok_or_else(|| {
+        let github::MergedPr {
+            number,
+            head: pr_head,
+            ..
+        } = gh.merged_pr(&branch).await?.ok_or_else(|| {
             anyhow!(
                 "{branch} has commits beyond {} and no merged PR; merge it or pass --force",
                 rt.base
@@ -905,12 +909,24 @@ impl Daemon {
             {
                 continue;
             }
-            let Some((number, pr_head)) = gh.merged_pr(&branch).await? else {
+            let Some(merged) = gh.merged_pr(&branch).await? else {
                 continue;
             };
-            let Ok(pr_head) = Oid::from_str(&pr_head) else {
+            let number = merged.number;
+            let Ok(pr_head) = Oid::from_str(&merged.head) else {
                 continue;
             };
+            // Same branch name, but made after that PR merged (a new task reusing the
+            // name): not the PR's worktree, whatever its commits.
+            let i = info.clone();
+            let made = tokio::task::spawn_blocking(move || worktree::created_at(&i)).await?;
+            if !made.is_ok_and(|t| t < merged.merged_at) {
+                debug!(
+                    "{branch}: #{number} merged before worktree {} was made",
+                    info.name
+                );
+                continue;
+            }
             let (remote, base, i) = (
                 rt.project.settings.remote.clone(),
                 rt.base.clone(),

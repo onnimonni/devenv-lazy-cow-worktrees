@@ -567,6 +567,12 @@ pub fn ahead(
     Ok(n)
 }
 
+/// When the worktree was made (its `.git` file's mtime), as unix seconds.
+pub fn created_at(info: &Info) -> Result<i64> {
+    let t = std::fs::symlink_metadata(info.path.join(".git"))?.modified()?;
+    Ok(t.duration_since(std::time::UNIX_EPOCH)?.as_secs() as i64)
+}
+
 /// After a PR merged `branch` at `pr_head`: is everything in the worktree in it?
 pub fn covered_by_pr(info: &Info, pr_head: Oid, remote: &str, base: &str) -> Result<bool> {
     let repo = Repository::open(&info.path)?;
@@ -871,6 +877,19 @@ mod tests {
         assert!(repo.find_branch("feat-x", BranchType::Local).is_err());
         // Can be created again.
         create(&project, &syncer, "feat-x", None).unwrap();
+    }
+
+    #[test]
+    fn knows_when_a_worktree_was_made() {
+        let (_d, project, syncer) = fixture();
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        create(&project, &syncer, "feat-x", None).unwrap();
+        let info = list(&project.root).unwrap().remove(0);
+        let t = created_at(&info).unwrap();
+        assert!((before - 1..=before + 60).contains(&t), "{t} vs {before}");
     }
 
     #[test]
