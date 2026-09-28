@@ -1304,6 +1304,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "ignore",
  "keyring",
  "libc",
  "libgit2-sys",

@@ -8,7 +8,7 @@ use std::{
     ffi::CString,
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use anyhow::{Context, Result, bail};
@@ -299,7 +299,7 @@ fn populate(root: &Path, path: &Path, name: &str) -> Result<()> {
         include_ignored: true,
         settle: false,
     };
-    match git_cow::populate(path, &opts) {
+    let carried = match git_cow::populate(path, &opts) {
         Ok(r) if r.cloned > 0 => {
             for w in &r.warnings {
                 warn!("git-cow: {w}");
@@ -310,6 +310,10 @@ fn populate(root: &Path, path: &Path, name: &str) -> Result<()> {
                 r.rewritten,
                 git_cow::join_paths(&r.carried)
             );
+            r.carried
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect()
         }
         // A regular checkout (no copy-on-write here): the caches are ours to bring.
         Ok(_) => copy_caches(root, path, name)?,
@@ -317,17 +321,19 @@ fn populate(root: &Path, path: &Path, name: &str) -> Result<()> {
             warn!("git-cow: {e:#}; falling back to a regular checkout");
             let wt = Repository::open(path)?;
             wt.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))?;
-            copy_caches(root, path, name)?;
+            copy_caches(root, path, name)?
         }
-    }
+    };
     for dir in PER_CHECKOUT {
         let p = path.join(dir);
         if p.exists() {
             std::fs::remove_dir_all(&p)?;
         }
     }
-    // Never again for this worktree (its git admin dir goes away with it).
-    std::fs::write(populated_marker(path)?, "")?;
+    // Never again for this worktree (its git admin dir goes away with it). Lists the
+    // carried caches, which removal then doesn't report as lost.
+    let list: String = carried.iter().map(|c| format!("{c}\n")).collect();
+    std::fs::write(populated_marker(path)?, list)?;
     Ok(())
 }
 
@@ -386,10 +392,11 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
 
 /// git-cow couldn't clone (no copy-on-write on this filesystem, e.g. ext4): copy the
 /// build caches ourselves, so the worktree still needs no fresh install/compile.
-fn copy_caches(root: &Path, path: &Path, name: &str) -> Result<()> {
+/// Ok(the copied directories).
+fn copy_caches(root: &Path, path: &Path, name: &str) -> Result<Vec<String>> {
     let missing = missing_caches(root, path)?;
     if missing.is_empty() {
-        return Ok(());
+        return Ok(missing);
     }
     let t = std::time::Instant::now();
     for dir in &missing {
@@ -400,7 +407,7 @@ fn copy_caches(root: &Path, path: &Path, name: &str) -> Result<()> {
         missing.join(", "),
         t.elapsed()
     );
-    Ok(())
+    Ok(missing)
 }
 
 fn populated_marker(path: &Path) -> Result<PathBuf> {
@@ -427,6 +434,47 @@ fn worktree_include(root: &Path) -> Option<HashSet<String>> {
 
 const ENV_BEGIN: &str = "# >>> localforest: this worktree's environment (regenerated) >>>";
 const ENV_END: &str = "# <<< localforest <<<";
+const ENV_OVERRIDDEN: &str = "# overridden by localforest: ";
+
+/// `.env` text without localforest's block.
+fn outside_env_block(text: &str) -> String {
+    let mut rest = String::new();
+    let mut inside = false;
+    for line in text.lines() {
+        if line == ENV_BEGIN {
+            inside = true;
+        } else if line == ENV_END {
+            inside = false;
+        } else if !inside {
+            rest.push_str(line);
+            rest.push('\n');
+        }
+    }
+    rest
+}
+
+/// The worktree's `.env` is only what localforest made of it: its block plus the
+/// primary's `.env` (keys the block sets commented out), or the block alone.
+fn env_is_ours(root: &Path, path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path.join(".env")) else {
+        return false;
+    };
+    if !text.lines().any(|l| l == ENV_BEGIN) {
+        return false;
+    }
+    let norm = |t: &str| {
+        let mut lines: Vec<&str> = t
+            .lines()
+            .map(|l| l.strip_prefix(ENV_OVERRIDDEN).unwrap_or(l).trim_end())
+            .collect();
+        while lines.last().is_some_and(|l| l.is_empty()) {
+            lines.pop();
+        }
+        lines.join("\n")
+    };
+    let primary = std::fs::read_to_string(root.join(".env")).unwrap_or_default();
+    norm(&outside_env_block(&text)) == norm(&primary)
+}
 
 /// A `.env` value. Single-quoted, which dotenvy, Node and Ruby dotenv, docker compose,
 /// direnv and `set -a; . .env` read verbatim (no escapes, no `$` expansion; Bun
@@ -485,18 +533,7 @@ pub fn write_env(path: &Path, env: &[(String, String)]) -> Result<()> {
     }
     let old = std::fs::read_to_string(&file).unwrap_or_default();
     // Drop our previous block.
-    let mut rest = String::new();
-    let mut inside = false;
-    for line in old.lines() {
-        if line == ENV_BEGIN {
-            inside = true;
-        } else if line == ENV_END {
-            inside = false;
-        } else if !inside {
-            rest.push_str(line);
-            rest.push('\n');
-        }
-    }
+    let rest = outside_env_block(&old);
     let ours: HashSet<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
     let mut out = format!("{ENV_BEGIN}\n");
     for (k, v) in env {
@@ -519,7 +556,7 @@ pub fn write_env(path: &Path, env: &[(String, String)]) -> Result<()> {
             .unwrap_or_default()
             .trim();
         if !line.trim_start().starts_with('#') && line.contains('=') && ours.contains(key) {
-            out.push_str(&format!("# overridden by localforest: {line}\n"));
+            out.push_str(&format!("{ENV_OVERRIDDEN}{line}\n"));
         } else {
             out.push_str(line);
             out.push('\n');
@@ -696,11 +733,105 @@ const REBUILDABLE: &[&str] = &[
     "venv",
 ];
 
+/// Written in the worktree's git admin dir once its setup command succeeded.
+pub const SETUP_MARKER: &str = "localforest-setup";
+
+/// When provisioning finished: the newest of the populated and setup markers.
+fn provisioned_at(path: &Path) -> Option<SystemTime> {
+    let admin = Repository::open(path).ok()?.path().to_path_buf();
+    [populated_marker(path).ok()?, admin.join(SETUP_MARKER)]
+        .iter()
+        .filter_map(|m| std::fs::metadata(m).ok()?.modified().ok())
+        .max()
+}
+
+/// Last modified or created/moved here (ctime).
+fn changed_at(m: &std::fs::Metadata) -> SystemTime {
+    use std::os::unix::fs::MetadataExt;
+    let ctime = SystemTime::UNIX_EPOCH
+        + Duration::new(
+            u64::try_from(m.ctime()).unwrap_or_default(),
+            u32::try_from(m.ctime_nsec()).unwrap_or_default(),
+        );
+    m.modified().map_or(ctime, |t| t.max(ctime))
+}
+
+/// Nothing at `p` (the file, or a directory and what's in it) changed after `t`.
+/// Gives up (false) past a few thousand entries rather than walk a big tree.
+fn unchanged_since(p: &Path, t: SystemTime) -> bool {
+    let mut budget = 5000usize;
+    let mut stack = vec![p.to_path_buf()];
+    while let Some(q) = stack.pop() {
+        let Ok(m) = std::fs::symlink_metadata(&q) else {
+            return false;
+        };
+        if changed_at(&m) > t {
+            return false;
+        }
+        if m.is_dir() {
+            let Ok(entries) = std::fs::read_dir(&q) else {
+                return false;
+            };
+            for e in entries.flatten() {
+                if budget == 0 {
+                    return false;
+                }
+                budget -= 1;
+                stack.push(e.path());
+            }
+        }
+    }
+    true
+}
+
+/// Ignored paths localforest carried into the worktree (listed in its populated
+/// marker) or the primary's `.worktreeinclude` names (what git-cow carries).
+struct Carried {
+    paths: Vec<String>,
+    include: Option<ignore::gitignore::Gitignore>,
+}
+
+impl Carried {
+    fn load(root: &Path, path: &Path) -> Carried {
+        let include = root.join(".worktreeinclude");
+        Carried {
+            paths: populated_marker(path)
+                .ok()
+                .and_then(|m| std::fs::read_to_string(m).ok())
+                .unwrap_or_default()
+                .lines()
+                .map(|l| l.trim().trim_end_matches('/').to_string())
+                .filter(|l| !l.is_empty())
+                .collect(),
+            include: include
+                .is_file()
+                .then(|| ignore::gitignore::Gitignore::new(&include).0),
+        }
+    }
+
+    /// `rel`: relative to the worktree, without a trailing `/`.
+    fn contains(&self, rel: &str, is_dir: bool) -> bool {
+        self.paths.iter().any(|c| {
+            rel == c
+                || rel
+                    .strip_prefix(c.as_str())
+                    .is_some_and(|r| r.starts_with('/'))
+        }) || self
+            .include
+            .as_ref()
+            .is_some_and(|i| i.matched_path_or_any_parents(rel, is_dir).is_ignore())
+    }
+}
+
 /// Gitignored paths in the worktree at `path` that removal would delete for good:
-/// not build caches or per-checkout indexes, and not copies of the primary checkout
-/// at `root` (same file contents; directories with the same files and sizes).
+/// not build caches or per-checkout indexes, not what localforest carried or wrote
+/// (`.env` holding only its block and the primary's), not what was already there
+/// when provisioning (setup) finished, and not copies of the primary checkout at
+/// `root` (same file contents; directories with the same files and sizes).
 /// Sockets and fifos are skipped.
 pub fn ignored_files(root: &Path, path: &Path) -> Result<Vec<String>> {
+    let carried = Carried::load(root, path);
+    let provisioned = provisioned_at(path);
     let repo = Repository::open(path)?;
     let mut opts = StatusOptions::new();
     opts.include_untracked(false)
@@ -717,6 +848,9 @@ pub fn ignored_files(root: &Path, path: &Path) -> Result<Vec<String>> {
             let rel = p.trim_end_matches('/');
             !REBUILDABLE.contains(&top)
                 && !PER_CHECKOUT.contains(&top)
+                && !carried.contains(rel, p.ends_with('/'))
+                && !(rel == ".env" && env_is_ours(root, path))
+                && !provisioned.is_some_and(|t| unchanged_since(&path.join(rel), t))
                 && !is_copy(&path.join(rel), &root.join(rel)).unwrap_or(false)
         })
         .collect())
@@ -1623,14 +1757,111 @@ mod tests {
             ignored_files(&project.root, &path).unwrap(),
             Vec::<String>::new()
         );
-        // Own files, edited copies, a carried dir with more in it, .env: reported.
+        // Own files, edited copies, a .env of one's own: reported. A carried cache
+        // with more in it isn't.
         std::fs::write(path.join("secrets.local"), "mine\n").unwrap();
         std::fs::write(path.join("same.local"), "edit\n").unwrap();
         std::fs::write(path.join("cache/notes"), "mine\n").unwrap();
         std::fs::write(path.join(".env"), "KEY=1\n").unwrap();
         let mut files = ignored_files(&project.root, &path).unwrap();
         files.sort();
-        assert_eq!(files, vec![".env", "cache/", "same.local", "secrets.local"]);
+        assert_eq!(files, vec![".env", "same.local", "secrets.local"]);
+    }
+
+    fn set_exclude(project: &Project, lines: &str) {
+        let exclude = project.root.join(".git/info/exclude");
+        std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        std::fs::write(&exclude, lines).unwrap();
+    }
+
+    #[test]
+    fn carried_caches_are_not_reported() {
+        let (_d, project, syncer) = fixture();
+        set_exclude(&project, "_build/\ndeps/\nassets/\n");
+        // Nested and listed in .worktreeinclude, like den_ui/deps.
+        std::fs::create_dir_all(project.root.join("sub/deps")).unwrap();
+        std::fs::write(project.root.join("sub/.keep"), "").unwrap();
+        std::fs::write(
+            project.root.join(".worktreeinclude"),
+            "cache/\nsub/deps/\nassets/\n",
+        )
+        .unwrap();
+        let path = create(&project, &syncer, "feat-x", None).unwrap();
+        // As if git-cow had carried these (only cache/ exists in the primary).
+        std::fs::write(populated_marker(&path).unwrap(), "assets\nsub/deps\n").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        // Rebuilt after provisioning: newer than the markers, differs from the primary.
+        for dir in ["sub/deps/x", "assets", "cache/more"] {
+            std::fs::create_dir_all(path.join(dir)).unwrap();
+            std::fs::write(path.join(dir).join("f"), "new\n").unwrap();
+        }
+        assert_eq!(
+            ignored_files(&project.root, &path).unwrap(),
+            Vec::<String>::new()
+        );
+        // Recorded carried paths count without a .worktreeinclude too.
+        std::fs::remove_file(project.root.join(".worktreeinclude")).unwrap();
+        let files = ignored_files(&project.root, &path).unwrap();
+        assert_eq!(files, vec!["cache/"]);
+    }
+
+    #[test]
+    fn env_holding_only_localforests_block_is_not_reported() {
+        let (_d, project, syncer) = fixture();
+        let path = create(&project, &syncer, "feat-x", None).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        let env = [("DATABASE_URL".to_string(), "postgres://x".to_string())];
+        write_env(&path, &env).unwrap();
+        assert_eq!(
+            ignored_files(&project.root, &path).unwrap(),
+            Vec::<String>::new()
+        );
+        // The primary's .env under the block, its DATABASE_URL overridden: still ours.
+        std::fs::write(project.root.join(".env"), "DATABASE_URL=p\nKEY=1\n").unwrap();
+        std::fs::write(path.join(".env"), "DATABASE_URL=p\nKEY=1\n").unwrap();
+        write_env(&path, &env).unwrap();
+        assert_eq!(
+            ignored_files(&project.root, &path).unwrap(),
+            Vec::<String>::new()
+        );
+        // A key of one's own: reported.
+        let mut text = std::fs::read_to_string(path.join(".env")).unwrap();
+        text.push_str("MINE=2\n");
+        std::fs::write(path.join(".env"), text).unwrap();
+        assert_eq!(ignored_files(&project.root, &path).unwrap(), vec![".env"]);
+    }
+
+    #[test]
+    fn files_from_before_setup_finished_are_not_reported() {
+        let (_d, project, syncer) = fixture();
+        set_exclude(&project, ".mcp.json\n.claude/\ntmp/\n");
+        let path = create(&project, &syncer, "feat-x", None).unwrap();
+        // What the setup command writes.
+        std::fs::write(path.join(".mcp.json"), "{}\n").unwrap();
+        std::fs::create_dir(path.join(".claude")).unwrap();
+        std::fs::write(path.join(".claude/settings.json"), "{}\n").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        let admin = Repository::open(&path).unwrap().path().to_path_buf();
+        std::fs::write(admin.join(SETUP_MARKER), "1\n").unwrap();
+        assert_eq!(
+            ignored_files(&project.root, &path).unwrap(),
+            Vec::<String>::new()
+        );
+        // Created after: reported, also inside a directory setup made.
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(path.join(".claude/notes.md"), "mine\n").unwrap();
+        std::fs::create_dir(path.join("tmp")).unwrap();
+        std::fs::write(path.join("tmp/dump.sql"), "--\n").unwrap();
+        let mut files = ignored_files(&project.root, &path).unwrap();
+        files.sort();
+        assert_eq!(files, vec![".claude/", "tmp/"]);
+        // A setup file edited later: reported.
+        std::fs::remove_file(path.join(".claude/notes.md")).unwrap();
+        std::fs::remove_dir_all(path.join("tmp")).unwrap();
+        std::fs::write(path.join(".mcp.json"), "{\"mine\":1}\n").unwrap();
+        let mut files = ignored_files(&project.root, &path).unwrap();
+        files.sort();
+        assert_eq!(files, vec![".claude/", ".mcp.json"]);
     }
 
     #[test]

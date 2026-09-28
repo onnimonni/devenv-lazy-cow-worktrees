@@ -65,8 +65,10 @@ removal or its ancestors, such as the Claude Code session), stops its redis-serv
 its databases and role, deletes its branch (even `--force` keeps one with commits
 that aren't on the base branch, pushed, or in its merged PR, renamed to
 `<name>-kept-<sha>`; uncommitted files it deletes are listed) and moves the files away
-for background deletion. Gitignored files it deletes that are neither build caches nor
-copies of the primary checkout's are printed as warnings and listed on its gone page.
+for background deletion. Gitignored files it deletes that are neither build caches
+(including whatever it carried in or `.worktreeinclude` names), its own `.env`, copies of
+the primary checkout's, nor unchanged since setup finished are printed as warnings and
+listed on its gone page.
 
 ## Install
 
