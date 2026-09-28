@@ -445,6 +445,31 @@ impl Services {
     }
 }
 
+/// PostgreSQL's longest name (NAMEDATALEN - 1); it silently truncates longer ones.
+pub const PG_NAME_MAX: usize = 63;
+
+fn short_hash(s: &str) -> String {
+    hex::encode(&Sha256::digest(s.as_bytes())[..4])
+}
+
+/// Every database and role name localforest makes: kept when it fits PostgreSQL's 63
+/// bytes, else cut and suffixed with a hash of the whole, so two long names can't
+/// truncate to the same one.
+pub fn pg_name(s: &str) -> String {
+    if s.len() <= PG_NAME_MAX {
+        return s.to_string();
+    }
+    let hash = short_hash(s);
+    let mut head = String::new();
+    for c in s.chars() {
+        if head.len() + c.len_utf8() > PG_NAME_MAX - hash.len() - 1 {
+            break;
+        }
+        head.push(c);
+    }
+    format!("{head}_{hash}")
+}
+
 /// One checkout (primary or worktree) of a project, with everything derived from it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Checkout {
@@ -548,15 +573,23 @@ impl Checkout {
     /// project `shop` + worktree `admin-foo` and project `shop-admin` + worktree `foo`
     /// stay apart. Over PostgreSQL's 63-byte names, shortened with a hash of the whole.
     pub fn id(&self) -> String {
-        let id = match &self.worktree {
-            Some(w) => format!("{}--{w}", self.project),
-            None => return self.project.clone(),
-        };
-        if id.len() <= 63 {
-            return id;
+        match &self.worktree {
+            Some(w) => pg_name(&format!("{}--{w}", self.project)),
+            None => self.project.clone(),
         }
-        let hash = hex::encode(&Sha256::digest(id.as_bytes())[..4]);
-        format!("{}-{hash}", &id[..54])
+    }
+
+    /// The id (role name) worktrees had before `id` used `--`; None for the primary,
+    /// whose id didn't change.
+    pub fn legacy_id(&self) -> Option<String> {
+        let w = self.worktree.as_deref()?;
+        // PostgreSQL truncated long role names.
+        Some(
+            format!("{}-{w}", self.project)
+                .chars()
+                .take(PG_NAME_MAX)
+                .collect(),
+        )
     }
 
     /// Key of a one-off command's log (`setup`, `seed`) in the checkout; `+` can't
@@ -892,6 +925,9 @@ mod tests {
         let long = id(&a, Some(&format!("{b}1")));
         assert_eq!(long.len(), 63);
         assert_ne!(long, id(&a, Some(&format!("{b}2"))));
+        // Old role names, for the upgrade.
+        assert_eq!(co(Some("wt")).legacy_id().as_deref(), Some("my-app-wt"));
+        assert_eq!(co(None).legacy_id(), None);
         let p = worktree_port("a", "b");
         assert!((20000..29000).contains(&p) && p.is_multiple_of(10));
     }

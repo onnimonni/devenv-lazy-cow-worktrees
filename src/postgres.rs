@@ -312,6 +312,73 @@ impl Postgres {
         Ok(())
     }
 
+    pub async fn role_exists(&self, role: &str) -> Result<bool> {
+        Ok(self
+            .admin()
+            .await?
+            .query_opt("SELECT 1 FROM pg_roles WHERE rolname = $1", &[&role])
+            .await?
+            .is_some())
+    }
+
+    /// `ALTER ROLE old RENAME TO new` (it keeps everything it owns and its grants;
+    /// PostgreSQL clears its MD5 password, which `ensure_role` sets again).
+    pub async fn rename_role(&self, old: &str, new: &str) -> Result<()> {
+        self.admin()
+            .await?
+            .batch_execute(&format!(
+                "ALTER ROLE {} RENAME TO {}",
+                quote_ident(old),
+                quote_ident(new)
+            ))
+            .await
+            .with_context(|| format!("renaming role {old} to {new}"))?;
+        Ok(())
+    }
+
+    /// Make `new` a member of `old`, so it may use and alter what `old` owns.
+    pub async fn grant_role(&self, old: &str, new: &str) -> Result<()> {
+        self.admin()
+            .await?
+            .batch_execute(&format!(
+                "GRANT {} TO {}",
+                quote_ident(old),
+                quote_ident(new)
+            ))
+            .await
+            .with_context(|| format!("granting {old} to {new}"))?;
+        Ok(())
+    }
+
+    /// Hand everything `old` owns to `new` and drop `old` (no-op without `old`).
+    pub async fn retire_role(&self, old: &str, new: &str) -> Result<()> {
+        let admin = self.admin().await?;
+        let exists = admin
+            .query_opt("SELECT 1 FROM pg_roles WHERE rolname = $1", &[&old])
+            .await?
+            .is_some();
+        if !exists {
+            return Ok(());
+        }
+        // REASSIGN / DROP OWNED act on the current database (and shared objects):
+        // run them in each database the role owns objects in.
+        let dbs = self.databases().await?;
+        let (o, n) = (quote_ident(old), quote_ident(new));
+        for db in dbs {
+            let Ok(c) = self.connect(&db).await else {
+                continue;
+            };
+            c.batch_execute(&format!("REASSIGN OWNED BY {o} TO {n}; DROP OWNED BY {o}"))
+                .await
+                .with_context(|| format!("moving {old}'s objects in {db} to {new}"))?;
+        }
+        admin
+            .batch_execute(&format!("DROP ROLE {o}"))
+            .await
+            .with_context(|| format!("dropping role {old}"))?;
+        Ok(())
+    }
+
     pub async fn drop(&self, db: &str) -> Result<()> {
         self.admin()
             .await?

@@ -209,6 +209,11 @@ needed), e.g. for services `web` (default), `api` and
 | `LOCALFOREST_SERVICE`, `LOCALFOREST_WORKTREE`, `LOCALFOREST_PROJECT` | | |
 | `NODE_EXTRA_CA_CERTS` | the local CA | |
 
+Worktree roles were `<project>-<worktree>` before; the daemon renames an old role to
+the new name on its next start (or, if that name was shared by two checkouts, makes
+the new role a member of it). The Redis password and the role changed, so restart
+anything a worktree runs by hand with an old `.env` / `localforest env`.
+
 Detected from the manifests in the service's `cwd`, set to its hostname so the dev
 server accepts it (the service's `env` overrides them):
 

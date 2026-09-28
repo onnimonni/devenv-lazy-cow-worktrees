@@ -365,6 +365,9 @@ impl Daemon {
     /// Worktrees also get their environment in `.env`. Ok(true) when the primary's
     /// dev database was just created (to be seeded).
     async fn provision(&self, c: &Checkout) -> Result<bool> {
+        if let Err(e) = self.migrate_role(c).await {
+            warn!("{}: taking over its old role: {e:#}", c.id());
+        }
         self.pg.ensure_role(&c.id(), &c.pg_password()?).await?;
         let mut created = false;
         if c.worktree.is_none() {
@@ -389,6 +392,61 @@ impl Daemon {
             }
         }
         Ok(created)
+    }
+
+    /// Upgrade from `<project>-<worktree>` role names: the worktree's old role becomes
+    /// its new one (renamed: it keeps what it owns). When the old name is ambiguous
+    /// (another checkout's id, or another's old id: the collision this naming fixes),
+    /// the old role stays and the new one becomes a member of it instead, so it may
+    /// still use the objects the old one owns.
+    async fn migrate_role(&self, c: &Checkout) -> Result<()> {
+        let Some(old) = c.legacy_id() else {
+            return Ok(());
+        };
+        if !self.pg.role_exists(&old).await? {
+            return Ok(());
+        }
+        let projects: Vec<Project> = self
+            .projects
+            .lock()
+            .unwrap()
+            .values()
+            .map(|rt| rt.project.clone())
+            .collect();
+        let me = c.path.clone();
+        let others = tokio::task::spawn_blocking(move || {
+            let mut out = Vec::new();
+            for p in projects {
+                out.push(p.checkout(None, p.root.clone()));
+                for i in worktree::list(&p.root).unwrap_or_default() {
+                    if i.path != me {
+                        out.push(p.checkout(Some(&i.name), i.path));
+                    }
+                }
+            }
+            out
+        })
+        .await?;
+        let shared = others
+            .iter()
+            .any(|o| o.id() == old || o.legacy_id().as_deref() == Some(old.as_str()));
+        let new = c.id();
+        match (shared, self.pg.role_exists(&new).await?) {
+            (false, false) => {
+                self.pg.rename_role(&old, &new).await?;
+                info!("renamed role {old} to {new}");
+            }
+            (false, true) => {
+                self.pg.retire_role(&old, &new).await?;
+                info!("moved role {old}'s objects to {new}");
+            }
+            (true, _) => {
+                self.pg.ensure_role(&new, &c.pg_password()?).await?;
+                self.pg.grant_role(&old, &new).await?;
+                info!("{new}: member of {old}, which another checkout also used");
+            }
+        }
+        Ok(())
     }
 
     /// A worktree seen for the first time: clone build caches into it when it was made
