@@ -166,7 +166,7 @@ so one session gets answers from the worktree each file belongs to.
 | `localforest.port` | `4000` | base port of the primary checkout's services |
 | `localforest.migrate` | none | migrate command: primary when the base branch moves (then the template is refreshed) or its database was just created, new worktrees once, worktrees the base branch was merged into |
 | `localforest.seed` | none | seed command: primary, after `migrate`, when its database was just created; worktrees get seeded data via the template |
-| `localforest.setup` | none | runs once in every new checkout (localforest, `git worktree add`, Claude Code), e.g. `mix deps.get` |
+| `localforest.setup` | none | runs once in every new checkout (localforest, `git worktree add`, Claude Code), e.g. `mix deps.get`; in the primary checkout too (a fresh clone has no `deps/`), before its first migrate, seed or service start. Done is a `localforest-setup` marker in the checkout's git dir; a failure in the primary shows in `localforest status` and is retried with the migrations' backoff |
 | `localforest.services.<name>` | none | see below |
 | `localforest.server` | none | shorthand for `localforest.services.web.exec` |
 | `localforest.previewTtlHours` | `48` | close previews after this many hours without activity; `0` keeps them |
