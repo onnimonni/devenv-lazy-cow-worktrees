@@ -98,12 +98,28 @@ pub struct Global {
     /// {"shared_preload_libraries": "pg_stat_statements"}.
     #[arg(long, env = "LOCALFOREST_POSTGRES_SETTINGS", global = true)]
     pub postgres_settings: Option<String>,
+    /// Extensions to create in template1 (so in every database made afterwards) and
+    /// the primaries' databases, as superuser: for extensions that aren't trusted
+    /// (postgis, vector), which checkout roles can't create. Comma or space separated.
+    #[arg(long, env = "LOCALFOREST_POSTGRES_EXTENSIONS", global = true)]
+    pub postgres_extensions: Option<String>,
     /// The `redis-server` to run [default: from PATH].
     #[arg(long, env = "LOCALFOREST_REDIS_SERVER", global = true)]
     pub redis_server: Option<PathBuf>,
 }
 
 impl Global {
+    /// `--postgres-extensions` as names.
+    pub fn postgres_extensions(&self) -> Vec<String> {
+        self.postgres_extensions
+            .as_deref()
+            .unwrap_or_default()
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
     /// `postgres_settings` as `name=value` pairs.
     pub fn postgres_settings(&self) -> Result<Vec<(String, String)>> {
         let Some(json) = self
@@ -828,6 +844,19 @@ mod tests {
     }
 
     #[test]
+    fn postgres_extensions() {
+        assert_eq!(
+            global().postgres_extensions(),
+            ["postgis", "vector", "pg_trgm"]
+        );
+        let none = Global {
+            postgres_extensions: None,
+            ..global()
+        };
+        assert!(none.postgres_extensions().is_empty());
+    }
+
+    #[test]
     fn postgres_settings() {
         assert_eq!(
             global().postgres_settings().unwrap(),
@@ -851,6 +880,7 @@ mod tests {
                 r#"{"shared_preload_libraries": "x", "jit": false, "n": 3}"#.into(),
             ),
             redis_server: None,
+            postgres_extensions: Some("postgis, vector  pg_trgm,".into()),
         }
     }
 

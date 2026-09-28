@@ -169,7 +169,8 @@ so one session gets answers from the worktree each file belongs to.
 | `localforest.httpsPort` | `443` | HTTPS proxy port |
 | `localforest.lsp.<name>` | none | adds `localforest-lsp-<name>` for Claude Code's `lspServers` |
 | `localforest.postgres.package` | `pkgs.postgresql_18` | PostgreSQL build (18+ for copy-on-write databases) |
-| `localforest.postgres.extensions` | none | as in devenv: `extensions: [ extensions.postgis extensions.pgvector ]`; enable with `CREATE EXTENSION` |
+| `localforest.postgres.extensions` | none | as in devenv: `extensions: [ extensions.postgis extensions.pgvector ]`; trusted ones: enable with `CREATE EXTENSION` |
+| `localforest.postgres.createExtensions` | `[]` | created as superuser in `template1` (so every database made afterwards) and the primaries' databases, for untrusted extensions checkout roles can't create, e.g. `[ "postgis" "vector" ]`; migrations' `CREATE EXTENSION IF NOT EXISTS` is then a no-op |
 | `localforest.postgres.settings` | `{}` | extra postgresql.conf settings, e.g. `shared_preload_libraries` |
 | `localforest.postgres.ramdiskMB` | `4096` | RAM disk size (used as it fills); resizing needs `localforest down --eject`, which empties every database |
 | `localforest.redis` | `pkgs.redis` | Redis build |
@@ -289,9 +290,19 @@ All configurable (`--pg-port`, `--redis-port`, `--https-port`, `--http-port` or
 
 - The RAM disk is volatile: a reboot or `localforest down --eject` empties every
   database; the next start seeds the primary again through the migrate command.
-- Worktree checkout roles are `SUPERUSER` (dev tooling expects it: extensions,
-  `ecto.create`, objects owned by the primary's role in cloned databases); which
-  databases they can open is enforced by the proxy.
+- Checkout roles are not superusers: `CREATEDB` only. A checkout owns its
+  databases (`mix ecto.create` / `ecto.drop` work) and everything in its cloned dev
+  database: the template's objects belong to a no-login role named after it
+  (`<prefix>_template`), handed to the worktree's role on clone. It can't drop or alter
+  other checkouts' databases or roles, run programs (`COPY ... TO PROGRAM`) or read
+  server files; which databases it can open is enforced by the proxy, which also
+  refuses a database another checkout's role created under its name. Trusted
+  extensions (`pgcrypto`, `citext`, `pg_trgm`, `hstore`, `uuid-ossp`, ...) are created
+  by the app as usual; others (`postgis`, `vector`) need
+  `localforest.postgres.createExtensions`. What still needs a superuser: disabling
+  constraint triggers (Rails fixtures' `disable_referential_integrity` warns) and
+  `COMMENT ON EXTENSION` for pre-created extensions in a `structure.sql`. Keep
+  `dblink` / `postgres_fdw` out of `createExtensions`: they connect past the proxy.
 - macOS has no API for RAM disks, so `hdiutil`/`diskutil` are run for it; PostgreSQL,
   redis-server, the migrate and service commands and language servers are also
   separate processes. Everything else (git, GitHub, certificates, keychain) is
