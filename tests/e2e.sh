@@ -103,7 +103,7 @@ primary_redis=$(cd "$work/app" && "$bin" env --json | jq -r .REDIS_URL)
 pass "redis isolated per checkout"
 
 out=$(curl_lf "https://feat-a.web.demo.localhost:8443/" 2>&1) || true
-[[ $out == primary ]] || { cat "$home/logs/demo-feat-a.web.log" >&2; fail "https service not started on demand: $out"; }
+[[ $out == primary ]] || { cat "$home/logs/demo--feat-a.web.log" >&2; fail "https service not started on demand: $out"; }
 pass "https://feat-a.web.demo.localhost started its service on demand"
 
 grep -q "DATABASE_URL=" "$wt/.env" || fail ".env not written"

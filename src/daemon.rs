@@ -413,7 +413,7 @@ impl Daemon {
         if marker.exists() {
             return;
         }
-        let id = format!("{}-setup", c.id());
+        let id = c.run_id("setup");
         match self
             .run_command(rt, &id, &cmd, &c.path, c.env(&self.global))
             .await
@@ -980,7 +980,7 @@ impl Daemon {
             // Into the template with the rest, so worktrees get seeded data.
             self.run_command(
                 rt,
-                &format!("{}-seed", primary.id()),
+                &primary.run_id("seed"),
                 cmd,
                 &primary.path,
                 primary.env(&self.global),
