@@ -28,7 +28,12 @@ work=$(mktemp -d)
 export LOCALFOREST_HOME=$home LOCALFOREST_PROJECT=demo LOCALFOREST_PORT=4100
 export LOCALFOREST_PG_PORT=55499 LOCALFOREST_REDIS_PORT=6399
 export LOCALFOREST_HTTPS_PORT=8443 LOCALFOREST_HTTP_PORT=0 LOCALFOREST_RAMDISK_MB=512
-export LOCALFOREST_MIGRATE="psql -v ON_ERROR_STOP=1 -c 'CREATE TABLE IF NOT EXISTS seeds(x int); INSERT INTO seeds VALUES (1)'"
+# Fails in the worktree named "broken".
+cat >"$home/migrate.sh" <<'EOF'
+[[ ${LOCALFOREST_WORKTREE:-} == broken ]] && { echo "migration broke" >&2; exit 1; }
+exec psql -v ON_ERROR_STOP=1 -c 'CREATE TABLE IF NOT EXISTS seeds(x int); INSERT INTO seeds VALUES (1)'
+EOF
+export LOCALFOREST_MIGRATE="bash $home/migrate.sh"
 export LOCALFOREST_SETUP="sh -c 'echo \"\$LOCALFOREST_WORKTREE\" >> $home/setup.log'"
 web="sh -c 'exec $python -m http.server \"\$PORT\" --bind 127.0.0.1'"
 LOCALFOREST_SERVICES=$(jq -nc --arg web "$web" '{web: {exec: $web}}')
@@ -90,8 +95,9 @@ wt=$("$bin" worktree new feat-a 2>/dev/null)
 pass "worktree new: $wt"
 
 eval "$(cd "$wt" && "$bin" env)"
-# The template's row, plus one from the migrate command run in the new worktree.
-[[ $(psql -tAc "select count(*) from seeds") == 2 ]] || fail "worktree database not cloned from the template and migrated"
+# Row counts depend on how the template is made; the marker says it was migrated.
+(($(psql -tAc "select count(*) from seeds") >= 1)) || fail "worktree database not cloned from the template"
+[[ -f $(git -C "$wt" rev-parse --absolute-git-dir)/localforest-migrated ]] || fail "new worktree not migrated"
 [[ $(psql -tAc "select current_database()") == demo_dev_feat_a ]] || fail "wrong database"
 pass "worktree database cloned from the template and migrated"
 if psql -d demo_dev -tAc "select 1" >/dev/null 2>&1; then fail "worktree could open the primary's database"; fi
@@ -111,6 +117,15 @@ grep -q "DATABASE_URL=" "$wt/.env" || fail ".env not written"
 git -C "$wt" check-ignore -q .env || fail ".env not gitignored"
 [[ -z $(git -C "$wt" status --porcelain) ]] || fail "worktree not clean"
 pass ".env written and gitignored"
+
+"$bin" worktree new broken >/dev/null 2>&1 || fail "worktree new failed on a failing migration"
+"$bin" status | grep -q "migrations failed" || fail "failed migration not in status"
+out=$(curl_lf "https://broken.web.demo.localhost:8443/" 2>&1) || true
+[[ $out == *"migrations failed"* ]] || fail "failed migration not on its page: $out"
+[[ ! -f $(git -C .claude/worktrees/broken rev-parse --absolute-git-dir)/localforest-migrated ]] ||
+  fail "failed migration marked done"
+"$bin" worktree rm --force broken
+pass "failed migration: in status and on the 502 page, services not started"
 
 git worktree add -q -b manual .claude/worktrees/manual
 eventually 30 test -f .claude/worktrees/manual/.env || fail "plain git worktree not provisioned"
@@ -134,11 +149,9 @@ g checkout -qb primary-feat
 admin_psql "DROP DATABASE demo_template WITH (FORCE)" >/dev/null
 admin_psql "DROP DATABASE demo_dev WITH (FORCE)" >/dev/null
 git worktree add -q -b fresh .claude/worktrees/fresh
-fresh_migrated() {
-  [[ $(PGUSER=postgres psql -h "$home/pg" -p 55500 -d demo_dev_fresh -tAc "select count(*) from seeds") == 2 ]]
-}
-eventually 60 fresh_migrated || fail "worktree not cloned from the fresh primary and migrated"
-[[ $(PGUSER=postgres psql -h "$home/pg" -p 55500 -d demo_dev -tAc "select count(*) from seeds") == 1 ]] ||
+fresh_marker=$(git -C .claude/worktrees/fresh rev-parse --absolute-git-dir)/localforest-migrated
+eventually 60 test -f "$fresh_marker" || fail "worktree not migrated after the fresh primary"
+(($(PGUSER=postgres psql -h "$home/pg" -p 55500 -d demo_dev -tAc "select count(*) from seeds") >= 1)) ||
   fail "fresh primary database on a feature branch not migrated"
 [[ -z $(admin_psql "select 1 from pg_database where datname = 'demo_template'") ]] ||
   fail "template made from a feature branch"

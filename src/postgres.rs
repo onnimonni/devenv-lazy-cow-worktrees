@@ -218,6 +218,16 @@ impl Postgres {
             .is_some())
     }
 
+    /// The database's OID: a new one each time it's (re)created.
+    pub async fn oid(&self, db: &str) -> Result<Option<u32>> {
+        Ok(self
+            .admin()
+            .await?
+            .query_opt("SELECT oid FROM pg_database WHERE datname = $1", &[&db])
+            .await?
+            .map(|r| r.get(0)))
+    }
+
     pub async fn connections(&self, db: &str) -> Result<i64> {
         Ok(self
             .admin()
