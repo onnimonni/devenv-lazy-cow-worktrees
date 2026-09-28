@@ -97,9 +97,14 @@ wt=$("$bin" worktree new feat-a 2>/dev/null)
 pass "worktree new: $wt"
 
 eval "$(cd "$wt" && "$bin" env)"
+# A template refresh racing the first connect: the clone still gets the template.
+"$bin" snapshot & snap=$!
 # Row counts depend on how the template is made; the marker says it was migrated.
 (($(psql -tAc "select count(*) from seeds") >= 1)) || fail "worktree database not cloned from the template"
+wait "$snap" || fail "snapshot failed"
 [[ -f $(git -C "$wt" rev-parse --absolute-git-dir)/localforest-migrated ]] || fail "new worktree not migrated"
+template_seeded || fail "template lost by the snapshot"
+[[ -z $(admin_psql "select 1 from pg_database where datname = 'demo_template_next'") ]] || fail "demo_template_next left behind"
 [[ $(psql -tAc "select current_database()") == demo_dev_feat_a ]] || fail "wrong database"
 pass "worktree database cloned from the template and migrated"
 if psql -d demo_dev -tAc "select 1" >/dev/null 2>&1; then fail "worktree could open the primary's database"; fi

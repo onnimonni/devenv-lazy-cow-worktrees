@@ -55,7 +55,7 @@ use crate::{
 pub struct Daemon {
     global: Global,
     pg: Postgres,
-    /// Serialises on-demand CREATE DATABASE.
+    /// Serialises on-demand CREATE DATABASE and swapping in a new template.
     create_lock: tokio::sync::Mutex<()>,
     redis: Arc<Redis>,
     servers: Servers,
@@ -1530,7 +1530,9 @@ impl Daemon {
             let dev = primary.dev_db();
             if self.pg.exists(&dev).await? {
                 let t = std::time::Instant::now();
-                self.pg.snapshot(&dev, &primary.template_db()).await?;
+                self.pg
+                    .snapshot(&dev, &primary.template_db(), &self.create_lock)
+                    .await?;
                 info!(
                     "{} refreshed from {dev} in {:?}",
                     primary.template_db(),
@@ -2052,7 +2054,9 @@ fn api(d: Arc<Daemon>) -> Router {
                 let rt = d.project(&r.root)?;
                 let _g = rt.lock.lock().await;
                 let primary = rt.primary();
-                d.pg.snapshot(&primary.dev_db(), &primary.template_db()).await?;
+                d.pg
+                    .snapshot(&primary.dev_db(), &primary.template_db(), &d.create_lock)
+                    .await?;
                 ApiResult::Ok(Json(serde_json::json!({})))
             }),
         )

@@ -417,8 +417,11 @@ impl Postgres {
     }
 
     /// Replace `dst` with a clone of `src`, closing `src`'s connections (PostgreSQL
-    /// refuses to copy a database in use; clients reconnect).
-    pub async fn snapshot(&self, src: &str, dst: &str) -> Result<()> {
+    /// refuses to copy a database in use; clients reconnect). The clone is built as
+    /// `<dst>_next`; the old `dst` is only dropped and the new one renamed in while
+    /// holding `lock` (the one clones of `dst` are made under), so a clone never finds
+    /// `dst` missing.
+    pub async fn snapshot(&self, src: &str, dst: &str, lock: &Mutex<()>) -> Result<()> {
         let tmp = format!("{dst}_next");
         self.drop(&tmp).await?;
         let mut last = None;
@@ -437,6 +440,7 @@ impl Postgres {
         if let Some(e) = last {
             return Err(e);
         }
+        let _g = lock.lock().await;
         self.drop(dst).await?;
         self.admin()
             .await?
