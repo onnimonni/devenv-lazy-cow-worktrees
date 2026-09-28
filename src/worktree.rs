@@ -605,16 +605,24 @@ pub fn remove_files(root: &Path, info: &Info) -> Result<()> {
     } else {
         trash
     };
+    // Only this worktree's admin dir: other invalid (e.g. locked, on an unmounted
+    // volume) worktrees are left alone.
+    let own = repo
+        .worktrees()?
+        .iter()
+        .filter_map(|n| n.ok().flatten().map(str::to_string))
+        .find(|n| {
+            repo.find_worktree(n)
+                .is_ok_and(|wt| wt.path().canonicalize().ok().as_deref() == Some(&*info.path))
+        });
     // Same volume: a rename instead of deleting thousands of files in the foreground.
     std::fs::rename(&info.path, &trash)
         .with_context(|| format!("moving {} away", info.path.display()))?;
-    for admin in repo.worktrees()?.iter().filter_map(|n| n.ok().flatten()) {
-        if let Ok(wt) = repo.find_worktree(admin)
-            && wt.validate().is_err()
-        {
-            let _ = wt.unlock();
-            wt.prune(Some(WorktreePruneOptions::new().locked(true)))?;
-        }
+    if let Some(wt) = own.and_then(|n| repo.find_worktree(&n).ok())
+        && wt.validate().is_err()
+    {
+        let _ = wt.unlock();
+        wt.prune(Some(WorktreePruneOptions::new().locked(true)))?;
     }
     if let Some(b) = &info.branch
         && *b == info.name
@@ -871,6 +879,33 @@ mod tests {
         assert!(repo.find_branch("feat-x", BranchType::Local).is_err());
         // Can be created again.
         create(&project, &syncer, "feat-x", None).unwrap();
+    }
+
+    #[test]
+    fn removal_leaves_other_locked_worktrees_alone() {
+        let (_d, project, syncer) = fixture();
+        let away = create(&project, &syncer, "away", None).unwrap();
+        create(&project, &syncer, "gone", None).unwrap();
+        let repo = Repository::open(&project.root).unwrap();
+        // Locked on purpose, its volume unmounted: invalid, but not ours to prune.
+        repo.find_worktree("away")
+            .unwrap()
+            .lock(Some("on a usb disk"))
+            .unwrap();
+        let info = list(&project.root)
+            .unwrap()
+            .into_iter()
+            .find(|i| i.name == "gone")
+            .unwrap();
+        std::fs::rename(&away, away.with_file_name("away-unmounted")).unwrap();
+
+        remove_files(&project.root, &info).unwrap();
+        let wt = repo.find_worktree("away").unwrap();
+        assert!(matches!(
+            wt.is_locked().unwrap(),
+            git2::WorktreeLockStatus::Locked(_)
+        ));
+        assert!(repo.find_worktree("gone").is_err());
     }
 
     #[test]
