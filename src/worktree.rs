@@ -671,6 +671,26 @@ pub fn covered_by_pr(info: &Info, pr_head: Oid, remote: &str, base: &str) -> Res
     Ok(ahead(&repo, head, &hidden, remote, base)? == 0)
 }
 
+/// Own commits of the worktree's HEAD that are neither on the base branch (local or
+/// remote) nor pushed to its branch on `remote`: deleting the branch would lose them.
+pub fn unpushed(info: &Info, remote: &str, base: &str) -> Result<usize> {
+    let repo = Repository::open(&info.path)?;
+    let head = repo.head()?.peel_to_commit()?.id();
+    let mut refs = vec![
+        format!("refs/heads/{base}"),
+        format!("refs/remotes/{remote}/{base}"),
+    ];
+    if let Some(b) = &info.branch {
+        refs.push(format!("refs/remotes/{remote}/{b}"));
+    }
+    let hidden: Vec<Oid> = refs
+        .iter()
+        .filter_map(|r| repo.find_reference(r).ok()?.peel_to_commit().ok())
+        .map(|c| c.id())
+        .collect();
+    ahead(&repo, head, &hidden, remote, base)
+}
+
 /// Move the worktree out of the way, drop git's metadata and its own branch, then
 /// delete the files in the background.
 pub fn remove_files(root: &Path, info: &Info) -> Result<()> {
@@ -1046,6 +1066,31 @@ mod tests {
             ahead(&repo, resolved, &[own, main], "origin", "main").unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn pushed_commits_are_not_unpushed() {
+        let (_d, project, syncer) = fixture();
+        let path = create(&project, &syncer, "feat-x", None).unwrap();
+        let info = list(&project.root).unwrap().remove(0);
+        assert_eq!(unpushed(&info, "origin", "main").unwrap(), 0);
+        let repo = Repository::open(&path).unwrap();
+        let sig = Signature::now("T", "t@example.com").unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        let head = repo
+            .commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "own",
+                &parent.tree().unwrap(),
+                &[&parent],
+            )
+            .unwrap();
+        assert_eq!(unpushed(&info, "origin", "main").unwrap(), 1);
+        repo.reference("refs/remotes/origin/feat-x", head, true, "push")
+            .unwrap();
+        assert_eq!(unpushed(&info, "origin", "main").unwrap(), 0);
     }
 
     #[test]
