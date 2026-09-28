@@ -644,9 +644,12 @@ impl Checkout {
 
     /// Key for per-checkout processes and logs; also its PostgreSQL role and the
     /// Redis password that picks its redis-server behind the shared Redis port.
+    /// `<project>--<worktree>`: project names never contain `--` (`dns_label`), so
+    /// project `shop` + worktree `admin-foo` and project `shop-admin` + worktree `foo`
+    /// stay apart. Over PostgreSQL's 63-byte names, shortened with a hash of the whole.
     pub fn id(&self) -> String {
         match &self.worktree {
-            Some(w) => pg_name(&format!("{}-{w}", self.project)),
+            Some(w) => pg_name(&format!("{}--{w}", self.project)),
             None => self.project.clone(),
         }
     }
@@ -679,6 +682,29 @@ impl Checkout {
             suffix,
             name: old,
         })
+    }
+
+    /// The id (role name) worktrees had before `id` used `--` (and, for one whose
+    /// name changed, before names came from git admin dirs: `legacy`); None for the
+    /// primary, whose id didn't change.
+    pub fn legacy_id(&self) -> Option<String> {
+        let w = self.worktree.as_deref()?;
+        if let Some(old) = self.legacy() {
+            return Some(old.role);
+        }
+        // PostgreSQL truncated long role names.
+        Some(
+            format!("{}-{w}", self.project)
+                .chars()
+                .take(PG_NAME_MAX)
+                .collect(),
+        )
+    }
+
+    /// Key of a one-off command's log (`setup`, `seed`) in the checkout; `+` can't
+    /// meet a checkout or service id.
+    pub fn run_id(&self, what: &str) -> String {
+        format!("{}+{what}", self.id())
     }
 
     /// Key of a service's process and log.
@@ -885,7 +911,7 @@ mod tests {
         assert_eq!(env["PORT"], "20000");
         assert_eq!(env["LOCALFOREST_URL"], "https://wt.api.my-app.localhost");
         assert_eq!(env["PGDATABASE"], "my_app_dev_wt");
-        assert!(env["REDIS_URL"].starts_with("redis://:my-app-wt@"));
+        assert!(env["REDIS_URL"].starts_with("redis://:my-app--wt@"));
         assert_eq!(
             env["LOCALFOREST_WEB_URL"],
             "https://wt.web.my-app.localhost"
@@ -1003,6 +1029,36 @@ mod tests {
         assert_eq!(co(Some("fix-it")).host(), "fix-it.my-app.localhost");
         assert_eq!(co(Some("fix-it")).dev_db(), "my_app_dev_fix_it");
         assert_eq!(co(None).test_db(), "my_app_test");
+        // Project `shop` + worktree `admin-foo` vs project `shop-admin` + worktree `foo`.
+        let id = |p: &str, w: Option<&str>| {
+            Checkout {
+                project: p.into(),
+                ..co(w)
+            }
+            .id()
+        };
+        assert_eq!(id("shop", Some("admin-foo")), "shop--admin-foo");
+        assert_ne!(id("shop", Some("admin-foo")), id("shop-admin", Some("foo")));
+        assert_ne!(id("shop-foo", None), id("shop", Some("foo")));
+        assert_ne!(co(Some("x")).run_id("setup"), co(Some("x-setup")).id());
+        // Fits PostgreSQL's 63-byte role names, still unique.
+        let (a, b) = ("a".repeat(32), "b".repeat(31));
+        let long = id(&a, Some(&format!("{b}1")));
+        assert_eq!(long.len(), 63);
+        assert_ne!(long, id(&a, Some(&format!("{b}2"))));
+        // Old role names, for the upgrade.
+        let wt = Checkout {
+            path: "/r/wt".into(),
+            ..co(Some("wt"))
+        };
+        assert_eq!(wt.legacy_id().as_deref(), Some("my-app-wt"));
+        // Renamed by the git-admin-dir naming too: its pre-upgrade role.
+        let renamed = Checkout {
+            path: "/r/.claude/worktrees/Fix_It".into(),
+            ..co(Some(&worktree_label("Fix_It")))
+        };
+        assert_eq!(renamed.legacy_id().as_deref(), Some("my-app-fix-it"));
+        assert_eq!(co(None).legacy_id(), None);
         let p = worktree_port("a", "b");
         assert!((20000..29000).contains(&p) && p.is_multiple_of(10));
     }

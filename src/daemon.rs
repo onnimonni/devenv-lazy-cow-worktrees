@@ -396,6 +396,9 @@ impl Daemon {
     /// Worktrees also get their environment in `.env`. Ok(true) when the primary's
     /// dev database was just created (to be seeded).
     async fn provision(&self, c: &Checkout) -> Result<bool> {
+        if let Err(e) = self.migrate_role(c).await {
+            warn!("{}: taking over its old role: {e:#}", c.id());
+        }
         self.pg.ensure_role(&c.id(), &c.pg_password()?).await?;
         let mut created = false;
         if c.worktree.is_none() {
@@ -423,17 +426,18 @@ impl Daemon {
     }
 
     /// Upgrade: a worktree whose name changed when names started coming from git
-    /// admin dirs keeps its databases (renamed), role objects and preview record.
-    /// Skipped for anything another checkout (`others`) uses under that name.
+    /// admin dirs keeps its databases (renamed) and preview record (its old role:
+    /// `migrate_role`, via `legacy_id`). Skipped for anything another checkout
+    /// (`others`) uses under that name.
     async fn adopt_legacy(&self, rt: &ProjectRt, c: &Checkout, others: &[Checkout]) -> Result<()> {
         let Some(old) = c.legacy() else {
             return Ok(());
         };
         let taken = |db: &str| others.iter().any(|o| o.owns_db(db));
-        if others.iter().any(|o| {
-            o.id() == old.role
-                || (o.project == c.project && o.worktree.as_deref() == Some(old.name.as_str()))
-        }) {
+        if others
+            .iter()
+            .any(|o| o.project == c.project && o.worktree.as_deref() == Some(old.name.as_str()))
+        {
             return Ok(());
         }
         let dbs = self.pg.databases().await?;
@@ -453,13 +457,67 @@ impl Daemon {
             self.pg.drop(db).await?;
             info!("dropped old test database {db}");
         }
-        self.pg.retire_role(&old.role, &c.id()).await?;
         if let Some(new) = c.worktree.clone() {
             history::History::update(&rt.project.root, |h| {
                 if let Some(p) = h.previews.remove(&old.name) {
                     h.previews.entry(new).or_insert(p);
                 }
             })?;
+        }
+        Ok(())
+    }
+
+    /// Upgrade from `<project>-<worktree>` role names: the worktree's old role becomes
+    /// its new one (renamed: it keeps what it owns). When the old name is ambiguous
+    /// (another checkout's id, or another's old id: the collision this naming fixes),
+    /// the old role stays and the new one becomes a member of it instead, so it may
+    /// still use the objects the old one owns.
+    async fn migrate_role(&self, c: &Checkout) -> Result<()> {
+        let Some(old) = c.legacy_id() else {
+            return Ok(());
+        };
+        if !self.pg.role_exists(&old).await? {
+            return Ok(());
+        }
+        let projects: Vec<Project> = self
+            .projects
+            .lock()
+            .unwrap()
+            .values()
+            .map(|rt| rt.project.clone())
+            .collect();
+        let me = c.path.clone();
+        let others = tokio::task::spawn_blocking(move || {
+            let mut out = Vec::new();
+            for p in projects {
+                out.push(p.checkout(None, p.root.clone()));
+                for i in worktree::list(&p.root).unwrap_or_default() {
+                    if i.path != me {
+                        out.push(p.checkout(Some(&i.name), i.path));
+                    }
+                }
+            }
+            out
+        })
+        .await?;
+        let shared = others
+            .iter()
+            .any(|o| o.id() == old || o.legacy_id().as_deref() == Some(old.as_str()));
+        let new = c.id();
+        match (shared, self.pg.role_exists(&new).await?) {
+            (false, false) => {
+                self.pg.rename_role(&old, &new).await?;
+                info!("renamed role {old} to {new}");
+            }
+            (false, true) => {
+                self.pg.retire_role(&old, &new).await?;
+                info!("moved role {old}'s objects to {new}");
+            }
+            (true, _) => {
+                self.pg.ensure_role(&new, &c.pg_password()?).await?;
+                self.pg.grant_role(&old, &new).await?;
+                info!("{new}: member of {old}, which another checkout also used");
+            }
         }
         Ok(())
     }
@@ -486,7 +544,7 @@ impl Daemon {
         if marker.exists() {
             return;
         }
-        let id = format!("{}-setup", c.id());
+        let id = c.run_id("setup");
         match self
             .run_command(rt, &id, &cmd, &c.path, c.env(&self.global))
             .await
@@ -1277,7 +1335,7 @@ impl Daemon {
             // Into the template with the rest, so worktrees get seeded data.
             self.run_command(
                 rt,
-                &format!("{}-seed", primary.id()),
+                &primary.run_id("seed"),
                 cmd,
                 &primary.path,
                 primary.env(&self.global),

@@ -13,7 +13,7 @@ $ curl https://fix-login.web.myapp.localhost   # starts web (and the worker it d
 $ curl https://fix-login.api.myapp.localhost   # starts api (same DATABASE_URL and REDIS_URL)
 $ cd .claude/worktrees/fix-login && eval "$(localforest env)"
 $ echo $DATABASE_URL $REDIS_URL
-postgres://myapp-fix-login:4c1f…@127.0.0.1:55432/myapp_dev_fix_login redis://:myapp-fix-login@127.0.0.1:6380/0
+postgres://myapp--fix-login:4c1f…@127.0.0.1:55432/myapp_dev_fix_login redis://:myapp--fix-login@127.0.0.1:6380/0
 ```
 
 ## Why
@@ -207,12 +207,17 @@ needed), e.g. for services `web` (default), `api` and
 |---|---|---|
 | `PORT` | base (`localforest.port`) + offset | base (20000–28990: hashed from the name, else the next slot no other worktree has; recorded in its git admin dir as `localforest-port`) + offset |
 | `LOCALFOREST_URL` | `web.myapp.localhost` | `fix-login.web.myapp.localhost` |
-| `DATABASE_URL`, `PG*` | `myapp_dev` as role `myapp` | `myapp_dev_fix_login` as role `myapp-fix-login` |
+| `DATABASE_URL`, `PG*` | `myapp_dev` as role `myapp` | `myapp_dev_fix_login` as role `myapp--fix-login` |
 | `TEST_DATABASE_URL` | `myapp_test` | `myapp_test_fix_login` |
-| `REDIS_URL` | password `myapp` | password `myapp-fix-login` |
+| `REDIS_URL` | password `myapp` | password `myapp--fix-login` |
 | `LOCALFOREST_<SERVICE>_URL`, `_PORT` | every service's | every service's |
 | `LOCALFOREST_SERVICE`, `LOCALFOREST_WORKTREE`, `LOCALFOREST_PROJECT` | | |
 | `NODE_EXTRA_CA_CERTS` | the local CA | |
+
+Worktree roles were `<project>-<worktree>` before; the daemon renames an old role to
+the new name on its next start (or, if that name was shared by two checkouts, makes
+the new role a member of it). The Redis password and the role changed, so restart
+anything a worktree runs by hand with an old `.env` / `localforest env`.
 
 Detected from the manifests in the service's `cwd`, set to its hostname so the dev
 server accepts it (the service's `env` overrides them):
