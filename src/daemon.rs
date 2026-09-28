@@ -455,18 +455,13 @@ impl Daemon {
 
     /// PostgreSQL proxy, before the connection is handed to the server (which checks
     /// the password): a checkout's role may open its own databases (its dev database is
-    /// created on the spot) and the maintenance ones. Other users pass through.
+    /// created on the spot) and the maintenance ones. Every other user is refused.
     async fn resolve_pg(&self, user: &str, db: &str) -> Result<()> {
-        if user == "postgres" {
-            anyhow::bail!(
-                "connect as your checkout's role (PGUSER in `localforest env`), not postgres"
-            );
-        }
         let projects: Vec<Arc<ProjectRt>> =
             self.projects.lock().unwrap().values().cloned().collect();
-        for rt in projects {
+        let found = projects.into_iter().find_map(|rt| {
             let primary = rt.primary();
-            let found = if primary.id() == user {
+            let c = if primary.id() == user {
                 Some(primary)
             } else {
                 rt.known
@@ -476,22 +471,14 @@ impl Daemon {
                     .find(|c| c.id() == user)
                     .cloned()
             };
-            let Some(c) = found else { continue };
+            c.map(|c| (rt, c))
+        });
+        let create_dev = pg_access(user, found.as_ref().map(|(_, c)| c), db)?;
+        if let Some((rt, c)) = found {
             self.activity.touch(&c.id());
-            if db == "postgres" || db == "template1" {
-                return Ok(());
-            }
-            if !c.owns_db(db) {
-                anyhow::bail!(
-                    "{user} may only open its own databases ({}, {}), not {db}",
-                    c.dev_db(),
-                    c.test_db()
-                );
-            }
-            if c.worktree.is_some() && db == c.dev_db() {
+            if create_dev {
                 self.ensure_dev_db(&rt, &c).await?;
             }
-            return Ok(());
         }
         Ok(())
     }
@@ -1738,6 +1725,34 @@ fn dashboard(d: &Daemon) -> String {
 
 // ---------- entry point
 
+/// The PostgreSQL proxy's decision for `user` opening `db`, `c` being the registered
+/// checkout whose role `user` is: Err refuses, Ok(true) lets a worktree through to its
+/// dev database (created first if missing), Ok(false) lets it through as is. Fails
+/// closed: users that are no registered checkout's role never reach the server.
+fn pg_access(user: &str, c: Option<&Checkout>, db: &str) -> Result<bool> {
+    if user == "postgres" {
+        anyhow::bail!(
+            "connect as your checkout's role (PGUSER in `localforest env`), not postgres"
+        );
+    }
+    let Some(c) = c else {
+        anyhow::bail!(
+            "{user:?} is not the role of a checkout localforest serves; use PGUSER / DATABASE_URL from `localforest env` in the checkout (and `localforest serve` in its project)"
+        );
+    };
+    if db == "postgres" || db == "template1" {
+        return Ok(false);
+    }
+    if !c.owns_db(db) {
+        anyhow::bail!(
+            "{user} may only open its own databases ({}, {}), not {db}",
+            c.dev_db(),
+            c.test_db()
+        );
+    }
+    Ok(c.worktree.is_some() && db == c.dev_db())
+}
+
 async fn daemon_alive() -> bool {
     crate::client::get::<serde_json::Value>("/status")
         .await
@@ -1932,4 +1947,39 @@ async fn lead(global: Global, project: Option<Project>, listener: UnixListener) 
     tokio::time::sleep(Duration::from_millis(500)).await;
     d.pg.stop().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn co(wt: Option<&str>) -> Checkout {
+        Checkout {
+            project: "demo".into(),
+            db_prefix: "demo".into(),
+            worktree: wt.map(str::to_string),
+            path: "/x".into(),
+            port: 20000,
+            services: Default::default(),
+        }
+    }
+
+    #[test]
+    fn pg_access_fails_closed() {
+        let wt = co(Some("wt"));
+        // Not a registered checkout's role: refused, whatever the database.
+        for db in ["postgres", "demo_dev", "anything"] {
+            let e = pg_access("stranger", None, db).unwrap_err();
+            assert!(e.to_string().contains("not the role of a checkout"), "{e}");
+        }
+        assert!(pg_access("postgres", None, "postgres").is_err());
+        assert!(pg_access("postgres", Some(&co(None)), "postgres").is_err());
+        // Registered: maintenance and own databases, the worktree's dev one created.
+        assert!(!pg_access("demo-wt", Some(&wt), "postgres").unwrap());
+        assert!(!pg_access("demo-wt", Some(&wt), "template1").unwrap());
+        assert!(pg_access("demo-wt", Some(&wt), "demo_dev_wt").unwrap());
+        assert!(!pg_access("demo-wt", Some(&wt), "demo_test_wt").unwrap());
+        assert!(!pg_access("demo", Some(&co(None)), "demo_dev").unwrap());
+        assert!(pg_access("demo-wt", Some(&wt), "demo_dev").is_err());
+    }
 }
