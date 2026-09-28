@@ -16,7 +16,7 @@ use git2::{BranchType, Oid, Repository, Status, StatusOptions, WorktreePruneOpti
 use tracing::{info, warn};
 
 use crate::{
-    config::{Project, dns_label, valid_label},
+    config::{self, Project, dns_label, valid_label},
     sync::Syncer,
 };
 
@@ -61,6 +61,70 @@ pub fn list(root: &Path) -> Result<Vec<Info>> {
         out.push(Info { name, path, branch });
     }
     Ok(out)
+}
+
+/// The worktree's base port, recorded in its git admin dir (gone with it).
+const PORT_FILE: &str = "localforest-port";
+
+fn recorded_port(path: &Path) -> Option<u16> {
+    let admin = Repository::open(path).ok()?.path().to_path_buf();
+    let p: u16 = std::fs::read_to_string(admin.join(PORT_FILE))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    (config::WORKTREE_PORTS.contains(&p) && p.is_multiple_of(10)).then_some(p)
+}
+
+/// Base port of worktree `name` at `path`: the one recorded in its git admin dir,
+/// else chosen now and recorded, so it never moves while the worktree lives. The
+/// choice is its hashed slot (`config::worktree_port`) unless another worktree of the
+/// repository or `taken` (the daemon passes other projects' ports) has it, then the
+/// next free slot. Whoever looks first (daemon or `localforest env`) records it.
+pub fn port(project: &Project, path: &Path, name: &str, taken: &HashSet<u16>) -> Result<u16> {
+    use std::io::Write;
+    if let Some(p) = recorded_port(path) {
+        return Ok(p);
+    }
+    let admin = Repository::open(path)?.path().to_path_buf();
+    let me = path.canonicalize()?;
+    // Unrecorded siblings (older localforest) count at their hashed slot.
+    let mut used = taken.clone();
+    for i in list(&project.root)? {
+        if i.path != me {
+            used.insert(
+                recorded_port(&i.path)
+                    .unwrap_or_else(|| config::worktree_port(&project.name, &i.name)),
+            );
+        }
+    }
+    let first = config::worktree_port(&project.name, name);
+    let slots = config::WORKTREE_PORTS.len() as u16 / 10;
+    let port = (0..slots)
+        .map(|k| {
+            let slot = ((first - config::WORKTREE_PORTS.start) / 10 + k) % slots;
+            config::WORKTREE_PORTS.start + slot * 10
+        })
+        .find(|p| !used.contains(p))
+        .unwrap_or(first);
+    if port != first {
+        warn!("worktree {name}: port {first} is taken, using {port}");
+    }
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(admin.join(PORT_FILE))
+    {
+        Ok(mut f) => f.write_all(format!("{port}\n").as_bytes())?,
+        // Someone else recorded one meanwhile: theirs holds.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            if let Some(p) = recorded_port(path) {
+                return Ok(p);
+            }
+        }
+        Err(e) => return Err(e.into()),
+    }
+    Ok(port)
 }
 
 /// `git worktree add --no-checkout` for an existing branch.
@@ -817,6 +881,32 @@ mod tests {
             token_host: "github.com".into(),
         };
         (dir, project, syncer)
+    }
+
+    #[test]
+    fn ports_never_collide() {
+        let (_d, project, syncer) = fixture();
+        let none = HashSet::new();
+        let a = create(&project, &syncer, "a", None).unwrap();
+        let b = create(&project, &syncer, "b", None).unwrap();
+        let slot_b = config::worktree_port("app", "b");
+        // a already holds b's slot (a hash collision).
+        let admin = Repository::open(&a).unwrap().path().to_path_buf();
+        std::fs::write(admin.join(PORT_FILE), format!("{slot_b}\n")).unwrap();
+        assert_eq!(port(&project, &a, "a", &none).unwrap(), slot_b);
+        let pb = port(&project, &b, "b", &none).unwrap();
+        assert_ne!(pb, slot_b);
+        assert!(config::WORKTREE_PORTS.contains(&pb) && pb.is_multiple_of(10));
+        // Recorded: stable whatever else is taken later, and what `checkout` uses.
+        assert_eq!(port(&project, &b, "b", &HashSet::from([pb])).unwrap(), pb);
+        assert_eq!(project.checkout(Some("b"), b.clone()).port, pb);
+
+        // Ports of other projects (from the daemon) are skipped too.
+        let c = create(&project, &syncer, "c", None).unwrap();
+        let slot_c = config::worktree_port("app", "c");
+        let pc = port(&project, &c, "c", &HashSet::from([slot_c])).unwrap();
+        assert_ne!(pc, slot_c);
+        assert!(![slot_b, pb].contains(&pc));
     }
 
     #[test]

@@ -17,7 +17,7 @@
 //! with the running one, then takes over if that one goes away.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -538,16 +538,28 @@ impl Daemon {
         if !initializing.is_empty() {
             rt.trigger(&rt.pending.reconcile);
         }
+        let taken = self.other_projects_ports(rt);
         let current: BTreeMap<String, Checkout> = infos
             .iter()
             .map(|i| {
                 (
                     i.name.clone(),
-                    rt.project.checkout(Some(&i.name), i.path.clone()),
+                    rt.project
+                        .checkout_avoiding(Some(&i.name), i.path.clone(), &taken),
                 )
             })
             .collect();
         let known = rt.known.lock().unwrap().clone();
+        for (name, c) in &current {
+            if !known.contains_key(name) && taken.contains(&c.port) {
+                warn!(
+                    "worktree {name}: port {} is also another project's; one of them serves \
+                     the other's requests (recorded in {name}'s git admin dir as \
+                     localforest-port; delete it and restart localforest to pick another)",
+                    c.port
+                );
+            }
+        }
         for (name, c) in &current {
             if !known.contains_key(name) && !initializing.contains(name) {
                 if let Some(info) = infos.iter().find(|i| &i.name == name) {
@@ -651,7 +663,10 @@ impl Daemon {
             worktree::create(&project, &syncer, &n, base.as_deref())
         })
         .await??;
-        let c = rt.project.checkout(Some(name), path.clone());
+        let taken = self.other_projects_ports(rt);
+        let c = rt
+            .project
+            .checkout_avoiding(Some(name), path.clone(), &taken);
         let info = worktree::Info {
             name: name.to_string(),
             path: path.clone(),
@@ -1108,6 +1123,16 @@ impl Daemon {
                 self.servers.restart(&id).await;
             }
         }
+    }
+
+    /// Base ports of every checkout of the other registered projects, which a new
+    /// worktree of `rt` must not take.
+    fn other_projects_ports(&self, rt: &ProjectRt) -> HashSet<u16> {
+        self.checkouts()
+            .into_iter()
+            .filter(|(o, _)| o.project.root != rt.project.root)
+            .map(|(_, c)| c.port)
+            .collect()
     }
 
     /// Every checkout (primary and worktrees) of every project.
