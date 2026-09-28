@@ -137,6 +137,11 @@ let
         default = false;
         description = "Restart it (if running) after the base branch was pulled into its checkout and the migrations ran; for servers without a code reloader.";
       };
+      restartOnMixChange = mkOption {
+        type = types.bool;
+        default = true;
+        description = "For a command running `mix`: restart it (if running) when mix.exs, mix.lock or config/*.exs in its cwd change, after running localforest.setup when mix.exs or mix.lock did (Phoenix's code reloader refuses to compile until then).";
+      };
     };
   };
 in

@@ -421,6 +421,10 @@ pub struct Service {
     /// the migrations ran, for servers without a code reloader.
     #[serde(default)]
     pub restart_on_pull: bool,
+    /// A service running `mix`: restart it when its `mix.exs`, `mix.lock` or
+    /// `config/*.exs` change (after the setup command when `mix.exs` or `mix.lock` did).
+    #[serde(default = "yes")]
+    pub restart_on_mix_change: bool,
     /// Further ports it listens on (e.g. a debugger), by name, from the same 10-port
     /// block, exported to every environment of the checkout.
     #[serde(default)]

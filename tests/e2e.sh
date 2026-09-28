@@ -37,8 +37,17 @@ export LOCALFOREST_MIGRATE="bash $home/migrate.sh"
 export LOCALFOREST_SETUP="sh -c 'echo \"\$LOCALFOREST_WORKTREE\" >> $home/setup.log'"
 # Also serves on its named secondary port, like Phoenix's LiveDebugger; never binds `idle`.
 web="sh -c '$python -m http.server \"\$DEBUGGER_PORT\" --bind 127.0.0.1 & exec $python -m http.server \"\$PORT\" --bind 127.0.0.1'"
-LOCALFOREST_SERVICES=$(jq -nc --arg web "$web" \
-  '{web: {exec: $web, ports: {debugger: {http: true}, test: {env: "TEST_PORT"}, idle: {http: true, offset: 5}}}}')
+# A Mix server: restarted when mix.lock changes. Logs each start.
+mkdir "$home/bin"
+cat >"$home/bin/mix" <<EOF
+#!/usr/bin/env bash
+echo started >> "$home/mix-starts.log"
+exec $python -m http.server "\$PORT" --bind 127.0.0.1
+EOF
+chmod +x "$home/bin/mix"
+LOCALFOREST_SERVICES=$(jq -nc --arg web "$web" --arg phx "$home/bin/mix phx.server" \
+  '{web: {exec: $web, portOffset: 0, ports: {debugger: {http: true}, test: {env: "TEST_PORT"}, idle: {http: true, offset: 5}}},
+    phx: {exec: $phx, portOffset: 3}}')
 export LOCALFOREST_SERVICES
 unset GH_TOKEN GITHUB_TOKEN
 
@@ -79,6 +88,7 @@ git init -q --bare -b main origin.git
 git clone -q origin.git app 2>/dev/null
 cd app
 echo primary > index.html
+echo '%{}' > mix.lock
 g add -A && g commit -qm init && git push -q origin main
 
 "$bin" serve >"$work/daemon.log" 2>&1 &
@@ -182,6 +192,27 @@ pass "rm killed its service and dropped its database"
 code=$(curl_lf -o "$work/gone.html" -w '%{http_code}' "https://feat-a.web.demo.localhost:8443/")
 [[ $code == 503 ]] && grep -q "Recreate worktree" "$work/gone.html" || fail "no gone page ($code)"
 pass "gone page (503) for the removed worktree"
+
+mix_starts() { [[ $(wc -l <"$home/mix-starts.log") -eq $1 ]]; }
+setups() { [[ $(wc -l <"$home/setup.log") -eq $1 ]]; }
+curl_lf -o /dev/null "https://phx.demo.localhost:8443/" || fail "mix service did not start"
+mix_starts 1 || fail "mix service started $(wc -l <"$home/mix-starts.log") times"
+echo '%{}' > mix.lock   # rewritten, same content
+sleep 3
+mix_starts 1 || fail "mix service restarted for an unchanged mix.lock"
+before=$(wc -l <"$home/setup.log")
+echo '%{"x" => 1}' > mix.lock
+eventually 30 mix_starts 2 || fail "mix service not restarted after mix.lock changed"
+setups $((before + 1)) || fail "setup did not run before the restart"
+mkdir -p config && echo 'import Config' > config/dev.exs
+eventually 30 mix_starts 3 || fail "mix service not restarted after config/dev.exs appeared"
+setups $((before + 1)) || fail "setup ran for a config change"
+rm -r config
+eventually 30 mix_starts 4 || fail "mix service not restarted after config/dev.exs was removed"
+eventually 30 curl_lf -f -o /dev/null "https://phx.demo.localhost:8443/" || fail "mix service down after restart"
+git checkout -q mix.lock
+eventually 30 mix_starts 5 || fail "mix service not restarted after mix.lock was restored"
+pass "mix service restarted when mix.lock or config changed, setup first for mix.lock"
 
 # A fresh primary database (as after a reboot) while the primary is on a feature
 # branch: migrated anyway, but the template is not made from the feature branch.
