@@ -370,6 +370,54 @@ pub struct Service {
     /// the migrations ran, for servers without a code reloader.
     #[serde(default)]
     pub restart_on_pull: bool,
+    /// Further ports it listens on (e.g. a debugger), by name, from the same 10-port
+    /// block, exported to every environment of the checkout.
+    #[serde(default)]
+    pub ports: BTreeMap<String, ExtraPort>,
+}
+
+/// A service's secondary port (`localforest.services.<svc>.ports.<name>`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExtraPort {
+    /// Variable holding the port [default: `<NAME>_PORT`].
+    #[serde(default)]
+    pub env: Option<String>,
+    /// Served at https://<worktree>.<name>.<project>.localhost, whose first request
+    /// starts the owning service.
+    #[serde(default)]
+    pub http: bool,
+    /// Port = the checkout's base port + this (0-9) [default: the highest free one].
+    #[serde(default)]
+    pub offset: Option<u16>,
+}
+
+/// A secondary port placed in a checkout's 10-port block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortSlot {
+    pub service: String,
+    pub name: String,
+    pub offset: u16,
+    pub env: String,
+    pub http: bool,
+}
+
+/// Every port of a checkout's block: services' offsets and their secondary ports.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Layout {
+    pub services: BTreeMap<String, u16>,
+    pub ports: Vec<PortSlot>,
+}
+
+fn env_var_name(name: &str) -> String {
+    name.to_ascii_uppercase().replace('-', "_")
+}
+
+fn valid_env_name(s: &str) -> bool {
+    let mut b = s.bytes();
+    b.next()
+        .is_some_and(|c| c.is_ascii_uppercase() || c == b'_')
+        && b.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -400,22 +448,8 @@ impl std::str::FromStr for Services {
 
 impl Services {
     fn validate(&self) -> std::result::Result<(), String> {
-        let mut seen = BTreeMap::new();
+        self.layout()?;
         for (name, s) in &self.0 {
-            if !valid_label(name) {
-                return Err(format!(
-                    "service {name}: use a-z, 0-9 and '-' (it's a hostname)"
-                ));
-            }
-            let off = self.offset(name);
-            if off > 9 {
-                return Err(format!("service {name}: port offset {off} is over 9"));
-            }
-            if let Some(other) = seen.insert(off, name) {
-                return Err(format!(
-                    "services {other} and {name} share port offset {off}"
-                ));
-            }
             for d in &s.depends_on {
                 if !self.0.contains_key(d) {
                     return Err(format!("service {name} depends on unknown service {d}"));
@@ -428,10 +462,93 @@ impl Services {
         Ok(())
     }
 
+    /// Place every port in the 10-port block: services at their `portOffset` (default:
+    /// position by name), then their secondary ports at their `offset`, the rest from
+    /// the top down (9, 8, ...) by service and port name. Pure: `localforest env` and
+    /// the daemon agree.
+    pub fn layout(&self) -> std::result::Result<Layout, String> {
+        fn take(
+            taken: &mut BTreeMap<u16, String>,
+            off: u16,
+            what: String,
+        ) -> std::result::Result<(), String> {
+            if off > 9 {
+                return Err(format!("{what}: port offset {off} is over 9"));
+            }
+            match taken.insert(off, what.clone()) {
+                Some(other) => Err(format!("{other} and {what} share port offset {off}")),
+                None => Ok(()),
+            }
+        }
+        let mut taken = BTreeMap::new();
+        let mut layout = Layout::default();
+        for (i, (name, s)) in self.0.iter().enumerate() {
+            if !valid_label(name) {
+                return Err(format!(
+                    "service {name}: use a-z, 0-9 and '-' (it's a hostname)"
+                ));
+            }
+            let off = s.port_offset.unwrap_or(i as u16);
+            take(&mut taken, off, format!("service {name}"))?;
+            layout.services.insert(name.clone(), off);
+        }
+        let mut envs: BTreeMap<String, String> = BTreeMap::new();
+        let mut hosts: BTreeMap<&str, &str> = BTreeMap::new();
+        for (svc, s) in &self.0 {
+            for (name, p) in &s.ports {
+                let what = format!("port {svc}.{name}");
+                if !valid_label(name) {
+                    return Err(format!("{what}: use a-z, 0-9 and '-' in its name"));
+                }
+                if p.http {
+                    if self.0.contains_key(name) {
+                        return Err(format!("{what}: its hostname is service {name}'s"));
+                    }
+                    if let Some(other) = hosts.insert(name, svc) {
+                        return Err(format!("{what}: service {other} has an http port {name}"));
+                    }
+                }
+                let env = p
+                    .env
+                    .clone()
+                    .unwrap_or_else(|| format!("{}_PORT", env_var_name(name)));
+                if !valid_env_name(&env) {
+                    return Err(format!("{what}: env {env} is not [A-Z_][A-Z0-9_]*"));
+                }
+                if let Some(other) = envs.insert(env.clone(), what.clone()) {
+                    return Err(format!("{other} and {what} share env {env}"));
+                }
+                if let Some(off) = p.offset {
+                    take(&mut taken, off, what)?;
+                }
+                layout.ports.push(PortSlot {
+                    service: svc.clone(),
+                    name: name.clone(),
+                    offset: p.offset.unwrap_or(u16::MAX),
+                    env,
+                    http: p.http,
+                });
+            }
+        }
+        for slot in layout.ports.iter_mut().filter(|p| p.offset == u16::MAX) {
+            let what = format!("port {}.{}", slot.service, slot.name);
+            let off = (0..=9u16)
+                .rev()
+                .find(|o| !taken.contains_key(o))
+                .ok_or_else(|| {
+                    format!("{what}: no free port offset (the 10-port block is full)")
+                })?;
+            take(&mut taken, off, what)?;
+            slot.offset = off;
+        }
+        Ok(layout)
+    }
+
     pub fn offset(&self, name: &str) -> u16 {
-        let s = &self.0[name];
-        s.port_offset
-            .unwrap_or_else(|| self.0.keys().position(|k| k == name).unwrap_or(0) as u16)
+        self.layout()
+            .ok()
+            .and_then(|l| l.services.get(name).copied())
+            .unwrap_or(0)
     }
 
     /// The service served at the checkout's own hostname.
@@ -502,7 +619,19 @@ impl Checkout {
             .iter()
             .filter(|(_, s)| s.http)
             .map(|(n, _)| (Some(n.clone()), self.service_host(n), self.service_port(n)))
+            .chain(self.port_slots().into_iter().filter(|p| p.http).map(|p| {
+                (
+                    Some(p.service),
+                    self.service_host(&p.name),
+                    self.port + p.offset,
+                )
+            }))
             .collect()
+    }
+
+    /// The services' secondary ports.
+    pub fn port_slots(&self) -> Vec<PortSlot> {
+        self.services.layout().map(|l| l.ports).unwrap_or_default()
     }
 
     /// Host of the default service (the checkout's own without services).
@@ -624,13 +753,26 @@ impl Checkout {
             ),
         ];
         for (n, s) in &self.services.0 {
-            let var = n.to_ascii_uppercase().replace('-', "_");
+            let var = env_var_name(n);
             env.push((
                 format!("LOCALFOREST_{var}_PORT"),
                 self.service_port(n).to_string(),
             ));
             if s.http {
                 env.push((format!("LOCALFOREST_{var}_URL"), url(&self.service_host(n))));
+            }
+        }
+        for p in self.port_slots() {
+            let port = (self.port + p.offset).to_string();
+            let var = format!(
+                "LOCALFOREST_{}_{}",
+                env_var_name(&p.service),
+                env_var_name(&p.name)
+            );
+            env.push((p.env, port.clone()));
+            env.push((format!("{var}_PORT"), port));
+            if p.http {
+                env.push((format!("{var}_URL"), url(&self.service_host(&p.name))));
             }
         }
         let svc = service.and_then(|n| self.service(n));
@@ -780,6 +922,113 @@ mod tests {
             "{\"a\": {\"exec\": \"x\", \"bogus\": 1}}"
                 .parse::<Services>()
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn named_ports() {
+        let mut c = with_services(
+            r#"{"web": {"exec": "mix phx.server", "ports": {
+                    "debugger": {"env": "LIVE_DEBUGGER_PORT", "http": true},
+                    "test": {"env": "TEST_PORT"}}},
+                "worker": {"exec": "mix run", "http": false,
+                    "ports": {"metrics": {"offset": 5}, "admin": {}}}}"#,
+        );
+        c.worktree = None;
+        c.port = 4000;
+        // Services by name (web 0, worker 1); explicit offsets; the rest top down by
+        // service then port name: web.debugger 9, web.test 8, worker.admin 7.
+        let slots: Vec<_> = c
+            .port_slots()
+            .into_iter()
+            .map(|p| (p.service, p.name, p.offset, p.env))
+            .collect();
+        assert_eq!(
+            slots,
+            [
+                (
+                    "web".into(),
+                    "debugger".into(),
+                    9,
+                    "LIVE_DEBUGGER_PORT".into()
+                ),
+                ("web".into(), "test".into(), 8, "TEST_PORT".into()),
+                ("worker".into(), "admin".into(), 7, "ADMIN_PORT".into()),
+                ("worker".into(), "metrics".into(), 5, "METRICS_PORT".into()),
+            ]
+        );
+        assert_eq!(c.service_port("web"), 4000);
+        assert_eq!(c.service_port("worker"), 4001);
+        assert_eq!(
+            c.routes(),
+            vec![
+                (Some("web".into()), "web.my-app.localhost".into(), 4000),
+                (Some("web".into()), "debugger.my-app.localhost".into(), 4009),
+            ]
+        );
+        let wt = Checkout {
+            worktree: Some("wt".into()),
+            ..c.clone()
+        };
+        assert!(wt.routes().contains(&(
+            Some("web".into()),
+            "wt.debugger.my-app.localhost".into(),
+            4009
+        )));
+        // In every environment of the checkout.
+        for svc in [None, Some("web"), Some("worker")] {
+            let env: BTreeMap<_, _> = c.service_env(&global(), svc).into_iter().collect();
+            assert_eq!(env["LIVE_DEBUGGER_PORT"], "4009");
+            assert_eq!(env["TEST_PORT"], "4008");
+            assert_eq!(env["ADMIN_PORT"], "4007");
+            assert_eq!(env["METRICS_PORT"], "4005");
+            assert_eq!(env["LOCALFOREST_WEB_DEBUGGER_PORT"], "4009");
+            assert_eq!(
+                env["LOCALFOREST_WEB_DEBUGGER_URL"],
+                "https://debugger.my-app.localhost"
+            );
+            assert_eq!(env["LOCALFOREST_WEB_TEST_PORT"], "4008");
+            assert!(!env.contains_key("LOCALFOREST_WEB_TEST_URL"));
+        }
+
+        let err = |json: &str| json.parse::<Services>().unwrap_err();
+        // Full block: 1 service + 10 ports.
+        let ports: Vec<String> = (0..10).map(|i| format!("\"p{i}\": {{}}")).collect();
+        let full = format!(
+            r#"{{"web": {{"exec": "x", "ports": {{{}}}}}}}"#,
+            ports.join(",")
+        );
+        assert!(err(&full).contains("block is full"), "{}", err(&full));
+        assert!(
+            err(r#"{"web": {"exec": "x", "ports": {"a": {"offset": 0}}}}"#)
+                .contains("share port offset 0")
+        );
+        assert!(
+            err(r#"{"web": {"exec": "x", "ports": {"a": {"offset": 10}}}}"#).contains("over 9")
+        );
+        assert!(
+            err(
+                r#"{"web": {"exec": "x", "ports": {"api": {"http": true}}}, "api": {"exec": "y"}}"#
+            )
+            .contains("service api's")
+        );
+        assert!(
+            err(r#"{"a": {"exec": "x", "ports": {"d": {"http": true}}}, "b": {"exec": "y", "ports": {"d": {"http": true, "env": "D2"}}}}"#)
+                .contains("http port d")
+        );
+        assert!(
+            err(r#"{"a": {"exec": "x", "ports": {"p": {}}}, "b": {"exec": "y", "ports": {"q": {"env": "P_PORT"}}}}"#)
+                .contains("share env P_PORT")
+        );
+        assert!(
+            err(r#"{"a": {"exec": "x", "ports": {"p": {"env": "lower"}}}}"#).contains("not [A-Z_]")
+        );
+        assert!(err(r#"{"a": {"exec": "x", "ports": {"P": {}}}}"#).contains("a-z"));
+        // Null options, as the devenv module's JSON has them.
+        assert!(
+            r#"{"a": {"exec": "x", "ports": {"p": {"env": null, "http": false, "offset": null}}}}"#
+                .parse::<Services>()
+                .is_ok()
         );
     }
 

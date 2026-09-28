@@ -134,6 +134,33 @@ impl Servers {
         Ok(())
     }
 
+    /// `ensure` the service owning `port`, then wait for `port` too when it is one of
+    /// its secondary ports (bound a moment after its main one).
+    pub async fn ensure_port(
+        &self,
+        project: &Project,
+        c: &Checkout,
+        name: &str,
+        port: u16,
+        g: &Global,
+    ) -> Result<()> {
+        self.ensure(project, c, name, g).await?;
+        if port == c.service_port(name) {
+            return Ok(());
+        }
+        let id = c.service_id(name);
+        for _ in 0..600 {
+            if listening(port).await {
+                return Ok(());
+            }
+            if !self.running(&id).await {
+                bail!("{id} exited; see {}", log_path(&id).display());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        bail!("{id} did not listen on its port {port} within a minute")
+    }
+
     async fn ensure_one(
         &self,
         project: &Project,

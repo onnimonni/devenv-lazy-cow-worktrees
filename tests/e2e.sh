@@ -30,8 +30,10 @@ export LOCALFOREST_PG_PORT=55499 LOCALFOREST_REDIS_PORT=6399
 export LOCALFOREST_HTTPS_PORT=8443 LOCALFOREST_HTTP_PORT=0 LOCALFOREST_RAMDISK_MB=512
 export LOCALFOREST_MIGRATE="psql -v ON_ERROR_STOP=1 -c 'CREATE TABLE IF NOT EXISTS seeds(x int); INSERT INTO seeds VALUES (1)'"
 export LOCALFOREST_SETUP="sh -c 'echo \"\$LOCALFOREST_WORKTREE\" >> $home/setup.log'"
-web="sh -c 'exec $python -m http.server \"\$PORT\" --bind 127.0.0.1'"
-LOCALFOREST_SERVICES=$(jq -nc --arg web "$web" '{web: {exec: $web}}')
+# Also serves on its named secondary port, like Phoenix's LiveDebugger.
+web="sh -c '$python -m http.server \"\$DEBUGGER_PORT\" --bind 127.0.0.1 & exec $python -m http.server \"\$PORT\" --bind 127.0.0.1'"
+LOCALFOREST_SERVICES=$(jq -nc --arg web "$web" \
+  '{web: {exec: $web, ports: {debugger: {http: true}, test: {env: "TEST_PORT"}}}}')
 export LOCALFOREST_SERVICES
 unset GH_TOKEN GITHUB_TOKEN
 
@@ -102,9 +104,20 @@ primary_redis=$(cd "$work/app" && "$bin" env --json | jq -r .REDIS_URL)
 [[ $(redis-cli --no-auth-warning -u "$REDIS_URL" get k) == worktree ]] || fail "redis lost the key"
 pass "redis isolated per checkout"
 
+base=$(cd "$wt" && "$bin" env --json | jq -r .PORT)
+[[ $DEBUGGER_PORT == $((base + 9)) && $TEST_PORT == $((base + 8)) ]] ||
+  fail "named ports: DEBUGGER_PORT=$DEBUGGER_PORT TEST_PORT=$TEST_PORT (base $base)"
+[[ $LOCALFOREST_WEB_DEBUGGER_URL == https://feat-a.debugger.demo.localhost:8443 ]] ||
+  fail "LOCALFOREST_WEB_DEBUGGER_URL=$LOCALFOREST_WEB_DEBUGGER_URL"
+pass "named ports in env: DEBUGGER_PORT=$DEBUGGER_PORT TEST_PORT=$TEST_PORT"
+
+out=$(curl_lf "https://feat-a.debugger.demo.localhost:8443/" 2>&1) || true
+[[ $out == primary ]] || { cat "$home/logs/demo-feat-a.web.log" >&2; fail "named http port did not start its service: $out"; }
+pass "https://feat-a.debugger.demo.localhost started web on demand"
+
 out=$(curl_lf "https://feat-a.web.demo.localhost:8443/" 2>&1) || true
-[[ $out == primary ]] || { cat "$home/logs/demo-feat-a.web.log" >&2; fail "https service not started on demand: $out"; }
-pass "https://feat-a.web.demo.localhost started its service on demand"
+[[ $out == primary ]] || { cat "$home/logs/demo-feat-a.web.log" >&2; fail "https service not served: $out"; }
+pass "https://feat-a.web.demo.localhost served"
 
 grep -q "DATABASE_URL=" "$wt/.env" || fail ".env not written"
 git -C "$wt" check-ignore -q .env || fail ".env not gitignored"
@@ -119,7 +132,9 @@ pass "plain git worktree add provisioned, setup ran"
 port=$(cd "$wt" && "$bin" env --json | jq -r .PORT)
 "$bin" worktree rm --force feat-a
 [[ ! -e $wt ]] || fail "worktree still there"
-if curl -s --max-time 2 "http://127.0.0.1:$port/" >/dev/null; then fail "its server survived"; fi
+for p in "$port" "$((port + 9))"; do
+  if curl -s --max-time 2 "http://127.0.0.1:$p/" >/dev/null; then fail "its server on $p survived"; fi
+done
 [[ -z $(admin_psql "select 1 from pg_database where datname = 'demo_dev_feat_a'") ]] || fail "its database survived"
 pass "rm killed its service and dropped its database"
 

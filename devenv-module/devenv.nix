@@ -45,6 +45,27 @@ let
     else
       cfg.postgres.package;
 
+  extraPort = types.submodule {
+    options = {
+      env = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "LIVE_DEBUGGER_PORT";
+        description = "Variable holding the port (default: `<NAME>_PORT`); also always LOCALFOREST_<SERVICE>_<NAME>_PORT (and _URL with http).";
+      };
+      http = mkOption {
+        type = types.bool;
+        default = false;
+        description = "Served at https://<worktree>.<name>.<project>.localhost, whose first request starts the service.";
+      };
+      offset = mkOption {
+        type = types.nullOr (types.ints.between 0 9);
+        default = null;
+        description = "Port = the checkout's base port + this (default: the highest free offset, 9 down).";
+      };
+    };
+  };
+
   service = types.submodule {
     options = {
       exec = mkOption {
@@ -98,6 +119,18 @@ let
         ];
         default = "no";
         description = "When it exits on its own: leave it down, start it again after a non-zero exit, or after any exit (backing off 1-30 s; `localforest service stop` keeps it down).";
+      };
+      ports = mkOption {
+        type = types.attrsOf extraPort;
+        default = { };
+        example = {
+          debugger = {
+            env = "LIVE_DEBUGGER_PORT";
+            http = true;
+          };
+          test.env = "TEST_PORT";
+        };
+        description = "Further ports the service listens on, from the checkout's 10-port block, in every environment of the checkout.";
       };
       restartOnPull = mkOption {
         type = types.bool;
