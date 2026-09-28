@@ -135,7 +135,8 @@ impl Servers {
     }
 
     /// `ensure` the service owning `port`, then wait for `port` too when it is one of
-    /// its secondary ports (bound a moment after its main one).
+    /// its secondary ports: 5 s once its main port listens (bound a moment after it),
+    /// 3 minutes for a service without http (nothing tells it is up).
     pub async fn ensure_port(
         &self,
         project: &Project,
@@ -149,7 +150,14 @@ impl Servers {
             return Ok(());
         }
         let id = c.service_id(name);
-        for _ in 0..600 {
+        let port_name = c
+            .port_slots()
+            .into_iter()
+            .find(|p| p.service == name && c.port + p.offset == port)
+            .map_or_else(|| "a".to_string(), |p| p.name);
+        let http = c.service(name).is_some_and(|s| s.http);
+        let tries = if http { 50 } else { 1800 };
+        for _ in 0..tries {
             if listening(port).await {
                 return Ok(());
             }
@@ -158,7 +166,10 @@ impl Servers {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        bail!("{id} did not listen on its port {port} within a minute")
+        bail!(
+            "{name} doesn't listen on its {port_name} port {port}; see {}",
+            log_path(&id).display()
+        )
     }
 
     async fn ensure_one(

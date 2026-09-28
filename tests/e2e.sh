@@ -30,10 +30,10 @@ export LOCALFOREST_PG_PORT=55499 LOCALFOREST_REDIS_PORT=6399
 export LOCALFOREST_HTTPS_PORT=8443 LOCALFOREST_HTTP_PORT=0 LOCALFOREST_RAMDISK_MB=512
 export LOCALFOREST_MIGRATE="psql -v ON_ERROR_STOP=1 -c 'CREATE TABLE IF NOT EXISTS seeds(x int); INSERT INTO seeds VALUES (1)'"
 export LOCALFOREST_SETUP="sh -c 'echo \"\$LOCALFOREST_WORKTREE\" >> $home/setup.log'"
-# Also serves on its named secondary port, like Phoenix's LiveDebugger.
+# Also serves on its named secondary port, like Phoenix's LiveDebugger; never binds `idle`.
 web="sh -c '$python -m http.server \"\$DEBUGGER_PORT\" --bind 127.0.0.1 & exec $python -m http.server \"\$PORT\" --bind 127.0.0.1'"
 LOCALFOREST_SERVICES=$(jq -nc --arg web "$web" \
-  '{web: {exec: $web, ports: {debugger: {http: true}, test: {env: "TEST_PORT"}}}}')
+  '{web: {exec: $web, ports: {debugger: {http: true}, test: {env: "TEST_PORT"}, idle: {http: true, offset: 5}}}}')
 export LOCALFOREST_SERVICES
 unset GH_TOKEN GITHUB_TOKEN
 
@@ -111,13 +111,20 @@ base=$(cd "$wt" && "$bin" env --json | jq -r .PORT)
   fail "LOCALFOREST_WEB_DEBUGGER_URL=$LOCALFOREST_WEB_DEBUGGER_URL"
 pass "named ports in env: DEBUGGER_PORT=$DEBUGGER_PORT TEST_PORT=$TEST_PORT"
 
+web_log=$(cd "$wt" && "$bin" service log -s web)
 out=$(curl_lf "https://feat-a.debugger.demo.localhost:8443/" 2>&1) || true
-[[ $out == primary ]] || { cat "$home/logs/demo-feat-a.web.log" >&2; fail "named http port did not start its service: $out"; }
+[[ $out == primary ]] || { cat "$web_log" >&2; fail "named http port did not start its service: $out"; }
 pass "https://feat-a.debugger.demo.localhost started web on demand"
 
 out=$(curl_lf "https://feat-a.web.demo.localhost:8443/" 2>&1) || true
-[[ $out == primary ]] || { cat "$home/logs/demo-feat-a.web.log" >&2; fail "https service not served: $out"; }
+[[ $out == primary ]] || { cat "$web_log" >&2; fail "https service not served: $out"; }
 pass "https://feat-a.web.demo.localhost served"
+
+start=$SECONDS
+code=$(curl_lf -o "$work/idle.txt" -w '%{http_code}' "https://feat-a.idle.demo.localhost:8443/")
+[[ $code == 502 ]] && grep -q "doesn't listen on its idle port" "$work/idle.txt" && ((SECONDS - start < 20)) ||
+  fail "unbound named port: $code in $((SECONDS - start)) s: $(cat "$work/idle.txt")"
+pass "unbound named port answers 502 after a short grace"
 
 grep -q "DATABASE_URL=" "$wt/.env" || fail ".env not written"
 git -C "$wt" check-ignore -q .env || fail ".env not gitignored"

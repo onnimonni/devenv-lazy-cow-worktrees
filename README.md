@@ -214,7 +214,12 @@ localforest.services.web = {
 
 They share the checkout's 10-port block with the services: services keep their
 offsets, the rest are filled from the top down (9, 8, …) by service and port name.
-With only `web` on base 4000: web 4000, debugger 4009, test 4008.
+With only `web` on base 4000: web 4000, debugger 4009, test 4008. Adding a port or
+service can shift the others, so give `offset` to any port whose number is written
+down anywhere instead of read from its variable. `env` may not name a variable
+localforest sets (`PORT`, `DATABASE_URL`, `PG*`, `REDIS_URL`, `PHX_HOST`, …,
+`LOCALFOREST_*`). An `http` port's first request waits 5 s for it once the service's
+main port listens, then answers 502.
 
 ## Environment
 

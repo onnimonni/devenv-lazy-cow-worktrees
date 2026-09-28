@@ -413,6 +413,24 @@ fn env_var_name(name: &str) -> String {
     name.to_ascii_uppercase().replace('-', "_")
 }
 
+/// Variables `Checkout::service_env` sets besides `LOCALFOREST_*`; a named port's
+/// `env` may not replace them.
+pub const RESERVED_ENV: &[&str] = &[
+    "PORT",
+    "PGHOST",
+    "PGPORT",
+    "PGUSER",
+    "PGPASSWORD",
+    "PGDATABASE",
+    "DATABASE_URL",
+    "TEST_DATABASE_URL",
+    "REDIS_URL",
+    "NODE_EXTRA_CA_CERTS",
+    "PHX_HOST",
+    "RAILS_DEVELOPMENT_HOSTS",
+    "__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS",
+];
+
 fn valid_env_name(s: &str) -> bool {
     let mut b = s.bytes();
     b.next()
@@ -493,6 +511,11 @@ impl Services {
             layout.services.insert(name.clone(), off);
         }
         let mut envs: BTreeMap<String, String> = BTreeMap::new();
+        // LOCALFOREST_<SERVICE>_PORT / _<SERVICE>_<PORT>_PORT (and _URL) must not collide.
+        let mut generated: BTreeMap<String, String> = BTreeMap::new();
+        for name in self.0.keys() {
+            generated.insert(env_var_name(name), format!("service {name}"));
+        }
         let mut hosts: BTreeMap<&str, &str> = BTreeMap::new();
         for (svc, s) in &self.0 {
             for (name, p) in &s.ports {
@@ -515,8 +538,17 @@ impl Services {
                 if !valid_env_name(&env) {
                     return Err(format!("{what}: env {env} is not [A-Z_][A-Z0-9_]*"));
                 }
+                if RESERVED_ENV.contains(&env.as_str()) || env.starts_with("LOCALFOREST_") {
+                    return Err(format!("{what}: env {env} is set by localforest"));
+                }
                 if let Some(other) = envs.insert(env.clone(), what.clone()) {
                     return Err(format!("{other} and {what} share env {env}"));
+                }
+                let var = format!("{}_{}", env_var_name(svc), env_var_name(name));
+                if let Some(other) = generated.insert(var.clone(), what.clone()) {
+                    return Err(format!(
+                        "{other} and {what} both set LOCALFOREST_{var}_PORT"
+                    ));
                 }
                 if let Some(off) = p.offset {
                     take(&mut taken, off, what)?;
@@ -1024,6 +1056,26 @@ mod tests {
             err(r#"{"a": {"exec": "x", "ports": {"p": {"env": "lower"}}}}"#).contains("not [A-Z_]")
         );
         assert!(err(r#"{"a": {"exec": "x", "ports": {"P": {}}}}"#).contains("a-z"));
+        for reserved in RESERVED_ENV.iter().chain(&["LOCALFOREST_X"]) {
+            let json =
+                format!(r#"{{"a": {{"exec": "x", "ports": {{"p": {{"env": "{reserved}"}}}}}}}}"#);
+            assert!(err(&json).contains("set by localforest"), "{reserved}");
+        }
+        assert!(
+            err(r#"{"web": {"exec": "x", "ports": {"debugger": {}}}, "web-debugger": {"exec": "y"}}"#)
+                .contains("both set LOCALFOREST_WEB_DEBUGGER_PORT")
+        );
+        // Everything else service_env sets is reserved.
+        let env = c.service_env(&global(), Some("web"));
+        let ports: Vec<String> = c.port_slots().into_iter().map(|p| p.env).collect();
+        for (k, _) in env {
+            assert!(
+                k.starts_with("LOCALFOREST_")
+                    || RESERVED_ENV.contains(&k.as_str())
+                    || ports.contains(&k),
+                "{k} not in RESERVED_ENV"
+            );
+        }
         // Null options, as the devenv module's JSON has them.
         assert!(
             r#"{"a": {"exec": "x", "ports": {"p": {"env": null, "http": false, "offset": null}}}}"#
@@ -1058,6 +1110,7 @@ mod tests {
             r#"{"devDependencies": {"vite": "^7"}}"#,
         )
         .unwrap();
+        assert!(keys(d).iter().all(|k| RESERVED_ENV.contains(&k.as_str())));
         assert_eq!(
             keys(d),
             [

@@ -1851,11 +1851,13 @@ async fn lead(global: Global, project: Option<Project>, listener: UnixListener) 
     let ensure: proxy::Ensure = Arc::new(move |host| {
         let weak = weak.clone();
         Box::pin(async move {
-            if let Some(d) = weak.upgrade()
-                && let Err(e) = d.ensure_server(&host).await
-            {
+            let Some(d) = weak.upgrade() else {
+                return Ok(());
+            };
+            d.ensure_server(&host).await.map_err(|e| {
                 warn!("{host}: {e:#}");
-            }
+                format!("{e:#}")
+            })
         })
     });
     let weak = Arc::downgrade(&d);
