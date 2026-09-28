@@ -37,6 +37,21 @@
 let
   cfg = config.localforest;
   exe = lib.getExe cfg.package;
+  # localforest's own nixpkgs (flake.lock), so the default package is the exact
+  # derivation CI pushes to localforest.cachix.org, whatever nixpkgs the consumer uses.
+  lock = builtins.fromJSON (builtins.readFile ../flake.lock);
+  nixpkgsLock = lock.nodes.${lock.nodes.${lock.root}.inputs.nixpkgs}.locked;
+  pinnedPkgs =
+    import
+      (builtins.fetchTarball {
+        url = "https://github.com/${nixpkgsLock.owner}/${nixpkgsLock.repo}/archive/${nixpkgsLock.rev}.tar.gz";
+        sha256 = nixpkgsLock.narHash;
+      })
+      {
+        system = pkgs.stdenv.hostPlatform.system;
+        config = { };
+        overlays = [ ];
+      };
   inherit (lib) mkOption types;
   # With its extensions, like devenv's services.postgres.
   postgres =
@@ -149,8 +164,15 @@ in
     };
     package = mkOption {
       type = types.package;
-      default = pkgs.callPackage ../package.nix { };
-      description = "The localforest package.";
+      default = pinnedPkgs.callPackage ../package.nix { };
+      defaultText = lib.literalMD "built with localforest's pinned nixpkgs (flake.lock), substituted from localforest.cachix.org";
+      example = lib.literalExpression "pkgs.callPackage (inputs.localforest + \"/package.nix\") { }";
+      description = "The localforest package. The default is the one localforest's CI builds and pushes to localforest.cachix.org; a package built with other nixpkgs is compiled locally.";
+    };
+    cachix.enable = mkOption {
+      type = types.bool;
+      default = true;
+      description = "Pull the default package from localforest.cachix.org (`cachix.pull`). A multi-user Nix only uses it for trusted users, or when it's in the daemon's own substituters.";
     };
     # Daemon-wide, like the ports: the project whose `devenv up` starts the daemon
     # decides; the others share its PostgreSQL.
@@ -273,6 +295,8 @@ in
 
   config = lib.mkIf cfg.enable {
     localforest.services = lib.mkIf (cfg.server != null) { web.exec = lib.mkDefault cfg.server; };
+
+    cachix.pull = lib.mkIf cfg.cachix.enable [ "localforest" ];
 
     packages = [
       cfg.package
