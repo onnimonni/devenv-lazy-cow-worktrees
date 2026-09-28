@@ -1690,7 +1690,7 @@ impl Daemon {
         let mut failed = Vec::new();
         for (id, cmd, cwd, env) in runs {
             if let Err(e) = self
-                .run_command(rt, &format!("{id}-migrate"), &cmd, &cwd, env)
+                .run_command(rt, &format!("{id}+migrate"), &cmd, &cwd, env)
                 .await
             {
                 warn!("{e:#}");
