@@ -43,7 +43,8 @@ jobs:
       matrix:
         # One native build per system, each pushed to the cache: aarch64-darwin,
         # x86_64-linux, aarch64-linux. (nixpkgs-unstable dropped x86_64-darwin.)
-        os: [macos-latest, ubuntu-latest, ubuntu-24.04-arm]
+        # No ubuntu-latest-arm label: https://github.com/orgs/community/discussions/148648
+        os: [macos-latest, ubuntu-latest, ubuntu-26.04-arm]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
