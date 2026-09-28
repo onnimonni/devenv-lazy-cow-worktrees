@@ -223,16 +223,18 @@ pub fn secret() -> Result<Vec<u8>> {
     std::fs::File::open("/dev/urandom")
         .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut s))
         .context("reading /dev/urandom")?;
-    match std::fs::OpenOptions::new()
+    // Written in full, then linked into place: a racing reader never sees it partial.
+    let tmp = home().join(format!("secret.{}.tmp", hex::encode(&s[..8])));
+    std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(&path)
-    {
-        Ok(mut f) => {
-            f.write_all(&s)?;
-            Ok(s)
-        }
+        .open(&tmp)?
+        .write_all(&s)?;
+    let linked = std::fs::hard_link(&tmp, &path);
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => Ok(s),
         // Another process won the race.
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(std::fs::read(&path)?),
         Err(e) => Err(e.into()),
