@@ -41,7 +41,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest]
+        # One native build per system the flake supports, each pushed to the cache:
+        # aarch64-darwin, x86_64-darwin, x86_64-linux, aarch64-linux.
+        os: [macos-latest, macos-15-intel, ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

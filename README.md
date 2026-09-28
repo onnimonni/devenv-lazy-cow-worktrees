@@ -65,8 +65,10 @@ removal or its ancestors, such as the Claude Code session), stops its redis-serv
 its databases and role, deletes its branch (even `--force` keeps one with commits
 that aren't on the base branch, pushed, or in its merged PR, renamed to
 `<name>-kept-<sha>`; uncommitted files it deletes are listed) and moves the files away
-for background deletion. Gitignored files it deletes that are neither build caches nor
-copies of the primary checkout's are printed as warnings and listed on its gone page.
+for background deletion. Gitignored files it deletes that are neither build caches
+(including whatever it carried in or `.worktreeinclude` names), its own `.env`, copies of
+the primary checkout's, nor unchanged since setup finished are printed as warnings and
+listed on its gone page.
 
 ## Install
 
@@ -119,7 +121,7 @@ To build it yourself instead: `localforest.cachix.enable = false;` and
 **2. Describe the project** in `devenv.nix`. The module adds localforest,
 PostgreSQL 18 and Redis to the shell, runs `localforest serve` as a devenv process,
 exports the checkout's environment in `enterShell`, and wires Claude Code's
-worktree hooks. Replace your own `services.postgres` / `services.redis` with it:
+worktree hooks and its trust in the local CA. Replace your own `services.postgres` / `services.redis` with it:
 
 ```nix
 # devenv.nix
@@ -146,7 +148,17 @@ registers the project with the one already running: one daemon serves every
 project, and another project's `devenv up` takes over if it stops.
 
 **4. Trust the local CA** once: `localforest trust` (macOS keychain, asks for your
-password), for `https://*.localhost`.
+password), for `https://*.localhost`. Node ignores the keychain, so the module also
+sets `NODE_EXTRA_CA_CERTS` to the CA (`$LOCALFOREST_HOME/ca/ca.pem`, default
+`~/.local/state/localforest/ca/ca.pem`) in `.claude/settings.local.json`'s `env`:
+Claude Code then connects to MCP servers behind localforest (e.g. Tidewave at
+`https://web.<project>.localhost/tidewave/mcp`) instead of failing with
+`SELF_SIGNED_CERT_IN_CHAIN`. Node takes a single file there: to trust another CA too,
+set `files.".claude/settings.local.json".json.env.NODE_EXTRA_CA_CERTS` to a bundle
+of both (yours wins), or turn it off with `localforest.claude.trustCa = false`.
+Codex uses the system roots, so `localforest trust` covers it; elsewhere point
+`CODEX_CA_CERTIFICATE` (added to the system roots) at the CA, not `SSL_CERT_FILE`
+(replaces them).
 
 **5. Point the app at the environment** instead of hard-coded settings:
 `DATABASE_URL`, `TEST_DATABASE_URL`, `REDIS_URL`, `PORT` (`PHX_HOST` is set when
@@ -191,7 +203,7 @@ so one session gets answers from the worktree each file belongs to.
 | `localforest.port` | `4000` | base port of the primary checkout's services |
 | `localforest.migrate` | none | migrate command: primary when the base branch moves (then the template is refreshed) or its database was just created, new worktrees once, worktrees the base branch was merged into |
 | `localforest.seed` | none | seed command: primary, after `migrate`, when its database was just created; worktrees get seeded data via the template |
-| `localforest.setup` | none | runs once in every new checkout (localforest, `git worktree add`, Claude Code), e.g. `mix deps.get` |
+| `localforest.setup` | none | runs once in every new checkout (localforest, `git worktree add`, Claude Code), e.g. `mix deps.get`; in the primary checkout too (a fresh clone has no `deps/`), before its first migrate, seed or service start. Done is a `localforest-setup` marker in the checkout's git dir; a failure in the primary shows in `localforest status` and is retried with the migrations' backoff |
 | `localforest.services.<name>` | none | see below |
 | `localforest.server` | none | shorthand for `localforest.services.web.exec` |
 | `localforest.previewTtlHours` | `48` | close previews after this many hours without activity; `0` keeps them |
@@ -200,6 +212,8 @@ so one session gets answers from the worktree each file belongs to.
 | `localforest.lsp.<name>` | none | adds `localforest-lsp-<name>` for Claude Code's `lspServers` |
 | `localforest.package` | built with localforest's pinned nixpkgs | localforest build; the default is on localforest.cachix.org |
 | `localforest.cachix.enable` | `true` | `cachix.pull = [ "localforest" ]` |
+| `localforest.claude.trustCa` | `true` | sets `NODE_EXTRA_CA_CERTS` to the local CA in `.claude/settings.local.json` (a value you set there wins) |
+| `localforest.home` | `$LOCALFOREST_HOME`, else `~/.local/state/localforest` | where the module looks for the daemon's CA (read from devenv's environment at evaluation; `env.LOCALFOREST_HOME` too) |
 | `localforest.postgres.package` | `pkgs.postgresql_18` | PostgreSQL build (18+ for copy-on-write databases) |
 | `localforest.postgres.extensions` | none | as in devenv: `extensions: [ extensions.postgis extensions.pgvector ]`; trusted ones: enable with `CREATE EXTENSION` |
 | `localforest.postgres.createExtensions` | `[]` | created as superuser in `template1` (so every database made afterwards) and the primaries' databases, for untrusted extensions checkout roles can't create, e.g. `[ "postgis" "vector" ]`; migrations' `CREATE EXTENSION IF NOT EXISTS` is then a no-op |
