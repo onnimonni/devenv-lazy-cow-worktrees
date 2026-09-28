@@ -203,7 +203,7 @@ so one session gets answers from the worktree each file belongs to.
 | `localforest.port` | `4000` | base port of the primary checkout's services |
 | `localforest.migrate` | none | migrate command: primary when the base branch moves (then the template is refreshed) or its database was just created, new worktrees once, worktrees the base branch was merged into |
 | `localforest.seed` | none | seed command: primary, after `migrate`, when its database was just created; worktrees get seeded data via the template |
-| `localforest.setup` | none | runs once in every new checkout (localforest, `git worktree add`, Claude Code), e.g. `mix deps.get`; in the primary checkout too (a fresh clone has no `deps/`), before its first migrate, seed or service start. Done is a `localforest-setup` marker in the checkout's git dir; a failure in the primary shows in `localforest status` and is retried with the migrations' backoff |
+| `localforest.setup` | none | runs once in every new checkout (localforest, `git worktree add`, Claude Code), e.g. `mix deps.get`; in the primary checkout too (a fresh clone has no `deps/`), before its first migrate, seed or service start. Done is a `localforest-setup` marker in the checkout's git dir; a failure in the primary shows in `localforest status` and is retried with the migrations' backoff; again before a `restartOnChange` restart for changed dependency files, so keep it idempotent |
 | `localforest.services.<name>` | none | see below |
 | `localforest.server` | none | shorthand for `localforest.services.web.exec` |
 | `localforest.previewTtlHours` | `48` | close previews after this many hours without activity; `0` keeps them |
@@ -235,10 +235,23 @@ Service options:
 | `env` | `{}` | extra environment |
 | `restart` | `"no"` | when it exits on its own: `"no"`, `"on-failure"` (non-zero exit) or `"always"`; backs off 1–30 s, `localforest service stop` keeps it down |
 | `restartOnPull` | `false` | restart it (if running) after the base branch was pulled into its checkout and migrated; for servers without a code reloader |
+| `restartOnChange` | Mix: `[ "mix.exs" "mix.lock" "config/*.exs" ]`, else `[]` | files (relative to `cwd`, `*` / `?` in the file name) whose content changing restarts it if running; see below |
 | `ports.<name>` | `{}` | further ports it listens on; see below |
 
 Commands are split like a shell would, then run directly (no shell) with the
 service's environment and the project's `PATH`. Logs: `localforest service log -s <name>`.
+
+A running service is restarted when the content of a `restartOnChange` file changes
+(a pull, a dependency update, an agent's edit), once nothing in its checkout changed for
+a second, and not while the checkout pulls or migrates (then after). When a dependency
+manifest or lockfile changed (`mix.exs`, `mix.lock`, `Gemfile(.lock)`, `package.json`,
+`bun.lock`, `Cargo.lock`, `go.mod`, `pyproject.toml`, `uv.lock`, `composer.lock`, …),
+`localforest.setup` runs in the checkout first, in the background, once for all its
+services, so it should be idempotent (`mix deps.get`, not an alias that also seeds). For
+a command running `mix` (`mix phx.server`, `iex -S mix …`, `sh -c '… mix phx.server'`)
+it defaults to `mix.exs`, `mix.lock` and `config/*.exs`: Phoenix's code reloader
+refuses to compile after those change until the server restarts. Others opt in, e.g.
+Rails with `restartOnChange = [ "Gemfile.lock" "config/*.rb" ]`; `[ ]` turns it off.
 
 Named ports, for a service that listens on more than `$PORT` (a debugger, a test
 endpoint), so the app reads a variable instead of computing an offset:

@@ -60,7 +60,7 @@ pub struct Daemon {
     /// Per dev database: its first connects wait until it's cloned and adopted.
     dev_locks: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
     redis: Arc<Redis>,
-    servers: Servers,
+    servers: Arc<Servers>,
     routes: Routes,
     /// Last activity per checkout (previews close after `preview_ttl_hours` without).
     activity: history::Activity,
@@ -745,6 +745,8 @@ impl Daemon {
         }
         let lock = rt.migrate_lock(c);
         let _g = lock.lock().await;
+        // Its changed files restart its services after migrating, not during.
+        let _hold = self.servers.hold(&c.path);
         if !force && let Some(f) = rt.migrate_failure(c).filter(MigrateFailure::backing_off) {
             anyhow::bail!("{} (retried later)", f.error);
         }
@@ -1615,6 +1617,7 @@ impl Daemon {
         let lock = rt.migrate_lock(&primary);
         let result = {
             let _g = lock.lock().await;
+            let _hold = self.servers.hold(&primary.path);
             match primary_setup_step(
                 rt.setup_pending(&primary),
                 rt.migrate_failure(&primary).as_ref(),
@@ -1762,27 +1765,7 @@ impl Daemon {
         cwd: &Path,
         env: Vec<(String, String)>,
     ) -> Result<()> {
-        let log_path = crate::server::log_path(id);
-        std::fs::create_dir_all(log_path.parent().unwrap())?;
-        let log = std::fs::File::create(&log_path)?;
-        info!("{id}: running `{cmd}`");
-        let t = std::time::Instant::now();
-        let mut command = crate::server::command(&rt.project, cmd, cwd, env)?;
-        command
-            .stdout(log.try_clone()?)
-            .stderr(log)
-            .kill_on_drop(true);
-        let status = tokio::time::timeout(Duration::from_secs(900), command.status())
-            .await
-            .map_err(|_| anyhow!("`{cmd}` timed out"))??;
-        if !status.success() {
-            anyhow::bail!(
-                "`{cmd}` failed in {id} ({status}); see {}",
-                log_path.display()
-            );
-        }
-        info!("{id}: done in {:?}", t.elapsed());
-        Ok(())
+        crate::server::run_logged(&rt.project, id, cmd, cwd, env, false).await
     }
 
     /// Pull branches and merge the base branch into worktrees, then migrate the
@@ -1794,6 +1777,8 @@ impl Daemon {
         if rt.project.settings.no_sync || !has_remote {
             return Ok(());
         }
+        // Merged files restart services once their checkouts are migrated.
+        let _hold = self.servers.hold(&rt.project.root);
         let moved = {
             let _g = rt.lock.lock().await;
             let syncer = rt.syncer();
@@ -2649,7 +2634,7 @@ async fn lead(global: Global, project: Option<Project>, listener: UnixListener) 
             activity.clone(),
             global.redis_server.clone(),
         )),
-        servers: Servers::default(),
+        servers: Default::default(),
         routes: Routes::new(activity.clone()),
         activity,
         projects: Mutex::new(BTreeMap::new()),

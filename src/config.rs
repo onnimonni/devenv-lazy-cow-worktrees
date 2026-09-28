@@ -421,6 +421,13 @@ pub struct Service {
     /// the migrations ran, for servers without a code reloader.
     #[serde(default)]
     pub restart_on_pull: bool,
+    /// Files (relative to `cwd`, `*` / `?` in the file name) whose content changing
+    /// restarts it if running, after the setup command when a dependency manifest or
+    /// lockfile changed (`mix.lock`, `Gemfile.lock`, `package.json`, …) [default: for a command running
+    /// `mix`, `mix.exs`, `mix.lock` and `config/*.exs`, which Phoenix's code reloader
+    /// refuses to compile after; `[]` for others and to turn it off].
+    #[serde(default)]
+    pub restart_on_change: Option<Vec<String>>,
     /// Further ports it listens on (e.g. a debugger), by name, from the same 10-port
     /// block, exported to every environment of the checkout.
     #[serde(default)]
