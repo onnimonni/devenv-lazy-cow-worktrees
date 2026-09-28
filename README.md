@@ -166,7 +166,8 @@ so one session gets answers from the worktree each file belongs to.
 | `localforest.services.<name>` | none | see below |
 | `localforest.server` | none | shorthand for `localforest.services.web.exec` |
 | `localforest.previewTtlHours` | `48` | close previews after this many hours without activity; `0` keeps them |
-| `localforest.httpsPort` | `443` | HTTPS proxy port |
+| `localforest.httpsPort` | `null` | HTTPS proxy port; unset: 443 where unprivileged processes may bind it, else 8443 |
+| `localforest.httpPort` | `null` | HTTP port redirecting to HTTPS, 0 disables; unset: 80 where unprivileged processes may bind it, else off |
 | `localforest.lsp.<name>` | none | adds `localforest-lsp-<name>` for Claude Code's `lspServers` |
 | `localforest.postgres.package` | `pkgs.postgresql_18` | PostgreSQL build (18+ for copy-on-write databases) |
 | `localforest.postgres.extensions` | none | as in devenv: `extensions: [ extensions.postgis extensions.pgvector ]`; enable with `CREATE EXTENSION` |
