@@ -94,6 +94,29 @@ impl MigrateFailure {
     }
 }
 
+/// Marker of a checkout's succeeded setup, in its git admin dir (a worktree's goes
+/// away with it).
+fn setup_marker(path: &Path) -> Result<PathBuf> {
+    Ok(Repository::open(path)?.path().join(worktree::SETUP_MARKER))
+}
+
+#[derive(Debug, PartialEq)]
+enum SetupStep {
+    Done,
+    Run,
+    BackingOff,
+}
+
+/// Whether the primary's setup runs now: when pending, unless its last failure
+/// (a failed setup, since its marker is missing) is still backing off and not `force`.
+fn primary_setup_step(pending: bool, failure: Option<&MigrateFailure>, force: bool) -> SetupStep {
+    match failure {
+        _ if !pending => SetupStep::Done,
+        Some(f) if !force && f.backing_off() => SetupStep::BackingOff,
+        _ => SetupStep::Run,
+    }
+}
+
 struct ProjectRt {
     project: Project,
     base: String,
@@ -176,6 +199,11 @@ impl ProjectRt {
         }
     }
 
+    /// A setup command is configured and hasn't succeeded in `c` yet.
+    fn setup_pending(&self, c: &Checkout) -> bool {
+        self.project.settings.setup.is_some() && setup_marker(&c.path).is_ok_and(|m| !m.exists())
+    }
+
     fn trigger(&self, flag: &AtomicBool) {
         flag.store(true, Ordering::SeqCst);
         self.wake.notify_one();
@@ -236,7 +264,7 @@ pub struct CheckoutStatus {
     /// Its redis-server is running.
     pub redis: bool,
     pub branch: Option<String>,
-    /// Its last migration failed (retried with a backoff).
+    /// Its last migration (or the primary's setup) failed (retried with a backoff).
     #[serde(default)]
     pub migrate_error: Option<String>,
 }
@@ -623,31 +651,40 @@ impl Daemon {
     }
 
     /// Run the setup command once in a new worktree, after `provision` (its role and
-    /// `.env` exist, so setup may use the database).
-    async fn run_setup(&self, rt: &ProjectRt, info: &worktree::Info, c: &Checkout) {
+    /// `.env` exist, so setup may use the database). A failure is only logged.
+    async fn run_setup(&self, rt: &ProjectRt, c: &Checkout) {
+        if let Err(e) = self.setup_once(rt, c).await {
+            warn!("{e:#}");
+        }
+    }
+
+    /// The setup command in `c` unless its marker says it already succeeded there.
+    async fn setup_once(&self, rt: &ProjectRt, c: &Checkout) -> Result<()> {
         let Some(cmd) = rt.project.settings.setup.clone() else {
-            return;
+            return Ok(());
         };
-        // Marked in the worktree's git admin dir, which goes away with it.
-        let Some(marker) = Repository::open(&info.path)
-            .ok()
-            .map(|r| r.path().join("localforest-setup"))
-        else {
-            return;
-        };
+        let marker = setup_marker(&c.path)?;
         if marker.exists() {
-            return;
+            return Ok(());
         }
         let id = c.run_id("setup");
-        match self
-            .run_command(rt, &id, &cmd, &c.path, c.env(&self.global))
+        self.run_command(rt, &id, &cmd, &c.path, c.env(&self.global))
             .await
-        {
-            Ok(()) => {
-                let _ = std::fs::write(&marker, history::now().to_string());
-            }
-            Err(e) => warn!("{e:#}"),
+            .context("setup failed")?;
+        if let Err(e) = std::fs::write(&marker, history::now().to_string()) {
+            warn!("{}: {}: {e}", c.id(), marker.display());
         }
+        Ok(())
+    }
+
+    /// Setup in the primary checkout, which may predate localforest or its `deps/`
+    /// (a fresh clone): run before its first migrate, seed or service start. Needs
+    /// its migrate lock. A failure is recorded like a failed migration (status, 502
+    /// page) and retried after the same backoff.
+    async fn setup_primary(&self, rt: &ProjectRt, c: &Checkout) -> Result<()> {
+        let result = self.setup_once(rt, c).await;
+        rt.migrated(c, result.as_ref().err().map(|e| format!("{e:#}")));
+        result
     }
 
     /// Create a worktree's dev database if missing: a copy-on-write clone of the
@@ -949,8 +986,8 @@ impl Daemon {
                     );
                     rt.known.lock().unwrap().insert(name.clone(), c.clone());
                     rt.trigger(&rt.pending.migrate_worktrees);
-                    if fresh && let Some(info) = info {
-                        self.run_setup(rt, info, c).await;
+                    if fresh && info.is_some() {
+                        self.run_setup(rt, c).await;
                     }
                 }
                 Err(e) => warn!("provisioning {name}: {e:#}"),
@@ -1072,7 +1109,7 @@ impl Daemon {
         self.carry_caches(rt, &info, &c).await;
         self.provision(&c).await?;
         rt.known.lock().unwrap().insert(name.to_string(), c.clone());
-        self.run_setup(rt, &info, &c).await;
+        self.run_setup(rt, &c).await;
         if let Err(e) = history::History::update(&rt.project.root, |h| {
             h.removed.remove(name);
         }) {
@@ -1571,13 +1608,25 @@ impl Daemon {
     /// feature-branch migrations included, until the primary is back on an
     /// up-to-date base branch and the template is made.
     ///
+    /// Setup runs first (once, `setup_primary`); while its failure backs off, nothing
+    /// runs unless `force`.
+    ///
     /// Holds the primary's migrate lock (its services wait on it), not `rt.lock`.
-    async fn migrate(&self, rt: &ProjectRt) -> Result<()> {
+    async fn migrate(&self, rt: &ProjectRt, force: bool) -> Result<()> {
         let primary = rt.primary();
         let lock = rt.migrate_lock(&primary);
         let result = {
             let _g = lock.lock().await;
             let _hold = self.servers.hold(&primary.path);
+            match primary_setup_step(
+                rt.setup_pending(&primary),
+                rt.migrate_failure(&primary).as_ref(),
+                force,
+            ) {
+                SetupStep::BackingOff => return Ok(()),
+                SetupStep::Run => self.setup_primary(rt, &primary).await?,
+                SetupStep::Done => {}
+            }
             self.migrate_primary(rt, &primary).await
         };
         match &result {
@@ -1828,7 +1877,20 @@ impl Daemon {
                 .await
                 .context("migrations failed; not starting its services")?;
         } else {
-            drop(rt.migrate_lock(c).lock().await);
+            let lock = rt.migrate_lock(c);
+            let _g = lock.lock().await;
+            let failure = rt.migrate_failure(c);
+            match primary_setup_step(rt.setup_pending(c), failure.as_ref(), false) {
+                SetupStep::BackingOff => {
+                    let error = failure.map(|f| f.error).unwrap_or_default();
+                    anyhow::bail!("{error} (retried later); not starting its services");
+                }
+                SetupStep::Run => self
+                    .setup_primary(rt, c)
+                    .await
+                    .context("not starting its services")?,
+                SetupStep::Done => {}
+            }
         }
         match port {
             Some(port) => {
@@ -1965,7 +2027,7 @@ async fn worker(d: Arc<Daemon>, rt: Arc<ProjectRt>) {
             rt.pending.migrate.store(true, Ordering::SeqCst);
         }
         if take(&rt.pending.migrate)
-            && let Err(e) = d.migrate(&rt).await
+            && let Err(e) = d.migrate(&rt, false).await
         {
             error!("{}: migrate: {e:#}", rt.project.name);
         }
@@ -1989,6 +2051,13 @@ async fn ticker(rt: Arc<ProjectRt>) {
         // Retries failed migrations once their backoff is over.
         if !rt.migrate_failures.lock().unwrap().is_empty() {
             rt.trigger(&rt.pending.migrate_worktrees);
+        }
+        // And the primary's (setup included).
+        if rt
+            .migrate_failure(&rt.primary())
+            .is_some_and(|f| !f.backing_off())
+        {
+            rt.trigger(&rt.pending.migrate);
         }
         // Retries checkouts whose provisioning failed.
         rt.trigger(&rt.pending.reconcile);
@@ -2149,7 +2218,7 @@ fn api(d: Arc<Daemon>) -> Router {
                 let rt = d.project(&r.root)?;
                 d.remove_merged(&rt).await?;
                 d.sync(&rt).await?;
-                d.migrate(&rt).await?;
+                d.migrate(&rt, true).await?;
                 ApiResult::Ok(Json(serde_json::json!({})))
             }),
         )
@@ -2718,6 +2787,31 @@ mod tests {
         // Capped at 32 minutes.
         assert!(failed(50, Duration::from_secs(31 * 60)).backing_off());
         assert!(!failed(50, Duration::from_secs(33 * 60)).backing_off());
+    }
+
+    #[test]
+    fn primary_setup_runs_until_it_succeeds_with_backoff() {
+        use SetupStep::*;
+        // Marker present or no setup command: nothing to do, whatever failed.
+        assert_eq!(primary_setup_step(false, None, false), Done);
+        let recent = failed(1, Duration::from_secs(10));
+        assert_eq!(primary_setup_step(false, Some(&recent), false), Done);
+        // Pending: runs, unless its last failure still backs off (forced anyway).
+        assert_eq!(primary_setup_step(true, None, false), Run);
+        assert_eq!(primary_setup_step(true, Some(&recent), false), BackingOff);
+        assert_eq!(primary_setup_step(true, Some(&recent), true), Run);
+        let old = failed(1, Duration::from_secs(61));
+        assert_eq!(primary_setup_step(true, Some(&old), false), Run);
+    }
+
+    #[test]
+    fn setup_marker_in_git_admin_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let marker = setup_marker(dir.path()).unwrap();
+        assert_eq!(marker, repo.path().join("localforest-setup"));
+        assert!(marker.parent().unwrap().ends_with(".git"));
+        assert!(setup_marker(&dir.path().join("missing")).is_err());
     }
 
     #[test]

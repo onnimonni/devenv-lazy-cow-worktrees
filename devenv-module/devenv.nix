@@ -26,7 +26,8 @@
 # checkout's DATABASE_URL and REDIS_URL. `localforest env [--service x]` gives every
 # shell the same environment. Claude Code's WorktreeCreate/WorktreeRemove
 # hooks go through the daemon, so `claude --worktree` and `isolation: worktree`
-# subagents get provisioned worktrees too.
+# subagents get provisioned worktrees too, and its NODE_EXTRA_CA_CERTS trusts the
+# local CA (MCP servers on https://*.localhost).
 {
   pkgs,
   lib,
@@ -37,6 +38,24 @@
 let
   cfg = config.localforest;
   exe = lib.getExe cfg.package;
+  # localforest's own nixpkgs (flake.lock), so the default package is the exact
+  # derivation CI pushes to localforest.cachix.org, whatever nixpkgs the consumer uses.
+  lock = builtins.fromJSON (builtins.readFile ../flake.lock);
+  nixpkgsLock = lock.nodes.${lock.nodes.${lock.root}.inputs.nixpkgs}.locked;
+  pinnedPkgs =
+    import
+      (builtins.fetchTarball {
+        url = "https://github.com/${nixpkgsLock.owner}/${nixpkgsLock.repo}/archive/${nixpkgsLock.rev}.tar.gz";
+        sha256 = nixpkgsLock.narHash;
+      })
+      {
+        system = pkgs.stdenv.hostPlatform.system;
+        config = { };
+        overlays = [ ];
+      };
+  # devenv evaluates impurely, so the invoking user's environment is readable.
+  envHome = builtins.getEnv "LOCALFOREST_HOME";
+  userHome = builtins.getEnv "HOME";
   inherit (lib) mkOption types;
   # With its extensions, like devenv's services.postgres.
   postgres =
@@ -155,8 +174,15 @@ in
     };
     package = mkOption {
       type = types.package;
-      default = pkgs.callPackage ../package.nix { };
-      description = "The localforest package.";
+      default = pinnedPkgs.callPackage ../package.nix { };
+      defaultText = lib.literalMD "built with localforest's pinned nixpkgs (flake.lock), substituted from localforest.cachix.org";
+      example = lib.literalExpression "pkgs.callPackage (inputs.localforest + \"/package.nix\") { }";
+      description = "The localforest package. The default is the one localforest's CI builds and pushes to localforest.cachix.org; a package built with other nixpkgs is compiled locally.";
+    };
+    cachix.enable = mkOption {
+      type = types.bool;
+      default = true;
+      description = "Pull the default package from localforest.cachix.org (`cachix.pull`). A multi-user Nix only uses it for trusted users, or when it's in the daemon's own substituters.";
     };
     # Daemon-wide, like the ports: the project whose `devenv up` starts the daemon
     # decides; the others share its PostgreSQL.
@@ -264,6 +290,25 @@ in
       example = 0;
       description = "Plain HTTP port that redirects to HTTPS; 0 disables (default: 80 where unprivileged processes may bind it, else off).";
     };
+    home = mkOption {
+      type = types.nullOr types.str;
+      default =
+        config.env.LOCALFOREST_HOME or (
+          if envHome != "" then
+            envHome
+          else if userHome != "" then
+            "${userHome}/.local/state/localforest"
+          else
+            null
+        );
+      defaultText = lib.literalExpression ''env.LOCALFOREST_HOME, else $LOCALFOREST_HOME, else "$HOME/.local/state/localforest"'';
+      description = "The daemon's state directory (absolute), where its CA lives (`<home>/ca/ca.pem`); only read here, set LOCALFOREST_HOME to move it.";
+    };
+    claude.trustCa = mkOption {
+      type = types.bool;
+      default = true;
+      description = "Set NODE_EXTRA_CA_CERTS to the local CA in `.claude/settings.local.json`, so Claude Code reaches MCP servers on https://*.localhost. Node reads one file only: to trust other CAs too, set `files.\".claude/settings.local.json\".json.env.NODE_EXTRA_CA_CERTS` to a bundle yourself.";
+    };
     lsp = mkOption {
       type = types.attrsOf (types.listOf types.str);
       default = { };
@@ -279,6 +324,8 @@ in
 
   config = lib.mkIf cfg.enable {
     localforest.services = lib.mkIf (cfg.server != null) { web.exec = lib.mkDefault cfg.server; };
+
+    cachix.pull = lib.mkIf cfg.cachix.enable [ "localforest" ];
 
     packages = [
       cfg.package
@@ -314,6 +361,11 @@ in
     enterShell = ''
       eval "$(${exe} env)"
     '';
+
+    # Node (Claude Code) ignores the keychain `localforest trust` writes to.
+    files.".claude/settings.local.json".json.env = lib.mkIf (cfg.claude.trustCa && cfg.home != null) {
+      NODE_EXTRA_CA_CERTS = lib.mkDefault "${cfg.home}/ca/ca.pem";
+    };
 
     files.".claude/settings.local.json".json.hooks = {
       WorktreeCreate = [

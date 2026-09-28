@@ -240,7 +240,7 @@ fn print_status(s: &daemon::Status) {
                 if c.redis { " redis" } else { "" },
             );
             if let Some(e) = &c.migrate_error {
-                println!("    migrations failed: {e}");
+                println!("    {e}");
             }
             for s in &c.services {
                 println!(

@@ -28,13 +28,15 @@ work=$(mktemp -d)
 export LOCALFOREST_HOME=$home LOCALFOREST_PROJECT=demo LOCALFOREST_PORT=4100
 export LOCALFOREST_PG_PORT=55499 LOCALFOREST_REDIS_PORT=6399
 export LOCALFOREST_HTTPS_PORT=8443 LOCALFOREST_HTTP_PORT=0 LOCALFOREST_RAMDISK_MB=512
-# Fails in the worktree named "broken".
+# Fails in the worktree named "broken", and in any checkout (the primary included)
+# where setup has not run yet: like `mix ecto.migrate` before `mix deps.get`.
 cat >"$home/migrate.sh" <<'EOF'
 [[ ${LOCALFOREST_WORKTREE:-} == broken ]] && { echo "migration broke" >&2; exit 1; }
+grep -qx "${LOCALFOREST_WORKTREE:-primary}" "$(dirname "$0")/setup.log" || { echo "setup did not run" >&2; exit 1; }
 exec psql -v ON_ERROR_STOP=1 -c 'CREATE TABLE IF NOT EXISTS seeds(x int); INSERT INTO seeds VALUES (1)'
 EOF
 export LOCALFOREST_MIGRATE="bash $home/migrate.sh"
-export LOCALFOREST_SETUP="sh -c 'echo \"\$LOCALFOREST_WORKTREE\" >> $home/setup.log'"
+export LOCALFOREST_SETUP="sh -c 'echo \"\${LOCALFOREST_WORKTREE:-primary}\" >> $home/setup.log'"
 # Also serves on its named secondary port, like Phoenix's LiveDebugger; never binds `idle`.
 web="sh -c '$python -m http.server \"\$DEBUGGER_PORT\" --bind 127.0.0.1 & exec $python -m http.server \"\$PORT\" --bind 127.0.0.1'"
 # A Mix server: restarted when mix.lock changes. Logs each start.
@@ -100,7 +102,9 @@ template_seeded() {
   [[ $(PGUSER=postgres psql -h "$home/pg" -p 55500 -d demo_template -tAc "select count(*) from seeds") == 1 ]]
 }
 eventually 60 template_seeded || fail "template not seeded by the migrate command"
-pass "primary migrated, template refreshed"
+[[ -f $(git rev-parse --absolute-git-dir)/localforest-setup ]] || fail "primary's setup not marked done"
+[[ $(grep -cx primary "$home/setup.log") == 1 ]] || fail "setup did not run once in the primary"
+pass "fresh primary: setup ran before migrate; migrated, template refreshed"
 
 wt=$("$bin" worktree new feat-a 2>/dev/null)
 [[ -f $wt/index.html ]] || fail "worktree not created"
@@ -179,6 +183,11 @@ git worktree add -q -b manual .claude/worktrees/manual
 eventually 30 test -f .claude/worktrees/manual/.env || fail "plain git worktree not provisioned"
 eventually 30 grep -q manual "$home/setup.log" || fail "setup did not run"
 pass "plain git worktree add provisioned, setup ran"
+eventually 30 test -f "$(git -C .claude/worktrees/manual rev-parse --absolute-git-dir)/localforest-setup" ||
+  fail "setup not marked done"
+out=$("$bin" worktree rm --force manual 2>&1) || fail "rm of a fresh worktree failed: $out"
+[[ $out != *"deleting gitignored"* ]] || fail "fresh worktree's removal warned: $out"
+pass "fresh worktree removed without a gitignored-files warning"
 
 port=$(cd "$wt" && "$bin" env --json | jq -r .PORT)
 "$bin" worktree rm --force feat-a
