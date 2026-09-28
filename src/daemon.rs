@@ -775,26 +775,31 @@ impl Daemon {
 
     /// Hand the checkout's role the databases it owns by name (`config::db_owner`) but
     /// another, unregistered role made: e.g. its role under an earlier naming scheme,
-    /// with everything in them. Then `adopt_dev_db`.
+    /// with everything in them. Then `adopt_dev_db`, if its dev database exists.
     async fn adopt_databases(&self, c: &Checkout) -> Result<()> {
         let others = self.all_checkouts();
-        for db in self.pg.databases().await? {
-            if !c.owns_db(&db)
-                || !config::db_owner(&db, others.iter().chain([c])).is_some_and(|o| o.same(c))
+        let dbs = self.pg.databases().await?;
+        for db in &dbs {
+            if !c.owns_db(db)
+                || !config::db_owner(db, others.iter().chain([c])).is_some_and(|o| o.same(c))
             {
                 continue;
             }
-            let Some(old) = self.pg.owner(&db).await? else {
+            let Some(old) = self.pg.owner(db).await? else {
                 continue;
             };
             if old == c.id() || old == "postgres" || others.iter().any(|o| o.id() == old) {
                 continue;
             }
-            self.pg.set_owner(&db, &c.id()).await?;
-            self.pg.adopt(&db, &old, &c.id()).await?;
+            self.pg.set_owner(db, &c.id()).await?;
+            self.pg.adopt(db, &old, &c.id()).await?;
             info!("{db}: handed from {old} to {}", c.id());
         }
-        self.adopt_dev_db(c).await
+        // A new worktree has no dev database yet: `ensure_dev_db` adopts it once cloned.
+        if dbs.contains(&c.dev_db()) {
+            self.adopt_dev_db(c).await?;
+        }
+        Ok(())
     }
 
     /// PostgreSQL proxy, before the connection is handed to the server (which checks
