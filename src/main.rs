@@ -183,7 +183,8 @@ async fn create(root: PathBuf, name: String, base: Option<String>) -> Result<dae
 }
 
 async fn remove(root: PathBuf, name: String, force: bool) -> Result<()> {
-    let keep = vec![std::process::id() as i32, unsafe { libc::getppid() }];
+    // The daemon spares these and their ancestors: the shell, the Claude Code session.
+    let keep = worktree::ancestors();
     let r: Value = client::post(
         "/worktrees/remove",
         &daemon::RemoveReq {

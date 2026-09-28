@@ -922,26 +922,35 @@ fn processes() -> Vec<(i32, i32, Vec<u8>, Vec<u8>)> {
 
 /// Processes running in `dir` (cwd or executable inside it: the BEAM, esbuild,
 /// tailwind, node, ...) and all their descendants, except `keep`, this process and
-/// its ancestors.
+/// their ancestors.
 fn processes_in(dir: &Path, keep: &[i32]) -> Vec<i32> {
     let dir = dir.as_os_str().as_bytes();
     let inside = |p: &[u8]| p.starts_with(dir) && (p.len() == dir.len() || p[dir.len()] == b'/');
-    let procs = processes();
-    let parent: HashMap<i32, i32> = procs.iter().map(|(p, pp, _, _)| (*p, *pp)).collect();
-    let mut spared: HashSet<i32> = keep.iter().copied().collect();
-    let mut me = std::process::id() as i32;
-    while me > 1 && spared.insert(me) {
-        me = parent.get(&me).copied().unwrap_or(0);
-    }
+    let procs: Vec<(i32, i32, bool)> = processes()
+        .into_iter()
+        .map(|(p, pp, cwd, exe)| (p, pp, inside(&cwd) || inside(&exe)))
+        .collect();
+    let mut roots = keep.to_vec();
+    roots.push(std::process::id() as i32);
+    sweep(&procs, &roots)
+}
+
+/// Of `procs` as (pid, parent pid, runs inside the dir): those inside and their
+/// descendants, except `keep` and their ancestors. The sweep doesn't go through a
+/// spared process: its other children (MCP servers, hook shells) are only hit when
+/// they themselves run inside.
+fn sweep(procs: &[(i32, i32, bool)], keep: &[i32]) -> Vec<i32> {
+    let parent: HashMap<i32, i32> = procs.iter().map(|(p, pp, _)| (*p, *pp)).collect();
+    let spared = with_ancestors(&parent, keep);
     let mut hit: HashSet<i32> = procs
         .iter()
-        .filter(|(_, _, cwd, exe)| inside(cwd) || inside(exe))
+        .filter(|(p, _, inside)| *inside && !spared.contains(p) && *p > 1)
         .map(|(p, ..)| *p)
         .collect();
     loop {
         let before = hit.len();
-        for (p, pp, ..) in &procs {
-            if hit.contains(pp) {
+        for (p, pp, _) in procs {
+            if hit.contains(pp) && !spared.contains(p) {
                 hit.insert(*p);
             }
         }
@@ -949,9 +958,31 @@ fn processes_in(dir: &Path, keep: &[i32]) -> Vec<i32> {
             break;
         }
     }
-    hit.into_iter()
-        .filter(|p| !spared.contains(p) && *p > 1)
-        .collect()
+    hit.into_iter().collect()
+}
+
+/// This process's ancestors, from the process table (sent along with removals so
+/// the daemon can spare them even when it can't see them all).
+pub fn ancestors() -> Vec<i32> {
+    let parent: HashMap<i32, i32> = processes().iter().map(|(p, pp, ..)| (*p, *pp)).collect();
+    let mut out: Vec<i32> = with_ancestors(&parent, &[std::process::id() as i32])
+        .into_iter()
+        .collect();
+    out.push(unsafe { libc::getppid() });
+    out
+}
+
+/// `pids` and every ancestor of each (a hook's shell runs under Claude Code, which
+/// may sit in the worktree being removed).
+fn with_ancestors(parent: &HashMap<i32, i32>, pids: &[i32]) -> HashSet<i32> {
+    let mut out = HashSet::new();
+    for &p in pids {
+        let mut p = p;
+        while p > 1 && out.insert(p) {
+            p = parent.get(&p).copied().unwrap_or(0);
+        }
+    }
+    out
 }
 
 /// SIGKILL everything running in `dir` (dev servers and their watchers): a dev server
@@ -1220,6 +1251,37 @@ mod tests {
         let mut files = ignored_files(&project.root, &path).unwrap();
         files.sort();
         assert_eq!(files, vec![".env", "cache/", "same.local", "secrets.local"]);
+    }
+
+    #[test]
+    fn spares_whole_ancestor_chains() {
+        // 1 <- 100 (claude) <- 200 (sh) <- 300 (localforest); 1 <- 400 <- 500
+        let parent = HashMap::from([(100, 1), (200, 100), (300, 200), (400, 1), (500, 400)]);
+        assert_eq!(
+            with_ancestors(&parent, &[300, 500]),
+            HashSet::from([100, 200, 300, 400, 500])
+        );
+        // Unknown pids are kept themselves.
+        assert_eq!(with_ancestors(&parent, &[42]), HashSet::from([42]));
+    }
+
+    #[test]
+    fn sweep_does_not_go_through_spared_processes() {
+        // claude 100 (inside) <- sh 200 <- localforest 300; claude <- mcp 110 (outside)
+        // <- 111; claude <- server 120 (inside) <- watcher 121; other 400 (outside).
+        let procs = [
+            (100, 1, true),
+            (200, 100, false),
+            (300, 200, false),
+            (110, 100, false),
+            (111, 110, false),
+            (120, 100, true),
+            (121, 120, false),
+            (400, 1, false),
+        ];
+        let mut hit = sweep(&procs, &[300]);
+        hit.sort();
+        assert_eq!(hit, vec![120, 121]);
     }
 
     #[test]
