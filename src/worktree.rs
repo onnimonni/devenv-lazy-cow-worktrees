@@ -66,9 +66,17 @@ pub fn list(root: &Path) -> Result<Vec<Info>> {
 /// The worktree's base port, recorded in its git admin dir (gone with it).
 const PORT_FILE: &str = "localforest-port";
 
-fn recorded_port(path: &Path) -> Option<u16> {
-    let admin = Repository::open(path).ok()?.path().to_path_buf();
-    let p: u16 = std::fs::read_to_string(admin.join(PORT_FILE))
+/// Admin dir of the worktree at `path`, from its `.git` file (`gitdir: <dir>`),
+/// without opening the repository.
+fn admin_dir(path: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(path.join(".git")).ok()?;
+    let dir = Path::new(text.strip_prefix("gitdir:")?.trim());
+    Some(path.join(dir))
+}
+
+/// The base port recorded in the worktree's git admin dir.
+pub fn recorded_port(path: &Path) -> Option<u16> {
+    let p: u16 = std::fs::read_to_string(admin_dir(path)?.join(PORT_FILE))
         .ok()?
         .trim()
         .parse()
@@ -76,55 +84,74 @@ fn recorded_port(path: &Path) -> Option<u16> {
     (config::WORKTREE_PORTS.contains(&p) && p.is_multiple_of(10)).then_some(p)
 }
 
-/// Base port of worktree `name` at `path`: the one recorded in its git admin dir,
-/// else chosen now and recorded, so it never moves while the worktree lives. The
-/// choice is its hashed slot (`config::worktree_port`) unless another worktree of the
-/// repository or `taken` (the daemon passes other projects' ports) has it, then the
-/// next free slot. Whoever looks first (daemon or `localforest env`) records it.
-pub fn port(project: &Project, path: &Path, name: &str, taken: &HashSet<u16>) -> Result<u16> {
-    use std::io::Write;
-    if let Some(p) = recorded_port(path) {
-        return Ok(p);
-    }
-    let admin = Repository::open(path)?.path().to_path_buf();
-    let me = path.canonicalize()?;
-    // Unrecorded siblings (older localforest) count at their hashed slot.
-    let mut used = taken.clone();
-    for i in list(&project.root)? {
-        if i.path != me {
-            used.insert(
-                recorded_port(&i.path)
-                    .unwrap_or_else(|| config::worktree_port(&project.name, &i.name)),
-            );
-        }
-    }
-    let first = config::worktree_port(&project.name, name);
+/// First free slot from `name`'s hashed one on (linear probing, wrapping).
+fn probe(project: &str, name: &str, used: &HashSet<u16>) -> u16 {
+    let first = config::worktree_port(project, name);
     let slots = config::WORKTREE_PORTS.len() as u16 / 10;
-    let port = (0..slots)
+    (0..slots)
         .map(|k| {
             let slot = ((first - config::WORKTREE_PORTS.start) / 10 + k) % slots;
             config::WORKTREE_PORTS.start + slot * 10
         })
         .find(|p| !used.contains(p))
-        .unwrap_or(first);
-    if port != first {
-        warn!("worktree {name}: port {first} is taken, using {port}");
-    }
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(admin.join(PORT_FILE))
-    {
-        Ok(mut f) => f.write_all(format!("{port}\n").as_bytes())?,
-        // Someone else recorded one meanwhile: theirs holds.
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            if let Some(p) = recorded_port(path) {
-                return Ok(p);
+        .unwrap_or(first)
+}
+
+/// Base port of every worktree of `projects` (all registered ones: the daemon's, or
+/// `state.json` for `localforest env`), by path. Recorded ports hold; the others
+/// get, in order of (project root, name), the first slot from their hashed one that
+/// no primary, recorded or earlier worktree has. Pure: the daemon and `localforest
+/// env` get the same answer from the same projects and admin dirs.
+pub fn plan_ports(projects: &[Project]) -> Result<Vec<(PathBuf, u16, bool)>> {
+    let mut used: HashSet<u16> = projects.iter().map(|p| p.settings.port).collect();
+    let mut recorded = Vec::new();
+    let mut open = Vec::new();
+    let mut projects: Vec<&Project> = projects.iter().collect();
+    projects.sort_by(|a, b| a.root.cmp(&b.root));
+    for p in projects {
+        let mut infos = list(&p.root)?;
+        infos.sort_by(|a, b| a.name.cmp(&b.name));
+        for i in infos {
+            match recorded_port(&i.path) {
+                Some(port) => {
+                    if !used.insert(port) {
+                        warn!(
+                            "worktree {} shares port {port} with another",
+                            i.path.display()
+                        );
+                    }
+                    recorded.push((i.path, port, true));
+                }
+                None => open.push((p.name.clone(), i)),
             }
         }
-        Err(e) => return Err(e.into()),
     }
-    Ok(port)
+    for (project, i) in open {
+        let port = probe(&project, &i.name, &used);
+        used.insert(port);
+        recorded.push((i.path, port, false));
+    }
+    Ok(recorded)
+}
+
+/// Serializes recording (the daemon's projects reconcile concurrently).
+static RECORDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// `plan_ports` and record the new ones, so they never move while their worktree
+/// lives (daemon only). Blocking: call from `spawn_blocking`.
+pub fn assign_ports(projects: &[Project]) -> Result<Vec<(PathBuf, u16)>> {
+    let _g = RECORDING.lock().unwrap_or_else(|e| e.into_inner());
+    let plan = plan_ports(projects)?;
+    for (path, port, recorded) in &plan {
+        if *recorded {
+            continue;
+        }
+        let Some(admin) = admin_dir(path) else {
+            continue;
+        };
+        std::fs::write(admin.join(PORT_FILE), format!("{port}\n"))?;
+    }
+    Ok(plan.into_iter().map(|(p, port, _)| (p, port)).collect())
 }
 
 /// `git worktree add --no-checkout` for an existing branch.
@@ -885,28 +912,58 @@ mod tests {
 
     #[test]
     fn ports_never_collide() {
+        let port_of = |plan: &[(PathBuf, u16, bool)], p: &Path| {
+            plan.iter()
+                .find(|(q, ..)| q == p)
+                .map(|(_, port, _)| *port)
+                .unwrap()
+        };
         let (_d, project, syncer) = fixture();
-        let none = HashSet::new();
         let a = create(&project, &syncer, "a", None).unwrap();
         let b = create(&project, &syncer, "b", None).unwrap();
-        let slot_b = config::worktree_port("app", "b");
-        // a already holds b's slot (a hash collision).
-        let admin = Repository::open(&a).unwrap().path().to_path_buf();
-        std::fs::write(admin.join(PORT_FILE), format!("{slot_b}\n")).unwrap();
-        assert_eq!(port(&project, &a, "a", &none).unwrap(), slot_b);
-        let pb = port(&project, &b, "b", &none).unwrap();
-        assert_ne!(pb, slot_b);
-        assert!(config::WORKTREE_PORTS.contains(&pb) && pb.is_multiple_of(10));
-        // Recorded: stable whatever else is taken later, and what `checkout` uses.
-        assert_eq!(port(&project, &b, "b", &HashSet::from([pb])).unwrap(), pb);
-        assert_eq!(project.checkout(Some("b"), b.clone()).port, pb);
+        // Uncontested: the hashed slot, recorded by assign_ports only.
+        let plan = plan_ports(std::slice::from_ref(&project)).unwrap();
+        assert_eq!(port_of(&plan, &b), config::worktree_port("app", "b"));
+        assert_eq!(recorded_port(&b), None);
+        assign_ports(std::slice::from_ref(&project)).unwrap();
+        assert_eq!(recorded_port(&b), Some(config::worktree_port("app", "b")));
 
-        // Ports of other projects (from the daemon) are skipped too.
-        let c = create(&project, &syncer, "c", None).unwrap();
+        // a holds c's slot (a hash collision): c moves on, and env's plan agrees.
         let slot_c = config::worktree_port("app", "c");
-        let pc = port(&project, &c, "c", &HashSet::from([slot_c])).unwrap();
+        std::fs::write(
+            admin_dir(&a).unwrap().join(PORT_FILE),
+            format!("{slot_c}\n"),
+        )
+        .unwrap();
+        let c = create(&project, &syncer, "c", None).unwrap();
+        let planned = port_of(&plan_ports(std::slice::from_ref(&project)).unwrap(), &c);
+        let assigned = assign_ports(std::slice::from_ref(&project)).unwrap();
+        let pc = assigned.iter().find(|(p, _)| *p == c).unwrap().1;
+        assert_eq!(pc, planned);
         assert_ne!(pc, slot_c);
-        assert!(![slot_b, pb].contains(&pc));
+        assert!(config::WORKTREE_PORTS.contains(&pc) && pc.is_multiple_of(10));
+        // Recorded: stable, and what `checkout` reads.
+        assert_eq!(project.checkout(Some("c"), c.clone()).port, pc);
+        assert_eq!(recorded_port(&c), Some(pc));
+
+        // Other projects' worktrees count too.
+        let (_d2, mut other, syncer2) = fixture();
+        other.name = "other".into();
+        let x = create(&other, &syncer2, "x", None).unwrap();
+        let slot_d = config::worktree_port("app", "d");
+        std::fs::write(
+            admin_dir(&x).unwrap().join(PORT_FILE),
+            format!("{slot_d}\n"),
+        )
+        .unwrap();
+        let d = create(&project, &syncer, "d", None).unwrap();
+        let both = [project.clone(), other.clone()];
+        let pd = port_of(&plan_ports(&both).unwrap(), &d);
+        assert_ne!(pd, slot_d);
+        assert_eq!(
+            port_of(&plan_ports(std::slice::from_ref(&project)).unwrap(), &d),
+            slot_d
+        );
     }
 
     #[test]

@@ -17,7 +17,7 @@
 //! with the running one, then takes over if that one goes away.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -141,6 +141,23 @@ fn load_saved() -> Saved {
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default()
+}
+
+/// Projects the daemon registered (its saved state), for tools that run without it.
+pub fn registered_projects() -> Vec<Project> {
+    load_saved().projects
+}
+
+/// Checkout of worktree `i` on its port from `worktree::assign_ports` / `plan_ports`.
+pub fn checkout_with(
+    project: &Project,
+    i: &worktree::Info,
+    ports: &HashMap<PathBuf, u16>,
+) -> Checkout {
+    match ports.get(&i.path) {
+        Some(&port) => project.checkout_on(Some(&i.name), i.path.clone(), port),
+        None => project.checkout(Some(&i.name), i.path.clone()),
+    }
 }
 
 // ---------- status types shared with the CLI
@@ -538,28 +555,12 @@ impl Daemon {
         if !initializing.is_empty() {
             rt.trigger(&rt.pending.reconcile);
         }
-        let taken = self.other_projects_ports(rt);
+        let ports = self.assign_ports().await?;
         let current: BTreeMap<String, Checkout> = infos
             .iter()
-            .map(|i| {
-                (
-                    i.name.clone(),
-                    rt.project
-                        .checkout_avoiding(Some(&i.name), i.path.clone(), &taken),
-                )
-            })
+            .map(|i| (i.name.clone(), checkout_with(&rt.project, i, &ports)))
             .collect();
         let known = rt.known.lock().unwrap().clone();
-        for (name, c) in &current {
-            if !known.contains_key(name) && taken.contains(&c.port) {
-                warn!(
-                    "worktree {name}: port {} is also another project's; one of them serves \
-                     the other's requests (recorded in {name}'s git admin dir as \
-                     localforest-port; delete it and restart localforest to pick another)",
-                    c.port
-                );
-            }
-        }
         for (name, c) in &current {
             if !known.contains_key(name) && !initializing.contains(name) {
                 if let Some(info) = infos.iter().find(|i| &i.name == name) {
@@ -663,15 +664,13 @@ impl Daemon {
             worktree::create(&project, &syncer, &n, base.as_deref())
         })
         .await??;
-        let taken = self.other_projects_ports(rt);
-        let c = rt
-            .project
-            .checkout_avoiding(Some(name), path.clone(), &taken);
         let info = worktree::Info {
             name: name.to_string(),
             path: path.clone(),
             branch: Some(name.to_string()),
         };
+        let ports = self.assign_ports().await?;
+        let c = checkout_with(&rt.project, &info, &ports);
         self.prepare_new(rt, &info, &c).await;
         self.provision(&c).await?;
         rt.known.lock().unwrap().insert(name.to_string(), c.clone());
@@ -1125,14 +1124,19 @@ impl Daemon {
         }
     }
 
-    /// Base ports of every checkout of the other registered projects, which a new
-    /// worktree of `rt` must not take.
-    fn other_projects_ports(&self, rt: &ProjectRt) -> HashSet<u16> {
-        self.checkouts()
-            .into_iter()
-            .filter(|(o, _)| o.project.root != rt.project.root)
-            .map(|(_, c)| c.port)
-            .collect()
+    /// Record the ports of new worktrees of every registered project
+    /// (`worktree::assign_ports`); every worktree's port by path.
+    async fn assign_ports(&self) -> Result<HashMap<PathBuf, u16>> {
+        let projects: Vec<Project> = self
+            .projects
+            .lock()
+            .unwrap()
+            .values()
+            .map(|rt| rt.project.clone())
+            .collect();
+        let ports =
+            tokio::task::spawn_blocking(move || worktree::assign_ports(&projects)).await??;
+        Ok(ports.into_iter().collect())
     }
 
     /// Every checkout (primary and worktrees) of every project.

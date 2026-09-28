@@ -298,25 +298,20 @@ impl Project {
         self.root.join(&self.settings.worktrees_dir)
     }
 
+    /// A worktree's port is the one recorded in its git admin dir (the daemon records
+    /// them, `worktree::assign_ports`), else its hashed slot. Reads only: `localforest
+    /// env` computes an unrecorded one with `worktree::plan_ports` first.
     pub fn checkout(&self, worktree: Option<&str>, path: PathBuf) -> Checkout {
-        self.checkout_avoiding(worktree, path, &Default::default())
-    }
-
-    /// `checkout`, a new worktree's port also avoiding `taken` (see `worktree::port`).
-    pub fn checkout_avoiding(
-        &self,
-        worktree: Option<&str>,
-        path: PathBuf,
-        taken: &std::collections::HashSet<u16>,
-    ) -> Checkout {
         let port = match worktree {
             None => self.settings.port,
-            Some(w) if path.as_os_str().is_empty() => worktree_port(&self.name, w),
-            Some(w) => crate::worktree::port(self, &path, w, taken).unwrap_or_else(|e| {
-                tracing::warn!("worktree {w}: port: {e:#}");
-                worktree_port(&self.name, w)
-            }),
+            Some(w) => crate::worktree::recorded_port(&path)
+                .unwrap_or_else(|| worktree_port(&self.name, w)),
         };
+        self.checkout_on(worktree, path, port)
+    }
+
+    /// `checkout` with a given base port.
+    pub fn checkout_on(&self, worktree: Option<&str>, path: PathBuf, port: u16) -> Checkout {
         Checkout {
             project: self.name.clone(),
             db_prefix: self.db_prefix(),

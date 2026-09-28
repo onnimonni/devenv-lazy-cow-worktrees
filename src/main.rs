@@ -261,7 +261,22 @@ async fn main() -> Result<()> {
         } => {
             let (root, wt, co_path) = config::locate(&path)?;
             let p = Project::new(root, project);
-            let c = p.checkout(wt.as_deref(), co_path);
+            // The port the daemon records (or will): same plan over the same projects.
+            let port = if wt.is_some() && worktree::recorded_port(&co_path).is_none() {
+                let mut all = daemon::registered_projects();
+                all.retain(|o| o.root != p.root);
+                all.push(p.clone());
+                worktree::plan_ports(&all)
+                    .ok()
+                    .and_then(|plan| plan.into_iter().find(|(path, ..)| *path == co_path))
+                    .map(|(_, port, _)| port)
+            } else {
+                None
+            };
+            let c = match port {
+                Some(port) => p.checkout_on(wt.as_deref(), co_path, port),
+                None => p.checkout(wt.as_deref(), co_path),
+            };
             let env = match service.as_deref() {
                 Some(s) if c.service(s).is_none() => anyhow::bail!("no service {s}"),
                 Some(s) => c.service_env(&cli.global, Some(s)),
