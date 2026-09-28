@@ -26,6 +26,7 @@ git2 = { version = "0.21.0", features = ["https", "ssh", "vendored-libgit2"] }
 hex = "0.4.3"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["full"] }
+ignore = "0.4.33"
 hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1", "server", "server-auto"] }
 keyring = { version = "3", features = ["apple-native"] }
 libc = "0.2.189"

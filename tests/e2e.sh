@@ -169,6 +169,11 @@ git worktree add -q -b manual .claude/worktrees/manual
 eventually 30 test -f .claude/worktrees/manual/.env || fail "plain git worktree not provisioned"
 eventually 30 grep -q manual "$home/setup.log" || fail "setup did not run"
 pass "plain git worktree add provisioned, setup ran"
+eventually 30 test -f "$(git -C .claude/worktrees/manual rev-parse --absolute-git-dir)/localforest-setup" ||
+  fail "setup not marked done"
+out=$("$bin" worktree rm --force manual 2>&1) || fail "rm of a fresh worktree failed: $out"
+[[ $out != *"deleting gitignored"* ]] || fail "fresh worktree's removal warned: $out"
+pass "fresh worktree removed without a gitignored-files warning"
 
 port=$(cd "$wt" && "$bin" env --json | jq -r .PORT)
 "$bin" worktree rm --force feat-a

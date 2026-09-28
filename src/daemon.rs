@@ -631,7 +631,7 @@ impl Daemon {
         // Marked in the worktree's git admin dir, which goes away with it.
         let Some(marker) = Repository::open(&info.path)
             .ok()
-            .map(|r| r.path().join("localforest-setup"))
+            .map(|r| r.path().join(worktree::SETUP_MARKER))
         else {
             return;
         };
