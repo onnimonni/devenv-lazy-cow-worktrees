@@ -789,7 +789,10 @@ impl Daemon {
         let target = Path::new(&req.name);
         let info = infos
             .iter()
-            .find(|i| i.name == req.name || target.canonicalize().is_ok_and(|p| p == i.path))
+            .find(|i| {
+                i.name == req.name
+                    || (target.is_absolute() && target.canonicalize().is_ok_and(|p| p == i.path))
+            })
             .cloned()
             .ok_or_else(|| anyhow!("no worktree {}", req.name))?;
         if info.branch.as_deref() == Some(rt.base.as_str()) {
@@ -868,10 +871,11 @@ impl Daemon {
         self.servers.stop_checkout(&c).await;
         // Whatever else runs there: a server started by hand, iex, watchers.
         worktree::kill_processes_in(&info.path, keep).await;
-        self.deprovision(&c).await?;
-        rt.known.lock().unwrap().remove(&info.name);
+        // Files first: if they can't move, the databases stay with them.
         let (root, i) = (rt.project.root.clone(), info.clone());
         tokio::task::spawn_blocking(move || worktree::remove_files(&root, &i)).await??;
+        self.deprovision(&c).await?;
+        rt.known.lock().unwrap().remove(&info.name);
         self.remember(rt, &info.name, info.branch.clone(), head, reason, pr);
         info!("removed worktree {}", info.name);
         Ok(())

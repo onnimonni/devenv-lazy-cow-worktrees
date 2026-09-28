@@ -182,6 +182,19 @@ async fn create(root: PathBuf, name: String, base: Option<String>) -> Result<dae
     client::post("/worktrees", &daemon::CreateReq { root, name, base }).await
 }
 
+/// A worktree name as is; a path (`.`, `../x`, `/abs`) made absolute here: the daemon
+/// has another cwd.
+fn rm_target(cwd: &Path, name: &str) -> Result<String> {
+    if config::valid_label(name) {
+        return Ok(name.to_string());
+    }
+    let path = cwd
+        .join(name)
+        .canonicalize()
+        .with_context(|| format!("no worktree {name}"))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
 async fn remove(root: PathBuf, name: String, force: bool) -> Result<()> {
     let keep = vec![std::process::id() as i32, unsafe { libc::getppid() }];
     client::post::<Value>(
@@ -286,7 +299,9 @@ async fn main() -> Result<()> {
             println!("{}", r.path.display());
             Ok(())
         }
-        Cmd::Worktree(WorktreeCmd::Rm { name, force }) => remove(root_of(&cwd)?, name, force).await,
+        Cmd::Worktree(WorktreeCmd::Rm { name, force }) => {
+            remove(root_of(&cwd)?, rm_target(&cwd, &name)?, force).await
+        }
         Cmd::Worktree(WorktreeCmd::List) => {
             let root = root_of(&cwd)?;
             let s: daemon::Status = client::get("/status").await?;
@@ -427,5 +442,23 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rm_target_makes_paths_absolute() {
+        let d = tempfile::TempDir::new().unwrap();
+        let wt = d.path().join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        let abs = wt.canonicalize().unwrap().to_string_lossy().into_owned();
+        assert_eq!(rm_target(d.path(), "feat-x").unwrap(), "feat-x");
+        assert_eq!(rm_target(&wt, ".").unwrap(), abs);
+        assert_eq!(rm_target(d.path(), "./wt").unwrap(), abs);
+        assert_eq!(rm_target(Path::new("/"), &abs).unwrap(), abs);
+        assert!(rm_target(d.path(), "./missing").is_err());
     }
 }

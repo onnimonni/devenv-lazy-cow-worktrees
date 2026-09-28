@@ -593,7 +593,7 @@ pub fn remove_files(root: &Path, info: &Info) -> Result<()> {
     let trash_dir = repo.commondir().join("localforest-trash");
     std::fs::create_dir_all(&trash_dir)?;
     let trash = trash_dir.join(format!("{}.{}", info.name, std::process::id()));
-    let trash = if trash.exists() {
+    let mut trash = if trash.exists() {
         trash_dir.join(format!(
             "{}.{}.{}",
             info.name,
@@ -606,8 +606,18 @@ pub fn remove_files(root: &Path, info: &Info) -> Result<()> {
         trash
     };
     // Same volume: a rename instead of deleting thousands of files in the foreground.
-    std::fs::rename(&info.path, &trash)
-        .with_context(|| format!("moving {} away", info.path.display()))?;
+    // Worktrees on another volume than the git dir go to a hidden sibling instead.
+    if let Err(e) = std::fs::rename(&info.path, &trash) {
+        if e.raw_os_error() != Some(libc::EXDEV) {
+            return Err(e).with_context(|| format!("moving {} away", info.path.display()));
+        }
+        trash = info.path.with_file_name(format!(
+            ".{}",
+            trash.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        std::fs::rename(&info.path, &trash)
+            .with_context(|| format!("moving {} away", info.path.display()))?;
+    }
     for admin in repo.worktrees()?.iter().filter_map(|n| n.ok().flatten()) {
         if let Ok(wt) = repo.find_worktree(admin)
             && wt.validate().is_err()
