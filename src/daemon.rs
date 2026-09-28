@@ -202,7 +202,8 @@ pub struct RemoveReq {
     pub root: PathBuf,
     pub name: String,
     pub force: bool,
-    /// Processes not to stop (the caller's shell).
+    /// Processes not to stop, with all their ancestors (the caller, its shell, the
+    /// Claude Code session that ran it).
     #[serde(default)]
     pub keep_pids: Vec<i32>,
 }

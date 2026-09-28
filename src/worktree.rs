@@ -717,17 +717,15 @@ fn processes() -> Vec<(i32, i32, Vec<u8>, Vec<u8>)> {
 
 /// Processes running in `dir` (cwd or executable inside it: the BEAM, esbuild,
 /// tailwind, node, ...) and all their descendants, except `keep`, this process and
-/// its ancestors.
+/// their ancestors.
 fn processes_in(dir: &Path, keep: &[i32]) -> Vec<i32> {
     let dir = dir.as_os_str().as_bytes();
     let inside = |p: &[u8]| p.starts_with(dir) && (p.len() == dir.len() || p[dir.len()] == b'/');
     let procs = processes();
     let parent: HashMap<i32, i32> = procs.iter().map(|(p, pp, _, _)| (*p, *pp)).collect();
-    let mut spared: HashSet<i32> = keep.iter().copied().collect();
-    let mut me = std::process::id() as i32;
-    while me > 1 && spared.insert(me) {
-        me = parent.get(&me).copied().unwrap_or(0);
-    }
+    let mut roots = keep.to_vec();
+    roots.push(std::process::id() as i32);
+    let spared = with_ancestors(&parent, &roots);
     let mut hit: HashSet<i32> = procs
         .iter()
         .filter(|(_, _, cwd, exe)| inside(cwd) || inside(exe))
@@ -747,6 +745,19 @@ fn processes_in(dir: &Path, keep: &[i32]) -> Vec<i32> {
     hit.into_iter()
         .filter(|p| !spared.contains(p) && *p > 1)
         .collect()
+}
+
+/// `pids` and every ancestor of each (a hook's shell runs under Claude Code, which
+/// may sit in the worktree being removed).
+fn with_ancestors(parent: &HashMap<i32, i32>, pids: &[i32]) -> HashSet<i32> {
+    let mut out = HashSet::new();
+    for &p in pids {
+        let mut p = p;
+        while p > 1 && out.insert(p) {
+            p = parent.get(&p).copied().unwrap_or(0);
+        }
+    }
+    out
 }
 
 /// SIGKILL everything running in `dir` (dev servers and their watchers): a dev server
@@ -871,6 +882,18 @@ mod tests {
         assert!(repo.find_branch("feat-x", BranchType::Local).is_err());
         // Can be created again.
         create(&project, &syncer, "feat-x", None).unwrap();
+    }
+
+    #[test]
+    fn spares_whole_ancestor_chains() {
+        // 1 <- 100 (claude) <- 200 (sh) <- 300 (localforest); 1 <- 400 <- 500
+        let parent = HashMap::from([(100, 1), (200, 100), (300, 200), (400, 1), (500, 400)]);
+        assert_eq!(
+            with_ancestors(&parent, &[300, 500]),
+            HashSet::from([100, 200, 300, 400, 500])
+        );
+        // Unknown pids are kept themselves.
+        assert_eq!(with_ancestors(&parent, &[42]), HashSet::from([42]));
     }
 
     #[test]
