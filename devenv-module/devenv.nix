@@ -26,7 +26,8 @@
 # checkout's DATABASE_URL and REDIS_URL. `localforest env [--service x]` gives every
 # shell the same environment. Claude Code's WorktreeCreate/WorktreeRemove
 # hooks go through the daemon, so `claude --worktree` and `isolation: worktree`
-# subagents get provisioned worktrees too.
+# subagents get provisioned worktrees too, and its NODE_EXTRA_CA_CERTS trusts the
+# local CA (MCP servers on https://*.localhost).
 {
   pkgs,
   lib,
@@ -37,6 +38,9 @@
 let
   cfg = config.localforest;
   exe = lib.getExe cfg.package;
+  # devenv evaluates impurely, so the invoking user's environment is readable.
+  envHome = builtins.getEnv "LOCALFOREST_HOME";
+  userHome = builtins.getEnv "HOME";
   inherit (lib) mkOption types;
   # With its extensions, like devenv's services.postgres.
   postgres =
@@ -258,6 +262,25 @@ in
       example = 0;
       description = "Plain HTTP port that redirects to HTTPS; 0 disables (default: 80 where unprivileged processes may bind it, else off).";
     };
+    home = mkOption {
+      type = types.nullOr types.str;
+      default =
+        config.env.LOCALFOREST_HOME or (
+          if envHome != "" then
+            envHome
+          else if userHome != "" then
+            "${userHome}/.local/state/localforest"
+          else
+            null
+        );
+      defaultText = lib.literalExpression ''env.LOCALFOREST_HOME, else $LOCALFOREST_HOME, else "$HOME/.local/state/localforest"'';
+      description = "The daemon's state directory (absolute), where its CA lives (`<home>/ca/ca.pem`); only read here, set LOCALFOREST_HOME to move it.";
+    };
+    claude.trustCa = mkOption {
+      type = types.bool;
+      default = true;
+      description = "Set NODE_EXTRA_CA_CERTS to the local CA in `.claude/settings.local.json`, so Claude Code reaches MCP servers on https://*.localhost. Node reads one file only: to trust other CAs too, set `files.\".claude/settings.local.json\".json.env.NODE_EXTRA_CA_CERTS` to a bundle yourself.";
+    };
     lsp = mkOption {
       type = types.attrsOf (types.listOf types.str);
       default = { };
@@ -308,6 +331,11 @@ in
     enterShell = ''
       eval "$(${exe} env)"
     '';
+
+    # Node (Claude Code) ignores the keychain `localforest trust` writes to.
+    files.".claude/settings.local.json".json.env = lib.mkIf (cfg.claude.trustCa && cfg.home != null) {
+      NODE_EXTRA_CA_CERTS = lib.mkDefault "${cfg.home}/ca/ca.pem";
+    };
 
     files.".claude/settings.local.json".json.hooks = {
       WorktreeCreate = [
