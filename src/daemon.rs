@@ -197,6 +197,14 @@ pub struct CreateResp {
     pub env: Vec<(String, String)>,
 }
 
+/// Why an idle preview stays open.
+enum PreviewKeep {
+    /// It has work that closing would lose.
+    Work(String),
+    /// Can't tell right now (GitHub unreachable, …).
+    Unknown(String),
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct RemoveReq {
     pub root: PathBuf,
@@ -767,16 +775,23 @@ impl Daemon {
             let Some(info) = infos.iter().find(|i| i.name == name) else {
                 continue;
             };
-            // Like `worktree rm` without --force: edits or new commits keep it open.
-            if let Err(e) = self.check_removable(rt, info).await {
-                info!("keeping idle preview {name}: {e:#}");
-                // Ask again after another TTL, not every minute.
-                history::History::update(&rt.project.root, |h| {
-                    if let Some(p) = h.previews.get_mut(&name) {
-                        p.last_active = now;
-                    }
-                })?;
-                continue;
+            match self.preview_closable(rt, info).await {
+                Ok(()) => {}
+                Err(PreviewKeep::Work(why)) => {
+                    info!("keeping idle preview {name}: {why}");
+                    // Ask again after another TTL, not every minute.
+                    history::History::update(&rt.project.root, |h| {
+                        if let Some(p) = h.previews.get_mut(&name) {
+                            p.last_active = now;
+                        }
+                    })?;
+                    continue;
+                }
+                Err(PreviewKeep::Unknown(why)) => {
+                    // Asked again next minute: closes once it can tell.
+                    debug!("idle preview {name}: can't tell yet if it's safe to close: {why}");
+                    continue;
+                }
             }
             info!(
                 "closing preview {name}: no activity for {} h",
@@ -790,6 +805,65 @@ impl Daemon {
             }
         }
         Ok(())
+    }
+
+    /// Can an idle preview close without losing work? Clean, and every commit on
+    /// the base branch, pushed to its branch on the remote (merged or not), or in
+    /// its merged PR.
+    async fn preview_closable(
+        &self,
+        rt: &ProjectRt,
+        info: &worktree::Info,
+    ) -> std::result::Result<(), PreviewKeep> {
+        let unknown = |e: anyhow::Error| PreviewKeep::Unknown(format!("{e:#}"));
+        let (remote, base, i) = (
+            rt.project.settings.remote.clone(),
+            rt.base.clone(),
+            info.clone(),
+        );
+        let unpushed = tokio::task::spawn_blocking(move || -> Result<Option<usize>> {
+            if worktree::is_dirty(&i.path)? {
+                return Ok(None);
+            }
+            worktree::unpushed(&i, &remote, &base).map(Some)
+        })
+        .await
+        .map_err(|e| unknown(e.into()))?
+        .map_err(unknown)?;
+        let n = match unpushed {
+            None => return Err(PreviewKeep::Work("uncommitted changes".into())),
+            Some(0) => return Ok(()),
+            Some(n) => n,
+        };
+        let (Some(gh), Some(branch)) = (&rt.gh, &info.branch) else {
+            return Err(PreviewKeep::Work(format!(
+                "{n} unpushed commit(s) and no GitHub to look up a merged PR"
+            )));
+        };
+        let Some((number, pr_head)) = gh.merged_pr(branch).await.map_err(unknown)? else {
+            return Err(PreviewKeep::Work(format!(
+                "{n} commit(s) neither pushed nor merged"
+            )));
+        };
+        let pr_head = Oid::from_str(&pr_head).map_err(|e| unknown(e.into()))?;
+        let (remote, base, i) = (
+            rt.project.settings.remote.clone(),
+            rt.base.clone(),
+            info.clone(),
+        );
+        let covered = tokio::task::spawn_blocking(move || {
+            worktree::covered_by_pr(&i, pr_head, &remote, &base)
+        })
+        .await
+        .map_err(|e| unknown(e.into()))?
+        .map_err(unknown)?;
+        if covered {
+            Ok(())
+        } else {
+            Err(PreviewKeep::Work(format!(
+                "commits after #{number} merged, not pushed"
+            )))
+        }
     }
 
     async fn remove_worktree(&self, req: RemoveReq) -> Result<()> {
