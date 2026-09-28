@@ -5,8 +5,9 @@
 //! them are killed (whole group, SIGKILL) with the checkout. `restart` restarts one
 //! that exits on its own; `restartOnPull` one whose checkout pulled the base branch.
 //! `restartOnChange` restarts a running one when the content of files in its `cwd`
-//! changes (after the setup command, e.g. `mix deps.get`); for Mix commands it defaults
-//! to what Phoenix's code reloader refuses to compile after until the server restarts.
+//! changes (after the setup command, e.g. `mix deps.get`, when a dependency file did;
+//! not while its checkout pulls or migrates); for Mix commands it defaults to what
+//! Phoenix's code reloader refuses to compile after until the server restarts.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -80,42 +81,98 @@ struct Proc {
     watched: Option<Watched>,
 }
 
+impl Proc {
+    fn new(project: &Project, c: &Checkout, name: &str, g: &Global, child: Child) -> Self {
+        let watched = c
+            .service(name)
+            .map(restart_patterns)
+            .filter(|p| !p.is_empty())
+            .and_then(|p| Some(Watched::new(service_cwd(c, name)?, p)));
+        Proc {
+            child,
+            project: project.clone(),
+            checkout: c.clone(),
+            name: name.to_string(),
+            global: g.clone(),
+            started: Instant::now(),
+            failures: 0,
+            respawn_at: None,
+            watched,
+        }
+    }
+
+    /// Runs `child` from now, with the `restartOnChange` files as they are.
+    fn started_with(&mut self, child: Child) {
+        self.child = child;
+        self.started = Instant::now();
+        self.respawn_at = None;
+        if let Some(w) = &mut self.watched {
+            w.files = hashes(&w.dir, &w.patterns);
+        }
+    }
+
+    fn alive(&mut self) -> bool {
+        self.respawn_at.is_none() && matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// Its `restartOnChange` files whose content differs from when it started.
+    fn changed_files(&self) -> Vec<PathBuf> {
+        let Some(w) = &self.watched else {
+            return Vec::new();
+        };
+        let now = hashes(&w.dir, &w.patterns);
+        now.keys()
+            .chain(w.files.keys())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter(|f| now.get(*f) != w.files.get(*f))
+            .cloned()
+            .collect()
+    }
+}
+
 /// A service's `restartOnChange` patterns, in its working directory, and the content
 /// hashes of the files they matched as it started.
 struct Watched {
     dir: PathBuf,
     patterns: Vec<String>,
+    /// The patterns' dirs, and the service's own: a pattern's dir made later shows
+    /// up there.
+    dirs: BTreeSet<PathBuf>,
     files: BTreeMap<PathBuf, u64>,
 }
 
 impl Watched {
     fn new(dir: PathBuf, patterns: Vec<String>) -> Self {
+        for p in &patterns {
+            if Path::new(p)
+                .parent()
+                .is_some_and(|d| d.to_string_lossy().contains(['*', '?']))
+            {
+                warn!("restartOnChange `{p}`: wildcards only work in the file name");
+            }
+        }
+        let dirs = patterns
+            .iter()
+            .map(|p| {
+                let d = dir.join(Path::new(p).parent().unwrap_or(Path::new("")));
+                d.canonicalize().unwrap_or(d)
+            })
+            .chain([dir.clone()])
+            .collect();
         let files = hashes(&dir, &patterns);
         Watched {
             dir,
             patterns,
+            dirs,
             files,
         }
     }
 
-    /// The pattern's dirs, and the service's own: a pattern's dir made later shows
-    /// up there.
-    fn dirs(&self) -> BTreeSet<PathBuf> {
-        self.patterns
-            .iter()
-            .map(|p| {
-                let d = self
-                    .dir
-                    .join(Path::new(p).parent().unwrap_or(Path::new("")));
-                d.canonicalize().unwrap_or(d)
-            })
-            .chain([self.dir.clone()])
-            .collect()
-    }
-
-    /// Whether an event on `path` may concern these files.
+    /// Whether an event on `path` may concern these files (FSEvents reports
+    /// canonical paths; the dirs are canonicalized too).
     fn concerns(&self, path: &Path) -> bool {
-        self.dirs()
+        self.dirs
             .iter()
             .any(|d| path == d || path.parent() == Some(d))
     }
@@ -125,10 +182,43 @@ impl Watched {
 /// plus runtime.exs.
 const MIX_FILES: &[&str] = &["mix.exs", "mix.lock", "config/*.exs"];
 
-/// Runs Mix: `mix phx.server`, `iex -S mix phx.server`, `with-secrets -- mix …`.
+/// Dependency manifests and lockfiles: the setup command runs before a
+/// `restartOnChange` restart only when one of these changed.
+const DEPENDENCY_FILES: &[&str] = &[
+    "mix.exs",
+    "mix.lock",
+    "Gemfile",
+    "Gemfile.lock",
+    "package.json",
+    "package-lock.json",
+    "bun.lock",
+    "bun.lockb",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "Cargo.toml",
+    "Cargo.lock",
+    "go.mod",
+    "go.sum",
+    "pyproject.toml",
+    "uv.lock",
+    "poetry.lock",
+    "requirements.txt",
+    "composer.json",
+    "composer.lock",
+];
+
+fn is_dependency_file(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|n| DEPENDENCY_FILES.iter().any(|d| n == *d))
+}
+
+/// Runs Mix: `mix phx.server`, `iex -S mix phx.server`, `with-secrets -- mix …`,
+/// `sh -c '… && mix phx.server'`. A false positive (Laravel Mix) is harmless: its
+/// `MIX_FILES` don't exist, so nothing restarts it.
 fn is_mix(exec: &str) -> bool {
     shell_words::split(exec).is_ok_and(|argv| {
         argv.iter()
+            .flat_map(|a| a.split_whitespace())
             .any(|a| Path::new(a).file_name().is_some_and(|n| n == "mix"))
     })
 }
@@ -232,67 +322,55 @@ fn kill_group(child: &Child) {
     }
 }
 
-#[derive(Default)]
-pub struct Servers {
-    /// By service id.
-    procs: Mutex<HashMap<String, Proc>>,
-    /// Watches the dirs of running services' `restartOnChange` files.
-    watcher: std::sync::Mutex<Option<notify::RecommendedWatcher>>,
-    watched: std::sync::Mutex<HashSet<PathBuf>>,
-    /// Paths changed since, and the last change (restarts wait a second of quiet:
-    /// `mix deps.get` and `git merge` write several files).
-    changed: Arc<std::sync::Mutex<(HashSet<PathBuf>, Option<Instant>)>>,
-}
-
-fn new_proc(project: &Project, c: &Checkout, name: &str, g: &Global, child: Child) -> Proc {
-    let watched = c
-        .service(name)
-        .map(restart_patterns)
-        .filter(|p| !p.is_empty())
-        .and_then(|p| Some(Watched::new(service_cwd(c, name)?, p)));
-    Proc {
-        child,
-        project: project.clone(),
-        checkout: c.clone(),
-        name: name.to_string(),
-        global: g.clone(),
-        started: Instant::now(),
-        failures: 0,
-        respawn_at: None,
-        watched,
-    }
-}
-
-/// The project's setup command (`mix deps.get`) in the checkout before restarting
-/// services whose files changed, logged with its first run; 15 minutes at most.
-async fn run_setup(project: &Project, c: &Checkout, g: &Global) -> Result<()> {
-    let Some(cmd) = &project.settings.setup else {
-        return Ok(());
-    };
-    let id = c.run_id("setup");
-    let log_path = log_path(&id);
+/// Run a project command (migrate, seed, setup) in `cwd`, logged to `logs/<id>.log`
+/// (appended to with `append`); 15 minutes at most.
+pub async fn run_logged(
+    project: &Project,
+    id: &str,
+    cmd: &str,
+    cwd: &Path,
+    env: Vec<(String, String)>,
+    append: bool,
+) -> Result<()> {
+    let log_path = log_path(id);
     std::fs::create_dir_all(log_path.parent().unwrap())?;
     let log = std::fs::OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
+        .append(append)
+        .truncate(!append)
         .open(&log_path)?;
-    info!("{id}: running `{cmd}` (files changed)");
-    let status = command(project, cmd, &c.path, c.env(g))?
+    info!("{id}: running `{cmd}`");
+    let t = Instant::now();
+    let status = command(project, cmd, cwd, env)?
         .stdout(log.try_clone()?)
         .stderr(log)
         .kill_on_drop(true)
         .status();
     let status = tokio::time::timeout(Duration::from_secs(900), status)
         .await
-        .map_err(|_| anyhow!("{id}: `{cmd}` timed out"))??;
+        .map_err(|_| anyhow!("`{cmd}` timed out"))??;
     if !status.success() {
         bail!(
             "`{cmd}` failed in {id} ({status}); see {}",
             log_path.display()
         );
     }
-    info!("{id}: done");
+    info!("{id}: done in {:?}", t.elapsed());
     Ok(())
+}
+
+/// The project's setup command (`mix deps.get`) in a checkout whose dependency files
+/// changed, before restarting its services; appended to the log of its first run. A
+/// failure is only logged: the dependencies may be there already.
+async fn run_setup(project: &Project, c: &Checkout, g: &Global) {
+    let Some(cmd) = &project.settings.setup else {
+        return;
+    };
+    let id = c.run_id("setup");
+    if let Err(e) = run_logged(project, &id, cmd, &c.path, c.env(g), true).await {
+        warn!("{e:#}");
+    }
 }
 
 /// Kill a running service's group and start it again.
@@ -301,119 +379,231 @@ async fn respawn(id: &str, p: &mut Proc) {
     let _ = p.child.wait().await;
     match spawn(&p.project, &p.checkout, &p.name, &p.global, true) {
         Ok(child) => {
-            p.child = child;
-            p.started = Instant::now();
+            p.started_with(child);
             p.failures = 0;
-            p.respawn_at = None;
-            if let Some(w) = &mut p.watched {
-                w.files = hashes(&w.dir, &w.patterns);
-            }
             info!("{id}: restarted");
         }
         Err(e) => warn!("{e:#}"),
     }
 }
 
+/// The notify watcher and the dirs it watches (or failed to).
+#[derive(Default)]
+struct Watches {
+    watcher: Option<notify::RecommendedWatcher>,
+    dirs: HashSet<PathBuf>,
+}
+
+#[derive(Default)]
+pub struct Servers {
+    /// By service id.
+    procs: Mutex<HashMap<String, Proc>>,
+    /// The dirs of running services' `restartOnChange` files.
+    watches: std::sync::Mutex<Watches>,
+    /// Changed paths by their last change (a checkout's restarts wait for a second
+    /// of quiet: `mix deps.get` and `git merge` write several files).
+    changed: Arc<std::sync::Mutex<HashMap<PathBuf, Instant>>>,
+    /// Checkouts (and those under them) whose services aren't restarted for changed
+    /// files now, by holders: pulling / migrating, or running setup. Changes wait.
+    held: std::sync::Mutex<HashMap<PathBuf, usize>>,
+}
+
+/// Holds back `restartOnChange` restarts of a checkout (and those under it) until
+/// dropped (`Servers::hold`).
+pub struct Hold {
+    servers: Arc<Servers>,
+    path: PathBuf,
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        let mut held = self.servers.held.lock().unwrap();
+        if let Some(n) = held.get_mut(&self.path) {
+            *n -= 1;
+            if *n == 0 {
+                held.remove(&self.path);
+            }
+        }
+    }
+}
+
 impl Servers {
+    /// Hold back `restartOnChange` restarts in `path` (a checkout, or the primary
+    /// for all of a project's) while pulling or migrating: they run once released, and
+    /// not at all for services `restart`ed meanwhile.
+    pub fn hold(self: &Arc<Self>, path: &Path) -> Hold {
+        *self
+            .held
+            .lock()
+            .unwrap()
+            .entry(path.to_path_buf())
+            .or_default() += 1;
+        Hold {
+            servers: self.clone(),
+            path: path.to_path_buf(),
+        }
+    }
+
+    fn held(&self, checkout: &Path) -> bool {
+        self.held
+            .lock()
+            .unwrap()
+            .keys()
+            .any(|h| checkout.starts_with(h))
+    }
+
     /// Watch the dirs of the `restartOnChange` files of `procs`, and only those.
     fn sync_watches(&self, procs: &HashMap<String, Proc>) {
         let want: HashSet<PathBuf> = procs
             .values()
             .filter_map(|p| p.watched.as_ref())
-            .flat_map(Watched::dirs)
+            .flat_map(|w| w.dirs.iter().cloned())
             .filter(|d| d.is_dir())
             .collect();
-        let mut watched = self.watched.lock().unwrap();
-        if *watched == want {
+        let mut watches = self.watches.lock().unwrap();
+        if watches.dirs == want {
             return;
         }
-        let mut watcher = self.watcher.lock().unwrap();
-        if watcher.is_none() {
+        if watches.watcher.is_none() {
             let changed = self.changed.clone();
             let w = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
                 let Ok(ev) = res else { return };
+                let now = Instant::now();
                 let mut changed = changed.lock().unwrap();
-                changed.0.extend(ev.paths);
-                changed.1 = Some(Instant::now());
+                for p in ev.paths {
+                    changed.insert(p, now);
+                }
             });
             match w {
-                Ok(w) => *watcher = Some(w),
+                Ok(w) => watches.watcher = Some(w),
                 Err(e) => {
+                    // Tried again only once the dirs change.
                     warn!("watching restartOnChange files: {e}");
+                    watches.dirs = want;
                     return;
                 }
             }
         }
+        let Watches { watcher, dirs } = &mut *watches;
         let w = watcher.as_mut().unwrap();
-        for d in watched.difference(&want) {
+        for d in dirs.difference(&want) {
             let _ = w.unwatch(d);
         }
-        for d in want.difference(&watched) {
+        for d in want.difference(dirs) {
             if let Err(e) = w.watch(d, RecursiveMode::NonRecursive) {
                 warn!("watching {}: {e}", d.display());
             }
         }
-        *watched = want;
+        *dirs = want;
     }
 
-    /// Restart running services whose `restartOnChange` files changed (once nothing
-    /// changed for a second), after the project's setup command (`mix deps.get`), run
-    /// once per checkout without holding up other services.
-    async fn restart_changed(&self) {
-        let paths: HashSet<PathBuf> = {
-            let mut changed = self.changed.lock().unwrap();
-            if changed
-                .1
-                .is_none_or(|at| at.elapsed() < Duration::from_secs(1))
-            {
+    /// Restart running services whose `restartOnChange` files changed, per checkout
+    /// once nothing in it changed for a second and it isn't `held`. When a dependency
+    /// file changed, the project's setup command (`mix deps.get`) runs first, in the
+    /// background (the checkout held meanwhile).
+    async fn restart_changed(self: &Arc<Self>) {
+        let (events, at) = {
+            let changed = self.changed.lock().unwrap();
+            if changed.is_empty() {
                 return;
             }
-            changed.1 = None;
-            std::mem::take(&mut changed.0)
+            (changed.clone(), Instant::now())
         };
-        let mut restart = Vec::new();
-        let mut setups: Vec<(Project, Checkout, Global)> = Vec::new();
-        for (id, p) in self.procs.lock().await.iter_mut() {
-            let Some(w) = &p.watched else { continue };
-            // FSEvents reports canonical paths; the dirs are canonicalized too.
-            if !paths.iter().any(|path| w.concerns(path)) || p.respawn_at.is_some() {
-                continue;
-            }
-            let now = hashes(&w.dir, &w.patterns);
-            if now == w.files || !matches!(p.child.try_wait(), Ok(None)) {
-                continue;
-            }
-            let what: Vec<String> = now
-                .keys()
-                .chain(w.files.keys())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .filter(|f| now.get(*f) != w.files.get(*f))
-                .map(|f| f.strip_prefix(&w.dir).unwrap_or(f).display().to_string())
-                .collect();
-            info!("{id}: {} changed; restarting", what.join(", "));
-            if p.project.settings.setup.is_some()
-                && !setups.iter().any(|(_, c, _)| c.path == p.checkout.path)
-            {
-                setups.push((p.project.clone(), p.checkout.clone(), p.global.clone()));
-            }
-            restart.push(id.clone());
-        }
-        for (project, c, g) in setups {
-            if let Err(e) = run_setup(&project, &c, &g).await {
-                // Restarted anyway: the dependencies may be there already.
-                warn!("{e:#}");
+        {
+            // A watched dir itself changed (removed, replaced): inotify dropped its
+            // watch; `sync_watches` watches it again.
+            let mut watches = self.watches.lock().unwrap();
+            let Watches { watcher, dirs } = &mut *watches;
+            for p in events.keys() {
+                if dirs.remove(p)
+                    && let Some(w) = watcher.as_mut()
+                {
+                    let _ = w.unwatch(p);
+                }
             }
         }
         let mut procs = self.procs.lock().await;
-        for id in restart {
-            if let Some(p) = procs.get_mut(&id)
-                && p.respawn_at.is_none()
-                && matches!(p.child.try_wait(), Ok(None))
-            {
-                respawn(&id, p).await;
+        let mut checkouts: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
+        for (id, p) in procs.iter() {
+            if p.watched.is_some() {
+                checkouts
+                    .entry(p.checkout.path.clone())
+                    .or_default()
+                    .push(id.clone());
             }
         }
+        let mut keep = HashSet::new();
+        for (path, ids) in checkouts {
+            let concerned: Vec<&PathBuf> = events
+                .keys()
+                .filter(|e| {
+                    ids.iter()
+                        .any(|id| procs[id].watched.as_ref().is_some_and(|w| w.concerns(e)))
+                })
+                .collect();
+            if concerned.is_empty() {
+                continue;
+            }
+            let quiet = concerned
+                .iter()
+                .all(|e| events[*e].elapsed() >= Duration::from_secs(1));
+            if !quiet || self.held(&path) {
+                keep.extend(concerned.into_iter().cloned());
+                continue;
+            }
+            let mut restart = Vec::new();
+            let mut deps = false;
+            for id in ids {
+                let p = procs.get_mut(&id).unwrap();
+                if !p.alive() {
+                    continue;
+                }
+                let changed = p.changed_files();
+                if changed.is_empty() {
+                    continue;
+                }
+                let dir = &p.watched.as_ref().unwrap().dir;
+                let what: Vec<String> = changed
+                    .iter()
+                    .map(|f| f.strip_prefix(dir).unwrap_or(f).display().to_string())
+                    .collect();
+                info!("{id}: {} changed; restarting", what.join(", "));
+                deps |= changed.iter().any(|f| is_dependency_file(f));
+                restart.push((id, p.started));
+            }
+            let Some((first, _)) = restart.first() else {
+                continue;
+            };
+            let p = &procs[first];
+            if !deps || p.project.settings.setup.is_none() {
+                for (id, _) in restart {
+                    respawn(&id, procs.get_mut(&id).unwrap()).await;
+                }
+                continue;
+            }
+            let (project, c, g) = (p.project.clone(), p.checkout.clone(), p.global.clone());
+            let hold = self.hold(&path);
+            let servers = self.clone();
+            tokio::spawn(async move {
+                run_setup(&project, &c, &g).await;
+                let mut procs = servers.procs.lock().await;
+                for (id, started) in restart {
+                    // Not one stopped and started again meanwhile.
+                    if let Some(p) = procs.get_mut(&id)
+                        && p.started == started
+                        && p.alive()
+                    {
+                        respawn(&id, p).await;
+                    }
+                }
+                drop(hold);
+            });
+        }
+        drop(procs);
+        self.changed
+            .lock()
+            .unwrap()
+            .retain(|p, t| keep.contains(p) || *t >= at);
     }
 
     /// Start `name` and (first) everything it depends on; http services are waited
@@ -494,7 +684,7 @@ impl Servers {
             };
             if !alive {
                 let child = spawn(project, c, name, g, false)?;
-                procs.insert(id.clone(), new_proc(project, c, name, g, child));
+                procs.insert(id.clone(), Proc::new(project, c, name, g, child));
                 self.sync_watches(&procs);
             }
         }
@@ -520,7 +710,7 @@ impl Servers {
     /// `on-failure` (non-zero exit) or `always` is started again after a backoff that
     /// doubles per quick exit (1 s .. 30 s) and resets once it stayed up a minute.
     /// Services whose `restartOnChange` files changed are restarted.
-    pub async fn supervise(&self) {
+    pub async fn supervise(self: &Arc<Self>) {
         self.restart_changed().await;
         let mut procs = self.procs.lock().await;
         let now = Instant::now();
@@ -531,14 +721,7 @@ impl Servers {
                     continue;
                 }
                 match spawn(&p.project, &p.checkout, &p.name, &p.global, true) {
-                    Ok(child) => {
-                        p.child = child;
-                        p.started = now;
-                        p.respawn_at = None;
-                        if let Some(w) = &mut p.watched {
-                            w.files = hashes(&w.dir, &w.patterns);
-                        }
-                    }
+                    Ok(child) => p.started_with(child),
                     Err(e) => {
                         warn!("{e:#}");
                         p.respawn_at = Some(now + Duration::from_secs(30));
@@ -579,8 +762,20 @@ impl Servers {
         self.sync_watches(&procs);
     }
 
-    /// Kill and start again a running service (after a pull).
+    /// Kill and start again a running service (after a pull), after the setup command
+    /// when its `restartOnChange` dependency files changed; their change then doesn't
+    /// restart it again (`restart_changed`).
     pub async fn restart(&self, id: &str) {
+        let setup = {
+            let procs = self.procs.lock().await;
+            let Some(p) = procs.get(id) else { return };
+            (p.project.settings.setup.is_some()
+                && p.changed_files().iter().any(|f| is_dependency_file(f)))
+            .then(|| (p.project.clone(), p.checkout.clone(), p.global.clone()))
+        };
+        if let Some((project, c, g)) = setup {
+            run_setup(&project, &c, &g).await;
+        }
         let mut procs = self.procs.lock().await;
         let Some(p) = procs.get_mut(id) else { return };
         respawn(id, p).await;
@@ -679,7 +874,11 @@ mod tests {
         assert!(is_mix("iex -S mix phx.server"));
         assert!(is_mix("with-secrets -- /nix/store/x/bin/mix run --no-halt"));
         assert!(!is_mix("bun run dev"));
+        assert!(is_mix("sh -c 'mix assets.build && mix phx.server'"));
         assert!(!is_mix("mixer serve"));
+        assert!(is_dependency_file(Path::new("/a/mix.lock")));
+        assert!(is_dependency_file(Path::new("/a/Gemfile.lock")));
+        assert!(!is_dependency_file(Path::new("/a/config/dev.exs")));
 
         let services: Services = r#"{"web": {"exec": "mix phx.server"},
                                      "off": {"exec": "mix phx.server", "restartOnChange": []},
@@ -692,6 +891,22 @@ mod tests {
         assert!(patterns("off").is_empty());
         assert_eq!(patterns("rails"), ["Gemfile.lock"]);
         assert!(patterns("vite").is_empty());
+    }
+
+    #[test]
+    fn holds() {
+        let servers = Arc::new(Servers::default());
+        let wt = Path::new("/p/.claude/worktrees/x");
+        let root = servers.hold(Path::new("/p"));
+        let own = servers.hold(wt);
+        assert!(servers.held(wt) && servers.held(Path::new("/p")));
+        drop(root);
+        assert!(servers.held(wt) && !servers.held(Path::new("/p")));
+        let again = servers.hold(wt);
+        drop(own);
+        assert!(servers.held(wt));
+        drop(again);
+        assert!(!servers.held(wt) && servers.held.lock().unwrap().is_empty());
     }
 
     #[test]

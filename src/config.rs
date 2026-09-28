@@ -422,7 +422,8 @@ pub struct Service {
     #[serde(default)]
     pub restart_on_pull: bool,
     /// Files (relative to `cwd`, `*` / `?` in the file name) whose content changing
-    /// restarts it if running, after the setup command [default: for a command running
+    /// restarts it if running, after the setup command when a dependency manifest or
+    /// lockfile changed (`mix.lock`, `Gemfile.lock`, `package.json`, …) [default: for a command running
     /// `mix`, `mix.exs`, `mix.lock` and `config/*.exs`, which Phoenix's code reloader
     /// refuses to compile after; `[]` for others and to turn it off].
     #[serde(default)]

@@ -141,7 +141,7 @@ let
         type = types.nullOr (types.listOf types.str);
         default = null;
         example = [ "Gemfile.lock" "config/*.rb" ];
-        description = "Files (relative to cwd, `*` / `?` in the file name) whose content changing restarts it if running, after localforest.setup. Default: for a command running `mix`, mix.exs, mix.lock and config/*.exs (Phoenix's code reloader refuses to compile after those change); `[ ]` for others and to turn it off.";
+        description = "Files (relative to cwd, `*` / `?` in the file name) whose content changing restarts it if running (after localforest.setup when a dependency manifest or lockfile such as mix.lock, Gemfile.lock or package.json changed; not while its checkout pulls or migrates). Default: for a command running `mix`, mix.exs, mix.lock and config/*.exs (Phoenix's code reloader refuses to compile after those change); `[ ]` for others and to turn it off.";
       };
     };
   };
@@ -234,7 +234,7 @@ in
       type = types.nullOr types.str;
       default = null;
       example = "mix deps.get";
-      description = "Setup command run once in every new checkout (made by localforest, git, git-cow or Claude Code), with its env, before its services start.";
+      description = "Setup command run once in every new checkout (made by localforest, git, git-cow or Claude Code), with its env, before its services start; again before a restartOnChange restart when dependency files changed, so keep it idempotent (mix deps.get, not an alias that seeds).";
     };
     services = mkOption {
       type = types.attrsOf service;
