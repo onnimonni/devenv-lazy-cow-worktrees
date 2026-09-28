@@ -95,6 +95,9 @@ eval "$(cd "$wt" && "$bin" env)"
 pass "worktree database cloned from the template on first connect"
 if psql -d demo_dev -tAc "select 1" >/dev/null 2>&1; then fail "worktree could open the primary's database"; fi
 pass "other checkouts' databases refused"
+psql -d postgres -qc "CREATE DATABASE demo_test_feat_a2" || fail "could not create a partition database"
+[[ $(psql -d demo_test_feat_a2 -tAc "select 1") == 1 ]] || fail "MIX_TEST_PARTITION database <test db>2 refused"
+pass "MIX_TEST_PARTITION database opened"
 
 redis-cli --no-auth-warning -u "$REDIS_URL" set k worktree >/dev/null
 primary_redis=$(cd "$work/app" && "$bin" env --json | jq -r .REDIS_URL)
@@ -120,7 +123,7 @@ port=$(cd "$wt" && "$bin" env --json | jq -r .PORT)
 "$bin" worktree rm --force feat-a
 [[ ! -e $wt ]] || fail "worktree still there"
 if curl -s --max-time 2 "http://127.0.0.1:$port/" >/dev/null; then fail "its server survived"; fi
-[[ -z $(admin_psql "select 1 from pg_database where datname = 'demo_dev_feat_a'") ]] || fail "its database survived"
+[[ -z $(admin_psql "select 1 from pg_database where datname in ('demo_dev_feat_a', 'demo_test_feat_a2')") ]] || fail "its databases survived"
 pass "rm killed its service and dropped its database"
 
 code=$(curl_lf -o "$work/gone.html" -w '%{http_code}' "https://feat-a.web.demo.localhost:8443/")

@@ -526,20 +526,27 @@ impl Checkout {
         format!("{}_template", self.db_prefix)
     }
 
-    /// Databases this checkout owns: dev, test and MIX_TEST_PARTITION style
-    /// `<prefix>_test<N>_<wt>` / `<prefix>_test_p<N>_<wt>`.
+    /// Databases this checkout may own: dev, test, and MIX_TEST_PARTITION ones,
+    /// `<test db><N>` (Ecto's usual `"..._test#{partition}"` on TEST_DATABASE_URL) or
+    /// `<prefix>_test<N>_<worktree>`. No other form: `<prefix>_test_<N>_<wt>` and
+    /// `<prefix>_test_p<N>_<wt>` are test databases of worktrees `<N>-<wt>` and
+    /// `p<N>-<wt>`. `<test db><N>` still overlaps worktrees named like this one plus
+    /// digits (`x` + 2 vs worktree `x2`): `db_owner` settles those.
     pub fn owns_db(&self, db: &str) -> bool {
         if db == self.dev_db() || db == self.test_db() {
             return true;
         }
-        let Some(rest) = db.strip_prefix(&format!("{}_test", self.db_prefix)) else {
-            return false;
-        };
-        let Some(mid) = rest.strip_suffix(&self.suffix()) else {
-            return false;
-        };
-        let mid = mid.trim_start_matches('_').trim_start_matches('p');
-        !mid.is_empty() && mid.bytes().all(|b| b.is_ascii_digit())
+        let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        if db.strip_prefix(&self.test_db()).is_some_and(digits) {
+            return true;
+        }
+        // Worktrees only: for the primary it's `<test db><N>` again.
+        let suffix = self.suffix();
+        !suffix.is_empty()
+            && db
+                .strip_prefix(&format!("{}_test", self.db_prefix))
+                .and_then(|rest| rest.strip_suffix(&suffix))
+                .is_some_and(digits)
     }
 
     /// Key for per-checkout processes and logs; also its PostgreSQL role and the
@@ -698,6 +705,20 @@ pub fn locate(path: &Path) -> Result<(PathBuf, Option<String>, PathBuf)> {
     }
     let name = dns_label(&top.file_name().unwrap_or_default().to_string_lossy());
     Ok((root, Some(name), top))
+}
+
+/// Which of `checkouts` a database belongs to, when more than one could own it by
+/// name: the one whose dev or test database it is, else the one whose partition it is
+/// with the longest test database name (`app_test_x2` is worktree `x2`'s own, not `x`'s
+/// partition 2; `app_test_x22` is `x2`'s partition 2 while `x22` doesn't exist).
+pub fn db_owner<'a>(
+    db: &str,
+    checkouts: impl IntoIterator<Item = &'a Checkout>,
+) -> Option<&'a Checkout> {
+    checkouts
+        .into_iter()
+        .filter(|c| c.owns_db(db))
+        .max_by_key(|c| (db == c.dev_db() || db == c.test_db(), c.test_db().len()))
 }
 
 #[cfg(test)]
@@ -870,10 +891,59 @@ mod tests {
         let c = co(Some("wt"));
         assert!(c.owns_db("my_app_dev_wt"));
         assert!(c.owns_db("my_app_test_wt"));
+        // MIX_TEST_PARTITION: appended to the test database, or `_test<N>_<wt>`.
+        assert!(c.owns_db("my_app_test_wt2"));
+        assert!(c.owns_db("my_app_test_wt12"));
         assert!(c.owns_db("my_app_test2_wt"));
-        assert!(c.owns_db("my_app_test_p3_wt"));
+        assert!(!c.owns_db("my_app_test_wt_2"));
         assert!(!c.owns_db("my_app_test_other_wt"));
         assert!(!c.owns_db("my_app_dev"));
-        assert!(!co(None).owns_db("my_app_dev_wt"));
+        assert!(!c.owns_db("my_app_dev_wt2"));
+        let p = co(None);
+        assert!(p.owns_db("my_app_dev") && p.owns_db("my_app_test"));
+        assert!(p.owns_db("my_app_test2"));
+        assert!(!p.owns_db("my_app_dev_wt"));
+        assert!(!p.owns_db("my_app_test_"));
+    }
+
+    #[test]
+    fn database_names_never_collide() {
+        // Old forms that were other worktrees' test databases.
+        assert!(!co(Some("x")).owns_db(&co(Some("1-x")).test_db()));
+        assert!(!co(Some("x")).owns_db(&co(Some("p1-x")).test_db()));
+        assert!(!co(None).owns_db(&co(Some("2")).test_db()));
+        assert!(!co(None).owns_db(&co(Some("p2")).test_db()));
+        // Nobody else's dev or test database is a `_test<N>_<wt>` partition.
+        let names = ["x", "1-x", "p1-x", "2", "p2", "x2", "test2-x", "dev"];
+        for a in names.iter().map(|n| co(Some(n))).chain([co(None)]) {
+            for b in names.iter().map(|n| co(Some(n))).chain([co(None)]) {
+                if a != b {
+                    for db in [b.dev_db(), b.test_db()] {
+                        let exact_overlap = db.strip_prefix(&a.test_db()).is_some();
+                        assert!(!a.owns_db(&db) || exact_overlap, "{a:?} owns {db}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn partition_owner() {
+        let (x, x2, x22) = (co(Some("x")), co(Some("x2")), co(Some("x22")));
+        let all = [x.clone(), x2.clone(), x22.clone()];
+        let owner =
+            |db: &str, cs: &[Checkout]| db_owner(db, cs).map(|c| c.worktree.clone().unwrap());
+        // x's partition 2 is worktree x2's test database while x2 exists.
+        assert_eq!(owner("my_app_test_x2", &all).as_deref(), Some("x2"));
+        assert_eq!(owner("my_app_test_x2", &all[..1]).as_deref(), Some("x"));
+        // Longest test database wins among partitions.
+        assert_eq!(owner("my_app_test_x23", &all).as_deref(), Some("x2"));
+        assert_eq!(owner("my_app_test_x22", &all).as_deref(), Some("x22"));
+        assert_eq!(owner("my_app_test_x3", &all).as_deref(), Some("x"));
+        assert_eq!(owner("my_app_test2_x", &all).as_deref(), Some("x"));
+        assert_eq!(owner("my_app_test_other", &all), None);
+        let p = [co(None), co(Some("2"))];
+        assert_eq!(owner("my_app_test_2", &p).as_deref(), Some("2"));
+        assert_eq!(db_owner("my_app_test2", &p), Some(&p[0]));
     }
 }

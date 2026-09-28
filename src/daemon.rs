@@ -481,10 +481,11 @@ impl Daemon {
             if db == "postgres" || db == "template1" {
                 return Ok(());
             }
-            if !c.owns_db(db) {
+            if !self.owns_db(&c, db) {
                 anyhow::bail!(
-                    "{user} may only open its own databases ({}, {}), not {db}",
+                    "{user} may only open its own databases ({}, {}, MIX_TEST_PARTITION's {}<N>), not {db}",
                     c.dev_db(),
+                    c.test_db(),
                     c.test_db()
                 );
             }
@@ -496,6 +497,14 @@ impl Daemon {
         Ok(())
     }
 
+    /// `c` owns `db` by name, and no other registered checkout has a closer claim
+    /// (`config::db_owner`).
+    fn owns_db(&self, c: &Checkout, db: &str) -> bool {
+        let others: Vec<Checkout> = self.checkouts().into_iter().map(|(_, o)| o).collect();
+        config::db_owner(db, others.iter().chain([c]))
+            .is_some_and(|o| (&o.project, &o.worktree) == (&c.project, &c.worktree))
+    }
+
     /// Kill the checkout's services and redis-server, drop its routes, databases and role.
     async fn deprovision(&self, c: &Checkout) -> Result<()> {
         for (_, host, _) in c.routes() {
@@ -504,7 +513,7 @@ impl Daemon {
         self.servers.stop_checkout(c).await;
         self.redis.remove(&c.id()).await;
         for db in self.pg.databases().await? {
-            if c.owns_db(&db) {
+            if self.owns_db(c, &db) {
                 self.pg.drop(&db).await?;
                 info!("dropped database {db}");
             }
