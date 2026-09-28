@@ -817,7 +817,7 @@ pub fn remove_files(root: &Path, info: &Info) -> Result<()> {
     let trash_dir = repo.commondir().join("localforest-trash");
     std::fs::create_dir_all(&trash_dir)?;
     let trash = trash_dir.join(format!("{}.{}", info.name, std::process::id()));
-    let trash = if trash.exists() {
+    let mut trash = if trash.exists() {
         trash_dir.join(format!(
             "{}.{}.{}",
             info.name,
@@ -841,28 +841,45 @@ pub fn remove_files(root: &Path, info: &Info) -> Result<()> {
                 .is_ok_and(|wt| wt.path().canonicalize().ok().as_deref() == Some(&*info.path))
         });
     // Same volume: a rename instead of deleting thousands of files in the foreground.
-    std::fs::rename(&info.path, &trash)
-        .with_context(|| format!("moving {} away", info.path.display()))?;
-    if let Some(wt) = own.and_then(|n| repo.find_worktree(&n).ok())
-        && wt.validate().is_err()
-    {
-        let _ = wt.unlock();
-        wt.prune(Some(WorktreePruneOptions::new().locked(true)))?;
-    }
-    for admin in repo.worktrees()?.iter().filter_map(|n| n.ok().flatten()) {
-        if let Ok(wt) = repo.find_worktree(admin)
-            && wt.validate().is_err()
-            && matches!(wt.is_locked(), Ok(git2::WorktreeLockStatus::Unlocked))
-        {
-            wt.prune(None)?;
+    // Worktrees on another volume than the git dir go to a hidden sibling instead.
+    if let Err(e) = std::fs::rename(&info.path, &trash) {
+        if e.raw_os_error() != Some(libc::EXDEV) {
+            return Err(e).with_context(|| format!("moving {} away", info.path.display()));
         }
+        trash = info.path.with_file_name(format!(
+            "{SIBLING_TRASH}{}",
+            trash.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        std::fs::rename(&info.path, &trash)
+            .with_context(|| format!("moving {} away", info.path.display()))?;
     }
-    if let Some(b) = &info.branch
-        && *b == info.name
-        && let Ok(mut branch) = repo.find_branch(b, BranchType::Local)
-    {
-        branch.delete()?;
-        info!("deleted branch {b}");
+    // The worktree is gone now: the rest is tidying up, not worth failing over.
+    let tidy = || -> Result<()> {
+        if let Some(wt) = own.and_then(|n| repo.find_worktree(&n).ok())
+            && wt.validate().is_err()
+        {
+            let _ = wt.unlock();
+            wt.prune(Some(WorktreePruneOptions::new().locked(true)))?;
+        }
+        for admin in repo.worktrees()?.iter().filter_map(|n| n.ok().flatten()) {
+            if let Ok(wt) = repo.find_worktree(admin)
+                && wt.validate().is_err()
+                && matches!(wt.is_locked(), Ok(git2::WorktreeLockStatus::Unlocked))
+            {
+                wt.prune(None)?;
+            }
+        }
+        if let Some(b) = &info.branch
+            && *b == info.name
+            && let Ok(mut branch) = repo.find_branch(b, BranchType::Local)
+        {
+            branch.delete()?;
+            info!("deleted branch {b}");
+        }
+        Ok(())
+    };
+    if let Err(e) = tidy() {
+        warn!("{}: cleaning up git metadata: {e:#}", info.name);
     }
     std::thread::spawn(move || {
         if let Err(e) = std::fs::remove_dir_all(&trash) {
@@ -870,6 +887,41 @@ pub fn remove_files(root: &Path, info: &Info) -> Result<()> {
         }
     });
     Ok(())
+}
+
+/// Prefix of a removed worktree moved next to itself (another volume than the git dir).
+const SIBLING_TRASH: &str = ".localforest-trash.";
+
+/// Delete what an interrupted removal left behind: the git dir's trash and hidden
+/// siblings in `worktrees_dir`.
+pub fn clean_trash(root: &Path, worktrees_dir: &Path) {
+    let Ok(repo) = Repository::open(root) else {
+        return;
+    };
+    let mut stale: Vec<PathBuf> = std::fs::read_dir(repo.commondir().join("localforest-trash"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    stale.extend(
+        std::fs::read_dir(worktrees_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(SIBLING_TRASH))
+            .map(|e| e.path()),
+    );
+    if stale.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        for p in stale {
+            if let Err(e) = std::fs::remove_dir_all(&p) {
+                warn!("removing {}: {e}", p.display());
+            }
+        }
+    });
 }
 
 /// Every process as (pid, parent pid, cwd, executable path).
@@ -1347,6 +1399,28 @@ mod tests {
         ));
         assert!(repo.find_worktree("gone").is_err());
         assert!(repo.find_worktree("by-hand").is_err());
+    }
+
+    #[test]
+    fn cleans_up_trash_of_interrupted_removals() {
+        let (_d, project, _) = fixture();
+        let trash = project.root.join(".git/localforest-trash/old.123");
+        let sibling = project
+            .worktrees_dir()
+            .join(format!("{SIBLING_TRASH}old.123"));
+        let keep = project.worktrees_dir().join("feat-x");
+        for d in [&trash, &sibling, &keep] {
+            std::fs::create_dir_all(d.join("sub")).unwrap();
+        }
+        clean_trash(&project.root, &project.worktrees_dir());
+        for _ in 0..100 {
+            if !trash.exists() && !sibling.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!trash.exists() && !sibling.exists());
+        assert!(keep.exists());
     }
 
     #[test]

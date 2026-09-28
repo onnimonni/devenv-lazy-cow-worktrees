@@ -17,7 +17,7 @@
 //! with the running one, then takes over if that one goes away.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -81,6 +81,8 @@ struct ProjectRt {
     lock: tokio::sync::Mutex<()>,
     /// Provisioned worktrees by name.
     known: Mutex<BTreeMap<String, Checkout>>,
+    /// Removed worktrees whose history is written but databases not yet dropped.
+    recorded: Mutex<HashSet<String>>,
     gh: Option<Arc<github::Client>>,
     token: Option<String>,
     pending: Pending,
@@ -306,6 +308,7 @@ impl Daemon {
             base,
             lock: Default::default(),
             known: Default::default(),
+            recorded: Default::default(),
             gh,
             token,
             pending: Pending::default(),
@@ -330,6 +333,8 @@ impl Daemon {
             rt.primary().host()
         );
 
+        let (r, wd) = (root.clone(), rt.project.worktrees_dir());
+        tokio::task::spawn_blocking(move || worktree::clean_trash(&r, &wd)).await?;
         self.reconcile(&rt).await?;
         self.start_watcher(&rt)?;
         let mut tasks = Vec::new();
@@ -579,9 +584,15 @@ impl Daemon {
             if !current.contains_key(name) {
                 info!("worktree {name} is gone; cleaning up");
                 if let Err(e) = self.deprovision(c).await {
+                    // Kept: tried again on the next reconcile.
                     warn!("cleaning up {name}: {e:#}");
+                    continue;
                 }
                 rt.known.lock().unwrap().remove(name);
+                if rt.recorded.lock().unwrap().remove(name) {
+                    // Removed by us; history already says why.
+                    continue;
+                }
                 // Its own branch (named after it) usually survives a deleted directory.
                 let head = Repository::open(&rt.project.root).ok().and_then(|r| {
                     r.find_reference(&format!("refs/heads/{name}"))
@@ -884,7 +895,10 @@ impl Daemon {
         let target = Path::new(&req.name);
         let info = infos
             .iter()
-            .find(|i| i.name == req.name || target.canonicalize().is_ok_and(|p| p == i.path))
+            .find(|i| {
+                i.name == req.name
+                    || (target.is_absolute() && target.canonicalize().is_ok_and(|p| p == i.path))
+            })
             .cloned()
             .ok_or_else(|| anyhow!("no worktree {}", req.name))?;
         if info.branch.as_deref() == Some(rt.base.as_str()) {
@@ -981,11 +995,19 @@ impl Daemon {
         self.servers.stop_checkout(&c).await;
         // Whatever else runs there: a server started by hand, iex, watchers.
         worktree::kill_processes_in(&info.path, keep).await;
-        self.deprovision(&c).await?;
-        rt.known.lock().unwrap().remove(&info.name);
+        // Files first: if they can't move, the databases stay with them.
         let (root, i) = (rt.project.root.clone(), info.clone());
         tokio::task::spawn_blocking(move || worktree::remove_files(&root, &i)).await??;
         self.remember(rt, &info.name, info.branch.clone(), head, reason, pr, lost);
+        if let Err(e) = self.deprovision(&c).await {
+            // Still known: the next reconcile finds it gone and tries again.
+            rt.recorded.lock().unwrap().insert(info.name.clone());
+            anyhow::bail!(
+                "removed {}, but not its databases yet (retrying later): {e:#}",
+                info.name
+            );
+        }
+        rt.known.lock().unwrap().remove(&info.name);
         info!("removed worktree {}", info.name);
         Ok(warnings)
     }
