@@ -12,6 +12,37 @@ use git2::Repository;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// Lowest port an unprivileged process may bind: 0 on macOS (for all interfaces),
+/// `net.ipv4.ip_unprivileged_port_start` on Linux (1024 unless lowered, e.g.
+/// `sysctl net.ipv4.ip_unprivileged_port_start=80`).
+fn unprivileged_port_start() -> u16 {
+    if cfg!(target_os = "macos") {
+        return 0;
+    }
+    std::fs::read_to_string("/proc/sys/net/ipv4/ip_unprivileged_port_start")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(1024)
+}
+
+/// 443 where it may be bound without root, else 8443.
+fn default_https_port() -> u16 {
+    if unprivileged_port_start() <= 443 {
+        443
+    } else {
+        8443
+    }
+}
+
+/// 80 where it may be bound without root, else off.
+fn default_http_port() -> u16 {
+    if unprivileged_port_start() <= 80 {
+        80
+    } else {
+        0
+    }
+}
+
 /// Daemon-wide settings, shared by every project.
 #[derive(clap::Args, Debug, Clone, Serialize, Deserialize)]
 pub struct Global {
@@ -33,20 +64,22 @@ pub struct Global {
         global = true
     )]
     pub redis_port: u16,
-    /// HTTPS proxy port. Below 1024 binds all interfaces (macOS allows that without
-    /// root) and refuses non-loopback peers.
+    /// HTTPS proxy port [default: 443 where unprivileged processes may bind it (macOS;
+    /// Linux with net.ipv4.ip_unprivileged_port_start <= 443), else 8443]. Below 1024
+    /// it binds all interfaces and refuses non-loopback peers.
     #[arg(
         long,
         env = "LOCALFOREST_HTTPS_PORT",
-        default_value_t = 443,
+        default_value_t = default_https_port(),
         global = true
     )]
     pub https_port: u16,
-    /// Plain HTTP port that redirects to HTTPS; 0 disables.
+    /// Plain HTTP port that redirects to HTTPS; 0 disables [default: 80 where
+    /// unprivileged processes may bind it, else off].
     #[arg(
         long,
         env = "LOCALFOREST_HTTP_PORT",
-        default_value_t = 80,
+        default_value_t = default_http_port(),
         global = true
     )]
     pub http_port: u16,

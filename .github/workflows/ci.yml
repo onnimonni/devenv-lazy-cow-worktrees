@@ -22,6 +22,21 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
+  e2e:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build
+      # PostgreSQL 18, Redis and jq from nixpkgs; git, curl and python3 from the runner.
+      - run: nix shell nixpkgs#postgresql_18 nixpkgs#redis nixpkgs#jq --command tests/e2e.sh target/debug/localforest
+
   nix:
     strategy:
       fail-fast: false

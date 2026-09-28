@@ -72,6 +72,8 @@ impl Ca {
         })
     }
 
+    /// For the keychain (`trust`), macOS only.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn cert_der(&self) -> &CertificateDer<'static> {
         &self.cert_der
     }

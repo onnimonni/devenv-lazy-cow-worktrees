@@ -51,7 +51,8 @@ pub fn parse_remote_url(url: &str) -> Option<RepoId> {
     })
 }
 
-/// Same lookup order as go-gh: env vars, then the keyring entry `gh` writes.
+/// Same lookup order as go-gh: env vars, the keyring entry `gh` writes, then its
+/// hosts.yml (where gh keeps the token without a keyring, e.g. on Linux).
 pub fn auth_token(host: &str) -> Result<String> {
     let env_vars: &[&str] = if host == "github.com" {
         &["GH_TOKEN", "GITHUB_TOKEN"]
@@ -65,12 +66,45 @@ pub fn auth_token(host: &str) -> Result<String> {
             return Ok(t.trim().to_string());
         }
     }
-    let secret = keyring::Entry::new(&format!("gh:{host}"), "")
-        .and_then(|e| e.get_password())
-        .with_context(|| {
-            format!("no token for {host}: set GH_TOKEN or run `gh auth login` (keyring storage)")
-        })?;
-    decode_go_keyring(&secret)
+    if let Ok(secret) =
+        keyring::Entry::new(&format!("gh:{host}"), "").and_then(|e| e.get_password())
+    {
+        return decode_go_keyring(&secret);
+    }
+    // Without a keyring (typical on Linux) gh keeps the token in hosts.yml.
+    let dir = std::env::var_os("GH_CONFIG_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("XDG_CONFIG_HOME").map(|d| std::path::PathBuf::from(d).join("gh"))
+        })
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config/gh"))
+        });
+    if let Some(dir) = dir
+        && let Ok(yml) = std::fs::read_to_string(dir.join("hosts.yml"))
+        && let Some(t) = hosts_yml_token(&yml, host)
+    {
+        return Ok(t);
+    }
+    bail!("no token for {host}: set GH_TOKEN or run `gh auth login`")
+}
+
+/// `oauth_token` of `host` in gh's hosts.yml (top-level host keys, indented fields).
+fn hosts_yml_token(yml: &str, host: &str) -> Option<String> {
+    let mut in_host = false;
+    for line in yml.lines() {
+        if !line.starts_with(' ') && !line.starts_with('\t') {
+            in_host = line.trim_end().trim_end_matches(':') == host;
+            continue;
+        }
+        if in_host && let Some(v) = line.trim().strip_prefix("oauth_token:") {
+            let v = v.trim().trim_matches('"').trim_matches('\'');
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// zalando/go-keyring stores secrets as `go-keyring-base64:<b64>` on macOS.
@@ -443,6 +477,18 @@ mod tests {
         let raw = format!(r#"{{"Header":{{"X-Github-Event":["pull_request"]}},"Body":"{body}"}}"#);
         let ev: WsEvent = serde_json::from_str(&raw).unwrap();
         assert_eq!(ev.event().unwrap(), None);
+    }
+
+    #[test]
+    fn reads_gh_hosts_yml() {
+        let yml = "github.com:\n    users:\n        onni:\n            oauth_token: gho_nested\n    oauth_token: gho_top\n    user: onni\nghe.corp:\n    oauth_token: \"gho_ghe\"\n";
+        // The first oauth_token under the host (older files have it top-level).
+        assert_eq!(
+            hosts_yml_token(yml, "github.com").as_deref(),
+            Some("gho_nested")
+        );
+        assert_eq!(hosts_yml_token(yml, "ghe.corp").as_deref(), Some("gho_ghe"));
+        assert_eq!(hosts_yml_token(yml, "other.host"), None);
     }
 
     #[test]

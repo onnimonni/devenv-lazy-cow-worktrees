@@ -16,6 +16,33 @@ $ echo $DATABASE_URL $REDIS_URL
 postgres://myapp-fix-login:4c1f…@127.0.0.1:55432/myapp_dev_fix_login redis://:myapp-fix-login@127.0.0.1:6380/0
 ```
 
+## Why
+
+[devenv](https://devenv.sh) is great for one checkout: `devenv up` and you have
+PostgreSQL, Redis and your processes. Coding agents changed the shape of the work:
+every task gets its own git worktree, often several at once, and devenv treats each
+worktree as a new project:
+
+- **Slow Nix evaluation per worktree.** Every new worktree is a new path, so
+  `devenv shell` / `devenv up` evaluates the whole Nix configuration again before
+  anything runs, for every task an agent starts. The evaluation is the slowest part
+  of spinning up a worktree, and it's repeated for work that is identical to the
+  primary checkout's.
+- **One stack per worktree.** Each worktree's `devenv up` wants its own PostgreSQL,
+  Redis and processes on the same ports as the primary's, with its own empty
+  database to migrate and seed.
+- **Shared git hooks.** Worktrees share `.git/hooks`; a worktree's devenv installs
+  a pre-commit hook pointing at *its* `.pre-commit-config.yaml`, and commits break
+  everywhere once that worktree is removed.
+
+This started as shell scripts in a Phoenix project's devenv (a shared RAM-disk
+PostgreSQL, hashed ports, `worktree-new` / `worktree-rm`) and became localforest:
+**devenv is evaluated once, in the primary checkout, and worktrees don't run devenv
+at all.** The daemon it starts gives every worktree what devenv would have: a
+database (a copy-on-write clone, in milliseconds), Redis, ports, HTTPS hostnames and
+the project's services, started on demand; the environment comes from
+`localforest env` or the worktree's `.env`.
+
 ## What it does
 
 | | |
@@ -46,7 +73,9 @@ Binaries for macOS (arm64) and Linux (x86_64) are on the
 `postgres`/`initdb` (18+) and `redis-server` from PATH unless told where they are
 (the devenv module does).
 
-## Install with devenv
+## Use with devenv
+
+**1. Import the module** in the primary checkout's `devenv.yaml`:
 
 ```yaml
 # devenv.yaml
@@ -57,6 +86,11 @@ inputs:
 imports:
   - localforest/devenv-module
 ```
+
+**2. Describe the project** in `devenv.nix`. The module adds localforest,
+PostgreSQL 18 and Redis to the shell, runs `localforest serve` as a devenv process,
+exports the checkout's environment in `enterShell`, and wires Claude Code's
+worktree hooks. Replace your own `services.postgres` / `services.redis` with it:
 
 ```nix
 # devenv.nix
@@ -78,15 +112,49 @@ imports:
 }
 ```
 
-`devenv up` in the primary checkout starts the daemon (or registers the project with
-the one already running; the first project to start it serves them all, and another
-takes over if it stops). Every shell, primary or worktree, gets the default
-service's environment from `eval "$(localforest env)"` (`localforest env -s api` for
-another's). Claude Code's `WorktreeCreate` / `WorktreeRemove` hooks go through the
-daemon, so `claude --worktree` and `isolation: worktree` subagents get provisioned
-worktrees.
+**3. Start it** with `devenv up` in the primary checkout. That starts the daemon, or
+registers the project with the one already running: one daemon serves every
+project, and another project's `devenv up` takes over if it stops.
 
-Trust the local CA once: `localforest trust` (macOS keychain, asks for your password).
+**4. Trust the local CA** once: `localforest trust` (macOS keychain, asks for your
+password), for `https://*.localhost`.
+
+**5. Point the app at the environment** instead of hard-coded settings:
+`DATABASE_URL`, `TEST_DATABASE_URL`, `REDIS_URL`, `PORT` (`PHX_HOST` is set when
+Phoenix is detected). For Ecto:
+
+```elixir
+# config/dev.exs
+config :myapp, MyApp.Repo, url: System.fetch_env!("DATABASE_URL"), pool_size: 10
+config :myapp, MyAppWeb.Endpoint, http: [port: String.to_integer(System.get_env("PORT", "4000"))]
+# config/test.exs
+config :myapp, MyApp.Repo, url: System.fetch_env!("TEST_DATABASE_URL"), pool: Ecto.Adapters.SQL.Sandbox
+```
+
+**6. Make worktrees** any way you like; each is provisioned the same:
+
+- Claude Code: `claude --worktree`, or subagents with `isolation: worktree` (the
+  module's `WorktreeCreate` / `WorktreeRemove` hooks)
+- `localforest worktree new fix-login` (prints the path)
+- plain `git worktree add .claude/worktrees/fix-login` (the build caches are
+  cloned in afterwards)
+
+**7. Work in a worktree without devenv.** Run commands from a shell that has the
+project's tools (the primary's `devenv shell`, or the agent's session started in
+it) and take the worktree's environment from `localforest env`:
+
+```console
+$ cd .claude/worktrees/fix-login && eval "$(localforest env)"
+$ mix test
+$ open "$LOCALFOREST_URL"      # https://fix-login.web.myapp.localhost, starts web
+```
+
+or let the app read the worktree's `.env`. Services started by localforest already
+get the project's `PATH` and the worktree's environment.
+
+**8. Language servers for agents:** `localforest.lsp.elixir = [ "dexter" "lsp" ];`
+adds `localforest-lsp-elixir`; use it as the command of Claude Code's `lspServers`,
+so one session gets answers from the worktree each file belongs to.
 
 | option | default | |
 |---|---|---|
@@ -212,7 +280,7 @@ localforest lsp -- <server> [args]
 |---|---|
 | 55432 | PostgreSQL proxy (the real server: `~/.local/state/localforest/pg/.s.PGSQL.55433`) |
 | 6380 | Redis proxy |
-| 443 / 80 | HTTPS proxy / redirect to HTTPS. Ports below 1024 bind all interfaces (unprivileged on macOS) and refuse non-loopback peers. |
+| 443 / 80 | HTTPS proxy / redirect to HTTPS where unprivileged processes may bind them (macOS; Linux, see below), else 8443 / off. Ports below 1024 bind all interfaces and refuse non-loopback peers. |
 
 All configurable (`--pg-port`, `--redis-port`, `--https-port`, `--http-port` or
 `LOCALFOREST_*`). State lives in `~/.local/state/localforest` (`LOCALFOREST_HOME`).
@@ -228,9 +296,33 @@ All configurable (`--pg-port`, `--redis-port`, `--https-port`, `--http-port` or
   redis-server, the migrate and service commands and language servers are also
   separate processes. Everything else (git, GitHub, certificates, keychain) is
   in-process.
-- Linux: works without the RAM disk; databases are still cloned copy-on-write on
-  btrfs / XFS (reflinks), plain copies elsewhere. `localforest.postgres.settings.file_copy_method = "copy"`
-  turns cloning off.
+- `localforest.postgres.settings.file_copy_method = "copy"` turns database cloning off.
+
+## Linux
+
+Everything works on Linux too (CI runs `tests/e2e.sh` on Ubuntu and macOS), with
+these differences:
+
+- **Ports 443 and 80.** Linux only lets root bind ports below
+  `net.ipv4.ip_unprivileged_port_start` (1024). localforest reads it: with it at 443
+  or lower you get `https://…localhost` on 443 (and the redirect on 80 at 80 or
+  lower), otherwise 8443. Lower it once:
+
+  ```sh
+  echo 'net.ipv4.ip_unprivileged_port_start = 80' | sudo tee /etc/sysctl.d/50-localforest.conf
+  sudo sysctl --system
+  ```
+
+  or on NixOS `boot.kernel.sysctl."net.ipv4.ip_unprivileged_port_start" = 80;`.
+  (`setcap cap_net_bind_service` doesn't survive a read-only Nix store or rebuilds.)
+- **No RAM disk:** PostgreSQL lives in `~/.local/state/localforest/pg`. Databases
+  are still cloned copy-on-write on btrfs / XFS (reflinks), plain copies elsewhere;
+  git-cow clones worktrees the same way.
+- **CA:** `localforest trust` is macOS only; add `~/.local/state/localforest/ca/ca.pem`
+  to the system (`sudo cp … /usr/local/share/ca-certificates/localforest.crt &&
+  sudo update-ca-certificates`) and the browser's store (`certutil -d sql:$HOME/.pki/nssdb
+  -A -t C,, -n localforest -i …/ca.pem`).
+- **GitHub token:** from `GH_TOKEN`, the keyring, or `gh`'s `~/.config/gh/hosts.yml`.
 
 ## Development
 
