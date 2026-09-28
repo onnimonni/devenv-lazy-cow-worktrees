@@ -800,6 +800,29 @@ fn merge_adds_nothing(repo: &Repository, c: &git2::Commit) -> Result<bool> {
     Ok(true)
 }
 
+/// When the worktree was made (its `.git` file's mtime), as unix seconds.
+pub fn created_at(info: &Info) -> Result<i64> {
+    let t = std::fs::symlink_metadata(info.path.join(".git"))?.modified()?;
+    Ok(t.duration_since(std::time::UNIX_EPOCH)?.as_secs() as i64)
+}
+
+/// Clock skew allowed between this machine and GitHub.
+const MERGE_GRACE_SECS: i64 = 300;
+
+/// Was the worktree made clearly (by [`MERGE_GRACE_SECS`]) before a PR merged at
+/// `merged_at`? Err when unknown or too close to call.
+pub fn made_before(info: &Info, merged_at: i64) -> Result<()> {
+    let made = created_at(info)?;
+    if made + MERGE_GRACE_SECS > merged_at {
+        bail!(
+            "{} was made {}s before the PR merged (or after); not the PR's worktree",
+            info.name,
+            merged_at - made
+        );
+    }
+    Ok(())
+}
+
 /// After a PR merged `branch` at `pr_head`: is everything in the worktree in it?
 pub fn covered_by_pr(info: &Info, pr_head: Oid, remote: &str, base: &str) -> Result<bool> {
     let repo = Repository::open(&info.path)?;
@@ -1487,6 +1510,23 @@ mod tests {
         assert!(!info.path.exists());
         assert!(repo.find_branch(&kept, BranchType::Local).is_ok());
         assert!(repo.find_branch("keep-me", BranchType::Local).is_err());
+    }
+
+    #[test]
+    fn knows_when_a_worktree_was_made() {
+        let (_d, project, syncer) = fixture();
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        create(&project, &syncer, "feat-x", None).unwrap();
+        let info = list(&project.root).unwrap().remove(0);
+        let t = created_at(&info).unwrap();
+        assert!((before - 1..=before + 60).contains(&t), "{t} vs {before}");
+        // Merged 10 minutes later: before. Within the clock-skew grace, or earlier: not.
+        assert!(made_before(&info, t + 600).is_ok());
+        assert!(made_before(&info, t + 60).is_err());
+        assert!(made_before(&info, t - 3600).is_err());
     }
 
     #[test]
