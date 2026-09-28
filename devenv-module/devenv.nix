@@ -205,9 +205,16 @@ in
       description = "Close a preview (a removed worktree recreated from its \"gone\" page) after this many hours without requests or database / Redis connections; 0 keeps previews until removed.";
     };
     httpsPort = mkOption {
-      type = types.port;
-      default = 443;
-      description = "HTTPS proxy port.";
+      type = types.nullOr types.port;
+      default = null;
+      example = 8443;
+      description = "HTTPS proxy port (default: 443 where unprivileged processes may bind it, i.e. macOS or Linux with net.ipv4.ip_unprivileged_port_start <= 443, else 8443).";
+    };
+    httpPort = mkOption {
+      type = types.nullOr types.port;
+      default = null;
+      example = 0;
+      description = "Plain HTTP port that redirects to HTTPS; 0 disables (default: 80 where unprivileged processes may bind it, else off).";
     };
     lsp = mkOption {
       type = types.attrsOf (types.listOf types.str);
@@ -239,7 +246,6 @@ in
 
     env = {
       LOCALFOREST_PORT = toString cfg.port;
-      LOCALFOREST_HTTPS_PORT = toString cfg.httpsPort;
       LOCALFOREST_SERVICES = builtins.toJSON cfg.services;
       LOCALFOREST_PREVIEW_TTL_HOURS = toString cfg.previewTtlHours;
       LOCALFOREST_RAMDISK_MB = toString cfg.postgres.ramdiskMB;
@@ -247,6 +253,8 @@ in
       LOCALFOREST_POSTGRES_SETTINGS = builtins.toJSON cfg.postgres.settings;
       LOCALFOREST_REDIS_SERVER = lib.getExe' cfg.redis "redis-server";
     }
+    // lib.optionalAttrs (cfg.httpsPort != null) { LOCALFOREST_HTTPS_PORT = toString cfg.httpsPort; }
+    // lib.optionalAttrs (cfg.httpPort != null) { LOCALFOREST_HTTP_PORT = toString cfg.httpPort; }
     // lib.optionalAttrs (cfg.project != null) { LOCALFOREST_PROJECT = cfg.project; }
     // lib.optionalAttrs (cfg.migrate != null) { LOCALFOREST_MIGRATE = cfg.migrate; }
     // lib.optionalAttrs (cfg.seed != null) { LOCALFOREST_SEED = cfg.seed; }
