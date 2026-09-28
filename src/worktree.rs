@@ -540,6 +540,35 @@ pub fn carry_caches(root: &Path, info: &Info) -> Result<bool> {
     Ok(true)
 }
 
+/// Uncommitted and untracked (not ignored) paths.
+pub fn uncommitted(path: &Path) -> Result<Vec<String>> {
+    let repo = Repository::open(path)?;
+    let mut opts = StatusOptions::new();
+    opts.include_untracked(true)
+        .include_ignored(false)
+        .exclude_submodules(true);
+    Ok(repo
+        .statuses(Some(&mut opts))?
+        .iter()
+        .filter(|e| e.status() != Status::CURRENT)
+        .filter_map(|e| e.path().ok().map(str::to_string))
+        .collect())
+}
+
+/// `a, b, c` (the first 20, then `…`).
+pub fn short_list(items: &[String]) -> String {
+    let mut s = items
+        .iter()
+        .take(20)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if items.len() > 20 {
+        s.push_str(", …");
+    }
+    s
+}
+
 pub fn is_dirty(path: &Path) -> Result<bool> {
     let repo = Repository::open(path)?;
     let mut opts = StatusOptions::new();
@@ -810,9 +839,10 @@ pub fn unpushed(info: &Info, remote: &str, base: &str) -> Result<usize> {
     ahead(&repo, head, &hidden, remote, base)
 }
 
-/// Move the worktree out of the way, drop git's metadata and its own branch, then
-/// delete the files in the background.
-pub fn remove_files(root: &Path, info: &Info) -> Result<()> {
+/// Move the worktree out of the way, drop git's metadata and its own branch (kept
+/// as `<name>-kept-<sha>` without `delete_branch`: Ok(Some(that name))), then delete
+/// the files in the background.
+pub fn remove_files(root: &Path, info: &Info, delete_branch: bool) -> Result<Option<String>> {
     let repo = Repository::open(root)?;
     let trash_dir = repo.commondir().join("localforest-trash");
     std::fs::create_dir_all(&trash_dir)?;
@@ -854,7 +884,7 @@ pub fn remove_files(root: &Path, info: &Info) -> Result<()> {
             .with_context(|| format!("moving {} away", info.path.display()))?;
     }
     // The worktree is gone now: the rest is tidying up, not worth failing over.
-    let tidy = || -> Result<()> {
+    let tidy = || -> Result<Option<String>> {
         if let Some(wt) = own.and_then(|n| repo.find_worktree(&n).ok())
             && wt.validate().is_err()
         {
@@ -873,20 +903,34 @@ pub fn remove_files(root: &Path, info: &Info) -> Result<()> {
             && *b == info.name
             && let Ok(mut branch) = repo.find_branch(b, BranchType::Local)
         {
-            branch.delete()?;
-            info!("deleted branch {b}");
+            if delete_branch {
+                branch.delete()?;
+                info!("deleted branch {b}");
+            } else {
+                // Out of the way, so a new worktree of the same name starts fresh.
+                let short = branch
+                    .get()
+                    .target()
+                    .map(|o| o.to_string()[..7].to_string())
+                    .unwrap_or_default();
+                let name = format!("{b}-kept-{short}");
+                branch.rename(&name, false)?;
+                warn!("kept branch {b} as {name}: it has commits that aren't merged or pushed");
+                return Ok(Some(name));
+            }
         }
-        Ok(())
+        Ok(None)
     };
-    if let Err(e) = tidy() {
+    let kept = tidy().unwrap_or_else(|e| {
         warn!("{}: cleaning up git metadata: {e:#}", info.name);
-    }
+        None
+    });
     std::thread::spawn(move || {
         if let Err(e) = std::fs::remove_dir_all(&trash) {
             warn!("removing {}: {e}", trash.display());
         }
     });
-    Ok(())
+    Ok(kept)
 }
 
 /// Prefix of a removed worktree moved next to itself (another volume than the git dir).
@@ -1226,7 +1270,8 @@ mod tests {
         assert!(safety(info, "origin", "main").is_err());
         std::fs::remove_file(path.join("c.txt")).unwrap();
 
-        remove_files(&project.root, info).unwrap();
+        assert_eq!(unpushed(info, "origin", "main").unwrap(), 1);
+        remove_files(&project.root, info, true).unwrap();
         assert!(!path.exists());
         assert!(list(&project.root).unwrap().is_empty());
         let repo = Repository::open(&project.root).unwrap();
@@ -1391,7 +1436,7 @@ mod tests {
         std::fs::rename(&away, away.with_file_name("away-unmounted")).unwrap();
         std::fs::remove_dir_all(&by_hand).unwrap();
 
-        remove_files(&project.root, find("gone")).unwrap();
+        remove_files(&project.root, find("gone"), true).unwrap();
         let wt = repo.find_worktree("away").unwrap();
         assert!(matches!(
             wt.is_locked().unwrap(),
@@ -1421,6 +1466,27 @@ mod tests {
         }
         assert!(!trash.exists() && !sibling.exists());
         assert!(keep.exists());
+    }
+
+    #[test]
+    fn removal_can_keep_the_branch() {
+        let (_d, project, syncer) = fixture();
+        let path = create(&project, &syncer, "keep-me", None).unwrap();
+        let info = list(&project.root).unwrap().remove(0);
+        assert_eq!(unpushed(&info, "origin", "main").unwrap(), 0);
+        std::fs::write(path.join("new.txt"), "x").unwrap();
+        std::fs::write(path.join("a.txt"), "changed").unwrap();
+        let mut dirty = uncommitted(&path).unwrap();
+        dirty.sort();
+        assert_eq!(dirty, vec!["a.txt", "new.txt"]);
+        let repo = Repository::open(&project.root).unwrap();
+        let head = repo.head().unwrap().target().unwrap().to_string();
+
+        let kept = remove_files(&project.root, &info, false).unwrap().unwrap();
+        assert_eq!(kept, format!("keep-me-kept-{}", &head[..7]));
+        assert!(!info.path.exists());
+        assert!(repo.find_branch(&kept, BranchType::Local).is_ok());
+        assert!(repo.find_branch("keep-me", BranchType::Local).is_err());
     }
 
     #[test]

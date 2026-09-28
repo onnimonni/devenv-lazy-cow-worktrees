@@ -961,7 +961,46 @@ impl Daemon {
         Ok(Some(number))
     }
 
-    /// Ok(warnings about what the removal deleted, for the caller).
+    /// Can the worktree's branch go (also after --force)? Only when every commit of
+    /// it is on the base branch, pushed, or in its merged PR.
+    async fn branch_disposable(&self, rt: &ProjectRt, info: &worktree::Info) -> bool {
+        let (remote, base, i) = (
+            rt.project.settings.remote.clone(),
+            rt.base.clone(),
+            info.clone(),
+        );
+        match tokio::task::spawn_blocking(move || worktree::unpushed(&i, &remote, &base)).await {
+            Ok(Ok(0)) => return true,
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => warn!("{}: counting unpushed commits: {e:#}", info.name),
+            Err(e) => warn!("{}: counting unpushed commits: {e}", info.name),
+        }
+        let (Some(gh), Some(branch)) = (&rt.gh, &info.branch) else {
+            return false;
+        };
+        let pr_head = match gh.merged_pr(branch).await {
+            Ok(Some((_, h))) => h,
+            Ok(None) => return false,
+            Err(e) => {
+                warn!("{branch}: looking up its merged PR: {e:#}");
+                return false;
+            }
+        };
+        let Ok(pr_head) = Oid::from_str(&pr_head) else {
+            return false;
+        };
+        // As remove_merged: the PR has it all, the base branch merged in aside.
+        let (remote, base, i) = (
+            rt.project.settings.remote.clone(),
+            rt.base.clone(),
+            info.clone(),
+        );
+        tokio::task::spawn_blocking(move || worktree::covered_by_pr(&i, pr_head, &remote, &base))
+            .await
+            .is_ok_and(|r| r.is_ok_and(|covered| covered))
+    }
+
+    /// Ok(warnings about what was lost or kept, for the caller).
     async fn remove_locked(
         &self,
         rt: &ProjectRt,
@@ -970,23 +1009,34 @@ impl Daemon {
         reason: history::Reason,
         pr: Option<u64>,
     ) -> Result<Vec<String>> {
+        let mut warnings = Vec::new();
         let head = Repository::open(&info.path)
             .ok()
             .and_then(|r| r.head().ok()?.target())
             .map(|o| o.to_string());
+        let p = info.path.clone();
+        if let Ok(Ok(files)) = tokio::task::spawn_blocking(move || worktree::uncommitted(&p)).await
+            && !files.is_empty()
+        {
+            let w = format!(
+                "{}: deleting uncommitted {}",
+                info.name,
+                worktree::short_list(&files)
+            );
+            warn!("{w}");
+            warnings.push(w);
+        }
         let (root, path) = (rt.project.root.clone(), info.path.clone());
         let lost = tokio::task::spawn_blocking(move || worktree::ignored_files(&root, &path))
             .await
             .ok()
             .and_then(Result::ok)
             .unwrap_or_default();
-        let mut warnings = Vec::new();
         if !lost.is_empty() {
             let w = format!(
-                "{}: deleting gitignored {}{}",
+                "{}: deleting gitignored {}",
                 info.name,
-                lost.iter().take(20).cloned().collect::<Vec<_>>().join(", "),
-                if lost.len() > 20 { ", …" } else { "" }
+                worktree::short_list(&lost)
             );
             warn!("{w}");
             warnings.push(w);
@@ -995,10 +1045,21 @@ impl Daemon {
         self.servers.stop_checkout(&c).await;
         // Whatever else runs there: a server started by hand, iex, watchers.
         worktree::kill_processes_in(&info.path, keep).await;
+        // Decided while the worktree (its HEAD) is still there.
+        let delete_branch = pr.is_some() || self.branch_disposable(rt, info).await;
         // Files first: if they can't move, the databases stay with them.
         let (root, i) = (rt.project.root.clone(), info.clone());
-        tokio::task::spawn_blocking(move || worktree::remove_files(&root, &i)).await??;
-        self.remember(rt, &info.name, info.branch.clone(), head, reason, pr, lost);
+        let kept =
+            tokio::task::spawn_blocking(move || worktree::remove_files(&root, &i, delete_branch))
+                .await??;
+        if let Some(k) = &kept {
+            warnings.push(format!(
+                "{}: kept its unmerged, unpushed commits as branch {k}",
+                info.name
+            ));
+        }
+        let branch = kept.or_else(|| info.branch.clone());
+        self.remember(rt, &info.name, branch, head, reason, pr, lost);
         if let Err(e) = self.deprovision(&c).await {
             // Still known: the next reconcile finds it gone and tries again.
             rt.recorded.lock().unwrap().insert(info.name.clone());
