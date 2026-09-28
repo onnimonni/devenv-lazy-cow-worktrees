@@ -138,6 +138,13 @@ pub fn create(
     if path.exists() {
         bail!("{} already exists", path.display());
     }
+    // E.g. git numbered a `feat` elsewhere's admin dir `feat1`.
+    if let Some(i) = list(root)?.iter().find(|i| i.name == name) {
+        bail!(
+            "worktree name {name} is taken by {} (its git admin dir); pick another name",
+            i.path.display()
+        );
+    }
 
     let repo = Repository::open(root)?;
     let branch_exists = repo.find_branch(name, BranchType::Local).is_ok();
@@ -884,6 +891,9 @@ mod tests {
         .unwrap();
         let err = create(&project, &syncer, "other", None).unwrap_err();
         assert!(err.to_string().contains("is worktree other-admin"), "{err}");
+        // A name git gave another worktree's admin dir.
+        let err = create(&project, &syncer, "dup1", None).unwrap_err();
+        assert!(err.to_string().contains("pick another name"), "{err}");
     }
 
     #[test]

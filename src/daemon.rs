@@ -391,6 +391,48 @@ impl Daemon {
         Ok(created)
     }
 
+    /// Upgrade: a worktree whose name changed when names started coming from git
+    /// admin dirs keeps its databases (renamed), role objects and preview record.
+    /// Skipped for anything another checkout (`others`) uses under that name.
+    async fn adopt_legacy(&self, rt: &ProjectRt, c: &Checkout, others: &[Checkout]) -> Result<()> {
+        let Some(old) = c.legacy() else {
+            return Ok(());
+        };
+        let taken = |db: &str| others.iter().any(|o| o.owns_db(db));
+        if others.iter().any(|o| {
+            o.id() == old.role
+                || (o.project == c.project && o.worktree.as_deref() == Some(old.name.as_str()))
+        }) {
+            return Ok(());
+        }
+        let dbs = self.pg.databases().await?;
+        for (from, to) in &old.dbs {
+            if from == to || !dbs.contains(from) || taken(from) {
+                continue;
+            }
+            if dbs.contains(to) {
+                self.pg.drop(from).await?;
+                info!("dropped {from}: {to} already exists");
+            } else {
+                self.pg.rename(from, to).await?;
+                info!("renamed database {from} to {to}");
+            }
+        }
+        for db in dbs.iter().filter(|d| old.owns_partition(d) && !taken(d)) {
+            self.pg.drop(db).await?;
+            info!("dropped old test database {db}");
+        }
+        self.pg.retire_role(&old.role, &c.id()).await?;
+        if let Some(new) = c.worktree.clone() {
+            history::History::update(&rt.project.root, |h| {
+                if let Some(p) = h.previews.remove(&old.name) {
+                    h.previews.entry(new).or_insert(p);
+                }
+            })?;
+        }
+        Ok(())
+    }
+
     /// A worktree seen for the first time: clone build caches into it when it was made
     /// by plain `git worktree add`, then run the setup command once.
     async fn prepare_new(&self, rt: &ProjectRt, info: &worktree::Info, c: &Checkout) {
@@ -555,6 +597,16 @@ impl Daemon {
                 }
                 match self.provision(c).await {
                     Ok(_) => {
+                        let others: Vec<Checkout> = self
+                            .checkouts()
+                            .into_iter()
+                            .map(|(_, c)| c)
+                            .chain(current.values().cloned())
+                            .filter(|o| o.path != c.path)
+                            .collect();
+                        if let Err(e) = self.adopt_legacy(rt, c, &others).await {
+                            warn!("worktree {name}: adopting its old databases: {e:#}");
+                        }
                         info!(
                             "worktree {name}: https://{} -> 127.0.0.1:{}",
                             c.host(),

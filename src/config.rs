@@ -459,6 +459,59 @@ impl Services {
     }
 }
 
+/// PostgreSQL's longest name (NAMEDATALEN - 1); it silently truncates longer ones.
+pub const PG_NAME_MAX: usize = 63;
+
+/// Longest infix a checkout's database names get: `_test_p<N>` of test partitions.
+const LONGEST_DB_INFIX: &str = "_test_p9999";
+
+fn short_hash(s: &str) -> String {
+    hex::encode(&Sha256::digest(s.as_bytes())[..4])
+}
+
+/// Every database and role name localforest makes: kept when it fits PostgreSQL's 63
+/// bytes, else cut and suffixed with a hash of the whole, so two long names can't
+/// truncate to the same one.
+pub fn pg_name(s: &str) -> String {
+    if s.len() <= PG_NAME_MAX {
+        return s.to_string();
+    }
+    let hash = short_hash(s);
+    let mut head = String::new();
+    for c in s.chars() {
+        if head.len() + c.len_utf8() > PG_NAME_MAX - hash.len() - 1 {
+            break;
+        }
+        head.push(c);
+    }
+    format!("{head}_{hash}")
+}
+
+/// A worktree's databases and role under its pre-upgrade name (`Checkout::legacy`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Legacy {
+    pub name: String,
+    pub role: String,
+    /// (old, new) dev and test databases.
+    pub dbs: [(String, String); 2],
+    test_prefix: String,
+    suffix: String,
+}
+
+impl Legacy {
+    /// Test partitions under the old name (dropped: tests recreate them).
+    pub fn owns_partition(&self, db: &str) -> bool {
+        let Some(mid) = db
+            .strip_prefix(&self.test_prefix)
+            .and_then(|r| r.strip_suffix(&self.suffix))
+        else {
+            return false;
+        };
+        let mid = mid.trim_start_matches('_').trim_start_matches('p');
+        !mid.is_empty() && mid.bytes().all(|b| b.is_ascii_digit())
+    }
+}
+
 /// One checkout (primary or worktree) of a project, with everything derived from it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Checkout {
@@ -481,11 +534,23 @@ impl Checkout {
         }
     }
 
+    /// `_<worktree>` of its database names, shortened (with a hash of the worktree)
+    /// where the longest name built from it, a `<prefix>_test_p<NNNN>_<wt>` partition,
+    /// would pass PostgreSQL's 63 bytes: its truncation would cut the end, where
+    /// worktrees differ.
     fn suffix(&self) -> String {
-        self.worktree
-            .as_deref()
-            .map(|w| format!("_{}", w.replace('-', "_")))
-            .unwrap_or_default()
+        let Some(w) = self.worktree.as_deref() else {
+            return String::new();
+        };
+        let full = format!("_{}", w.replace('-', "_"));
+        let room = PG_NAME_MAX.saturating_sub(self.db_prefix.len() + LONGEST_DB_INFIX.len());
+        if full.len() <= room {
+            return full;
+        }
+        let hash = short_hash(w);
+        let keep = room.saturating_sub(hash.len() + 1).max(1);
+        let head: String = full.chars().take(keep).collect();
+        format!("{}_{hash}", head.trim_end_matches('_'))
     }
 
     pub fn service(&self, name: &str) -> Option<&Service> {
@@ -528,16 +593,16 @@ impl Checkout {
     }
 
     pub fn dev_db(&self) -> String {
-        format!("{}_dev{}", self.db_prefix, self.suffix())
+        pg_name(&format!("{}_dev{}", self.db_prefix, self.suffix()))
     }
 
     pub fn test_db(&self) -> String {
-        format!("{}_test{}", self.db_prefix, self.suffix())
+        pg_name(&format!("{}_test{}", self.db_prefix, self.suffix()))
     }
 
     /// The project's template database, which worktrees' dev databases are cloned from.
     pub fn template_db(&self) -> String {
-        format!("{}_template", self.db_prefix)
+        pg_name(&format!("{}_template", self.db_prefix))
     }
 
     /// Databases this checkout owns: dev, test and MIX_TEST_PARTITION style
@@ -560,9 +625,39 @@ impl Checkout {
     /// Redis password that picks its redis-server behind the shared Redis port.
     pub fn id(&self) -> String {
         match &self.worktree {
-            Some(w) => format!("{}-{w}", self.project),
+            Some(w) => pg_name(&format!("{}-{w}", self.project)),
             None => self.project.clone(),
         }
+    }
+
+    /// Databases and role of this worktree under its name before worktree names
+    /// came from git admin dirs (`dns_label` of its directory), when that differs:
+    /// (old name, old role, (old, new) dev and test databases).
+    pub fn legacy(&self) -> Option<Legacy> {
+        let w = self.worktree.as_deref()?;
+        let old = dns_label(&self.path.file_name()?.to_string_lossy());
+        if old == w {
+            return None;
+        }
+        // The old code didn't shorten names; PostgreSQL truncated them.
+        let trunc = |s: String| s.chars().take(PG_NAME_MAX).collect::<String>();
+        let suffix = format!("_{}", old.replace('-', "_"));
+        Some(Legacy {
+            dbs: [
+                (
+                    trunc(format!("{}_dev{suffix}", self.db_prefix)),
+                    self.dev_db(),
+                ),
+                (
+                    trunc(format!("{}_test{suffix}", self.db_prefix)),
+                    self.test_db(),
+                ),
+            ],
+            role: trunc(format!("{}-{old}", self.project)),
+            test_prefix: format!("{}_test", self.db_prefix),
+            suffix,
+            name: old,
+        })
     }
 
     /// Key of a service's process and log.
@@ -889,6 +984,58 @@ mod tests {
         assert_eq!(co(None).test_db(), "my_app_test");
         let p = worktree_port("a", "b");
         assert!((20000..29000).contains(&p) && p.is_multiple_of(10));
+    }
+
+    #[test]
+    fn database_names_fit_postgres() {
+        let long = |p: &str, w: &str| Checkout {
+            project: p.into(),
+            db_prefix: p.replace('-', "_"),
+            ..co(Some(w))
+        };
+        let p = "a-project-name-of-thirty-two-chr";
+        assert_eq!(p.len(), 32);
+        let w1 = format!("{}-1", "w".repeat(30));
+        let w2 = format!("{}-2", "w".repeat(30));
+        let (a, b) = (long(p, &w1), long(p, &w2));
+        for c in [&a, &b] {
+            for db in [c.dev_db(), c.test_db(), c.id()] {
+                assert!(db.len() <= PG_NAME_MAX, "{db}");
+            }
+            // Partitions fit too, so PostgreSQL never truncates them.
+            let part = format!("{}_test_p9999{}", c.db_prefix, c.suffix());
+            assert!(part.len() <= PG_NAME_MAX, "{part}");
+            assert!(c.owns_db(&part) && c.owns_db(&c.dev_db()));
+        }
+        assert_ne!(a.dev_db(), b.dev_db());
+        assert_ne!(a.test_db(), b.test_db());
+        assert_ne!(a.id(), b.id());
+        assert!(!a.owns_db(&b.test_db()));
+        assert!(!a.owns_db(&format!("{}_test_p3{}", b.db_prefix, b.suffix())));
+        // Short names are unchanged.
+        assert_eq!(co(Some("wt")).dev_db(), "my_app_dev_wt");
+        assert_eq!(pg_name(&"x".repeat(63)), "x".repeat(63));
+        assert_eq!(pg_name(&"x".repeat(64)).len(), 63);
+        assert_ne!(pg_name(&"x".repeat(64)), pg_name(&"x".repeat(65)));
+    }
+
+    #[test]
+    fn legacy_names() {
+        let c = Checkout {
+            path: "/r/.claude/worktrees/Fix_It".into(),
+            ..co(Some(&worktree_label("Fix_It")))
+        };
+        let old = c.legacy().unwrap();
+        assert_eq!(old.name, "fix-it");
+        assert_eq!(old.role, "my-app-fix-it");
+        assert_eq!(old.dbs[0], ("my_app_dev_fix_it".into(), c.dev_db()));
+        assert!(old.owns_partition("my_app_test2_fix_it"));
+        assert!(!old.owns_partition("my_app_test_fix_it"));
+        let same = Checkout {
+            path: "/r/wt".into(),
+            ..co(Some("wt"))
+        };
+        assert!(same.legacy().is_none());
     }
 
     #[test]
