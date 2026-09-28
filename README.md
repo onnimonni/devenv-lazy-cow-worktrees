@@ -61,7 +61,8 @@ the project's services, started on demand; the environment comes from
 Removing a worktree SIGKILLs everything running in it (each service's process group,
 plus any process whose working directory or executable is inside it, with all
 descendants: the BEAM, esbuild, tailwind, node, …), stops its redis-server, drops
-its databases and role, deletes its branch and moves the files away for background
+its databases and role, deletes its branch (even `--force` keeps one with commits
+that aren't on the base branch, pushed, or merged at its HEAD) and moves the files away for background
 deletion.
 
 ## Install

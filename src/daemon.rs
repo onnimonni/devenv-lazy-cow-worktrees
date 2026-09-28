@@ -852,6 +852,38 @@ impl Daemon {
         Ok(Some(number))
     }
 
+    /// Can the worktree's branch go (also after --force)? Only when every commit of
+    /// it is on the base branch, pushed, or in a PR merged at exactly `head`.
+    async fn branch_disposable(
+        &self,
+        rt: &ProjectRt,
+        info: &worktree::Info,
+        head: Option<&str>,
+    ) -> bool {
+        let (remote, base, i) = (
+            rt.project.settings.remote.clone(),
+            rt.base.clone(),
+            info.clone(),
+        );
+        match tokio::task::spawn_blocking(move || worktree::unpushed(&i, &remote, &base)).await {
+            Ok(Ok(0)) => return true,
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => warn!("{}: counting unpushed commits: {e:#}", info.name),
+            Err(e) => warn!("{}: counting unpushed commits: {e}", info.name),
+        }
+        let (Some(gh), Some(branch), Some(head)) = (&rt.gh, &info.branch, head) else {
+            return false;
+        };
+        match gh.merged_pr(branch).await {
+            Ok(Some((_, pr_head))) => pr_head == head,
+            Ok(None) => false,
+            Err(e) => {
+                warn!("{branch}: looking up its merged PR: {e:#}");
+                false
+            }
+        }
+    }
+
     async fn remove_locked(
         &self,
         rt: &ProjectRt,
@@ -868,10 +900,12 @@ impl Daemon {
         self.servers.stop_checkout(&c).await;
         // Whatever else runs there: a server started by hand, iex, watchers.
         worktree::kill_processes_in(&info.path, keep).await;
+        let delete_branch = pr.is_some() || self.branch_disposable(rt, info, head.as_deref()).await;
         self.deprovision(&c).await?;
         rt.known.lock().unwrap().remove(&info.name);
         let (root, i) = (rt.project.root.clone(), info.clone());
-        tokio::task::spawn_blocking(move || worktree::remove_files(&root, &i)).await??;
+        tokio::task::spawn_blocking(move || worktree::remove_files(&root, &i, delete_branch))
+            .await??;
         self.remember(rt, &info.name, info.branch.clone(), head, reason, pr);
         info!("removed worktree {}", info.name);
         Ok(())

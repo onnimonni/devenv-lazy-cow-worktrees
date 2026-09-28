@@ -586,9 +586,29 @@ pub fn covered_by_pr(info: &Info, pr_head: Oid, remote: &str, base: &str) -> Res
     Ok(ahead(&repo, head, &hidden, remote, base)? == 0)
 }
 
-/// Move the worktree out of the way, drop git's metadata and its own branch, then
-/// delete the files in the background.
-pub fn remove_files(root: &Path, info: &Info) -> Result<()> {
+/// Own commits of the worktree's HEAD that are neither on the base branch (local or
+/// remote) nor pushed to its branch on `remote`: deleting the branch would lose them.
+pub fn unpushed(info: &Info, remote: &str, base: &str) -> Result<usize> {
+    let repo = Repository::open(&info.path)?;
+    let head = repo.head()?.peel_to_commit()?.id();
+    let mut refs = vec![
+        format!("refs/heads/{base}"),
+        format!("refs/remotes/{remote}/{base}"),
+    ];
+    if let Some(b) = &info.branch {
+        refs.push(format!("refs/remotes/{remote}/{b}"));
+    }
+    let hidden: Vec<Oid> = refs
+        .iter()
+        .filter_map(|r| repo.find_reference(r).ok()?.peel_to_commit().ok())
+        .map(|c| c.id())
+        .collect();
+    ahead(&repo, head, &hidden, remote, base)
+}
+
+/// Move the worktree out of the way, drop git's metadata and (with `delete_branch`)
+/// its own branch, then delete the files in the background.
+pub fn remove_files(root: &Path, info: &Info, delete_branch: bool) -> Result<()> {
     let repo = Repository::open(root)?;
     let trash_dir = repo.commondir().join("localforest-trash");
     std::fs::create_dir_all(&trash_dir)?;
@@ -620,8 +640,12 @@ pub fn remove_files(root: &Path, info: &Info) -> Result<()> {
         && *b == info.name
         && let Ok(mut branch) = repo.find_branch(b, BranchType::Local)
     {
-        branch.delete()?;
-        info!("deleted branch {b}");
+        if delete_branch {
+            branch.delete()?;
+            info!("deleted branch {b}");
+        } else {
+            warn!("kept branch {b}: it has commits that aren't merged or pushed");
+        }
     }
     std::thread::spawn(move || {
         if let Err(e) = std::fs::remove_dir_all(&trash) {
@@ -864,13 +888,26 @@ mod tests {
         assert!(safety(info, "origin", "main").is_err());
         std::fs::remove_file(path.join("c.txt")).unwrap();
 
-        remove_files(&project.root, info).unwrap();
+        assert_eq!(unpushed(info, "origin", "main").unwrap(), 1);
+        remove_files(&project.root, info, true).unwrap();
         assert!(!path.exists());
         assert!(list(&project.root).unwrap().is_empty());
         let repo = Repository::open(&project.root).unwrap();
         assert!(repo.find_branch("feat-x", BranchType::Local).is_err());
         // Can be created again.
         create(&project, &syncer, "feat-x", None).unwrap();
+    }
+
+    #[test]
+    fn removal_can_keep_the_branch() {
+        let (_d, project, syncer) = fixture();
+        create(&project, &syncer, "keep-me", None).unwrap();
+        let info = list(&project.root).unwrap().remove(0);
+        assert_eq!(unpushed(&info, "origin", "main").unwrap(), 0);
+        remove_files(&project.root, &info, false).unwrap();
+        assert!(!info.path.exists());
+        let repo = Repository::open(&project.root).unwrap();
+        assert!(repo.find_branch("keep-me", BranchType::Local).is_ok());
     }
 
     #[test]
