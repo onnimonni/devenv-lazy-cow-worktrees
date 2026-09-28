@@ -439,10 +439,13 @@ impl Postgres {
     }
 
     /// Replace `dst` with a clone of `src`, closing `src`'s connections (PostgreSQL
-    /// refuses to copy a database in use; clients reconnect). Objects in the clone
-    /// belong to the NOLOGIN role named `dst` (`ensure_owner_role`), not to `src`'s
-    /// owner: clones of `dst` hand them to their checkout's role (`adopt`).
-    pub async fn snapshot(&self, src: &str, dst: &str) -> Result<()> {
+    /// refuses to copy a database in use; clients reconnect). The clone is built as
+    /// `<dst>_next`, its objects given to the NOLOGIN role named `dst`
+    /// (`ensure_owner_role`), not `src`'s owner: clones of `dst` hand them to their
+    /// checkout's role (`adopt`). Only then are the old `dst` dropped and the new one
+    /// renamed in, holding `lock` (the one clones of `dst` are made under), so a clone
+    /// never finds `dst` missing.
+    pub async fn snapshot(&self, src: &str, dst: &str, lock: &Mutex<()>) -> Result<()> {
         let tmp = format!("{dst}_next");
         self.drop(&tmp).await?;
         let mut last = None;
@@ -465,6 +468,7 @@ impl Postgres {
             self.ensure_owner_role(dst).await?;
             self.adopt(&tmp, &from, dst).await?;
         }
+        let _g = lock.lock().await;
         self.drop(dst).await?;
         self.admin()
             .await?
@@ -580,7 +584,9 @@ mod tests {
             .await
             .unwrap();
 
-        pg.snapshot("app_dev", "app_template").await.unwrap();
+        pg.snapshot("app_dev", "app_template", &Mutex::new(()))
+            .await
+            .unwrap();
         assert_eq!(owners(&pg, "app_template").await, ["app_template"]);
         // REASSIGN OWNED moved the primary's databases too; they were handed back.
         assert_eq!(pg.owner("app_dev").await.unwrap().as_deref(), Some("app"));
