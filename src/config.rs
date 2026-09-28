@@ -318,11 +318,20 @@ impl Project {
         self.root.join(&self.settings.worktrees_dir)
     }
 
+    /// A worktree's port is the one recorded in its git admin dir (the daemon records
+    /// them, `worktree::assign_ports`), else its hashed slot. Reads only: `localforest
+    /// env` computes an unrecorded one with `worktree::plan_ports` first.
     pub fn checkout(&self, worktree: Option<&str>, path: PathBuf) -> Checkout {
         let port = match worktree {
             None => self.settings.port,
-            Some(w) => worktree_port(&self.name, w),
+            Some(w) => crate::worktree::recorded_port(&path)
+                .unwrap_or_else(|| worktree_port(&self.name, w)),
         };
+        self.checkout_on(worktree, path, port)
+    }
+
+    /// `checkout` with a given base port.
+    pub fn checkout_on(&self, worktree: Option<&str>, path: PathBuf, port: u16) -> Checkout {
         Checkout {
             project: self.name.clone(),
             db_prefix: self.db_prefix(),
@@ -334,11 +343,17 @@ impl Project {
     }
 }
 
-/// 20000-28990 in steps of 10, from a hash of project and worktree: every tool can
-/// compute it. The worktree's services use this port and the 9 above it.
+/// Worktree base ports: 900 slots of 10 (a worktree's services use its base port and
+/// the 9 above it).
+pub const WORKTREE_PORTS: std::ops::Range<u16> = 20000..29000;
+
+/// A worktree's first-choice slot, from a hash of project and worktree. Its actual
+/// port is recorded in its git admin dir by `worktree::port`, which moves on to the
+/// next free slot when another worktree has this one.
 pub fn worktree_port(project: &str, worktree: &str) -> u16 {
     let h = Sha256::digest(format!("{project}/{worktree}").as_bytes());
-    20000 + (u32::from_be_bytes([h[0], h[1], h[2], h[3]]) % 900) as u16 * 10
+    let slots = u32::from(WORKTREE_PORTS.end - WORKTREE_PORTS.start) / 10;
+    WORKTREE_PORTS.start + (u32::from_be_bytes([h[0], h[1], h[2], h[3]]) % slots) as u16 * 10
 }
 
 fn yes() -> bool {

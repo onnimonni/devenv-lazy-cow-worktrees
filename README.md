@@ -205,7 +205,7 @@ needed), e.g. for services `web` (default), `api` and
 
 | | primary | worktree `fix-login` |
 |---|---|---|
-| `PORT` | base (`localforest.port`) + offset | base (20000–28990, hashed from the name) + offset |
+| `PORT` | base (`localforest.port`) + offset | base (20000–28990: hashed from the name, else the next slot no other worktree has; recorded in its git admin dir as `localforest-port`) + offset |
 | `LOCALFOREST_URL` | `web.myapp.localhost` | `fix-login.web.myapp.localhost` |
 | `DATABASE_URL`, `PG*` | `myapp_dev` as role `myapp` | `myapp_dev_fix_login` as role `myapp-fix-login` |
 | `TEST_DATABASE_URL` | `myapp_test` | `myapp_test_fix_login` |

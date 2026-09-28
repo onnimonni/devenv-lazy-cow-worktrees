@@ -17,7 +17,7 @@
 //! with the running one, then takes over if that one goes away.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -143,6 +143,23 @@ fn load_saved() -> Saved {
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default()
+}
+
+/// Projects the daemon registered (its saved state), for tools that run without it.
+pub fn registered_projects() -> Vec<Project> {
+    load_saved().projects
+}
+
+/// Checkout of worktree `i` on its port from `worktree::assign_ports` / `plan_ports`.
+pub fn checkout_with(
+    project: &Project,
+    i: &worktree::Info,
+    ports: &HashMap<PathBuf, u16>,
+) -> Checkout {
+    match ports.get(&i.path) {
+        Some(&port) => project.checkout_on(Some(&i.name), i.path.clone(), port),
+        None => project.checkout(Some(&i.name), i.path.clone()),
+    }
 }
 
 // ---------- status types shared with the CLI
@@ -594,14 +611,10 @@ impl Daemon {
         if !initializing.is_empty() {
             rt.trigger(&rt.pending.reconcile);
         }
+        let ports = self.assign_ports().await?;
         let current: BTreeMap<String, Checkout> = infos
             .iter()
-            .map(|i| {
-                (
-                    i.name.clone(),
-                    rt.project.checkout(Some(&i.name), i.path.clone()),
-                )
-            })
+            .map(|i| (i.name.clone(), checkout_with(&rt.project, i, &ports)))
             .collect();
         let known = rt.known.lock().unwrap().clone();
         for (name, c) in &current {
@@ -728,12 +741,13 @@ impl Daemon {
             worktree::create(&project, &syncer, &n, base.as_deref())
         })
         .await??;
-        let c = rt.project.checkout(Some(name), path.clone());
         let info = worktree::Info {
             name: name.to_string(),
             path: path.clone(),
             branch: Some(name.to_string()),
         };
+        let ports = self.assign_ports().await?;
+        let c = checkout_with(&rt.project, &info, &ports);
         self.prepare_new(rt, &info, &c).await;
         self.provision(&c).await?;
         rt.known.lock().unwrap().insert(name.to_string(), c.clone());
@@ -1391,6 +1405,21 @@ impl Daemon {
                 self.servers.restart(&id).await;
             }
         }
+    }
+
+    /// Record the ports of new worktrees of every registered project
+    /// (`worktree::assign_ports`); every worktree's port by path.
+    async fn assign_ports(&self) -> Result<HashMap<PathBuf, u16>> {
+        let projects: Vec<Project> = self
+            .projects
+            .lock()
+            .unwrap()
+            .values()
+            .map(|rt| rt.project.clone())
+            .collect();
+        let ports =
+            tokio::task::spawn_blocking(move || worktree::assign_ports(&projects)).await??;
+        Ok(ports.into_iter().collect())
     }
 
     /// Every checkout (primary and worktrees) of every project.
