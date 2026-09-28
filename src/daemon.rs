@@ -781,7 +781,7 @@ impl Daemon {
         Ok(())
     }
 
-    async fn remove_worktree(&self, req: RemoveReq) -> Result<()> {
+    async fn remove_worktree(&self, req: RemoveReq) -> Result<Vec<String>> {
         let rt = self.project(&req.root)?;
         let _g = rt.lock.lock().await;
         let root = rt.project.root.clone();
@@ -853,13 +853,8 @@ impl Daemon {
     }
 
     /// Can the worktree's branch go (also after --force)? Only when every commit of
-    /// it is on the base branch, pushed, or in a PR merged at exactly `head`.
-    async fn branch_disposable(
-        &self,
-        rt: &ProjectRt,
-        info: &worktree::Info,
-        head: Option<&str>,
-    ) -> bool {
+    /// it is on the base branch, pushed, or in its merged PR.
+    async fn branch_disposable(&self, rt: &ProjectRt, info: &worktree::Info) -> bool {
         let (remote, base, i) = (
             rt.project.settings.remote.clone(),
             rt.base.clone(),
@@ -871,19 +866,32 @@ impl Daemon {
             Ok(Err(e)) => warn!("{}: counting unpushed commits: {e:#}", info.name),
             Err(e) => warn!("{}: counting unpushed commits: {e}", info.name),
         }
-        let (Some(gh), Some(branch), Some(head)) = (&rt.gh, &info.branch, head) else {
+        let (Some(gh), Some(branch)) = (&rt.gh, &info.branch) else {
             return false;
         };
-        match gh.merged_pr(branch).await {
-            Ok(Some((_, pr_head))) => pr_head == head,
-            Ok(None) => false,
+        let pr_head = match gh.merged_pr(branch).await {
+            Ok(Some((_, h))) => h,
+            Ok(None) => return false,
             Err(e) => {
                 warn!("{branch}: looking up its merged PR: {e:#}");
-                false
+                return false;
             }
-        }
+        };
+        let Ok(pr_head) = Oid::from_str(&pr_head) else {
+            return false;
+        };
+        // As remove_merged: the PR has it all, the base branch merged in aside.
+        let (remote, base, i) = (
+            rt.project.settings.remote.clone(),
+            rt.base.clone(),
+            info.clone(),
+        );
+        tokio::task::spawn_blocking(move || worktree::covered_by_pr(&i, pr_head, &remote, &base))
+            .await
+            .is_ok_and(|r| r.is_ok_and(|covered| covered))
     }
 
+    /// Ok(warnings about what was lost or kept, for the caller).
     async fn remove_locked(
         &self,
         rt: &ProjectRt,
@@ -891,24 +899,45 @@ impl Daemon {
         keep: &[i32],
         reason: history::Reason,
         pr: Option<u64>,
-    ) -> Result<()> {
+    ) -> Result<Vec<String>> {
+        let mut warnings = Vec::new();
         let head = Repository::open(&info.path)
             .ok()
             .and_then(|r| r.head().ok()?.target())
             .map(|o| o.to_string());
+        let p = info.path.clone();
+        if let Ok(Ok(files)) = tokio::task::spawn_blocking(move || worktree::uncommitted(&p)).await
+            && !files.is_empty()
+        {
+            let w = format!(
+                "{}: deleting uncommitted {}",
+                info.name,
+                worktree::short_list(&files)
+            );
+            warn!("{w}");
+            warnings.push(w);
+        }
         let c = rt.project.checkout(Some(&info.name), info.path.clone());
         self.servers.stop_checkout(&c).await;
         // Whatever else runs there: a server started by hand, iex, watchers.
         worktree::kill_processes_in(&info.path, keep).await;
-        let delete_branch = pr.is_some() || self.branch_disposable(rt, info, head.as_deref()).await;
+        let delete_branch = pr.is_some() || self.branch_disposable(rt, info).await;
         self.deprovision(&c).await?;
         rt.known.lock().unwrap().remove(&info.name);
         let (root, i) = (rt.project.root.clone(), info.clone());
-        tokio::task::spawn_blocking(move || worktree::remove_files(&root, &i, delete_branch))
-            .await??;
-        self.remember(rt, &info.name, info.branch.clone(), head, reason, pr);
+        let kept =
+            tokio::task::spawn_blocking(move || worktree::remove_files(&root, &i, delete_branch))
+                .await??;
+        if let Some(k) = &kept {
+            warnings.push(format!(
+                "{}: kept its unmerged, unpushed commits as branch {k}",
+                info.name
+            ));
+        }
+        let branch = kept.or_else(|| info.branch.clone());
+        self.remember(rt, &info.name, branch, head, reason, pr);
         info!("removed worktree {}", info.name);
-        Ok(())
+        Ok(warnings)
     }
 
     /// Remove every worktree whose branch's PR merged with nothing left unmerged
@@ -1475,8 +1504,8 @@ fn api(d: Arc<Daemon>) -> Router {
         .route(
             "/worktrees/remove",
             post(|State(d): State<Arc<Daemon>>, Json(r): Json<RemoveReq>| async move {
-                d.remove_worktree(r).await?;
-                ApiResult::Ok(Json(serde_json::json!({})))
+                let warnings = d.remove_worktree(r).await?;
+                ApiResult::Ok(Json(serde_json::json!({ "warnings": warnings })))
             }),
         )
         .route(

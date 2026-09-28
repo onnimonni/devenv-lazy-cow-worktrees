@@ -62,7 +62,8 @@ Removing a worktree SIGKILLs everything running in it (each service's process gr
 plus any process whose working directory or executable is inside it, with all
 descendants: the BEAM, esbuild, tailwind, node, …), stops its redis-server, drops
 its databases and role, deletes its branch (even `--force` keeps one with commits
-that aren't on the base branch, pushed, or merged at its HEAD) and moves the files away for background
+that aren't on the base branch, pushed, or in its merged PR, renamed to
+`<name>-kept-<sha>`; uncommitted files it deletes are listed) and moves the files away for background
 deletion.
 
 ## Install
