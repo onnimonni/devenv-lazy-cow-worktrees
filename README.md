@@ -255,7 +255,8 @@ worktree back at the commit it was at (fetched from the remote or the pull reque
 head if it's no longer local), with a fresh copy of the template database, and sends
 you back to the page, whose service then starts on demand. A preview isn't
 auto-removed for its merged pull request; it closes after `localforest.previewTtlHours`
-(48) without requests or database / Redis connections, and the page shows the
+(48) without requests or database / Redis connections (kept while it has work
+`worktree rm` without `--force` would refuse to lose), and the page shows the
 original reason again.
 
 ## Commands

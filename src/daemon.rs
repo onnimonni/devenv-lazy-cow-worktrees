@@ -767,6 +767,17 @@ impl Daemon {
             let Some(info) = infos.iter().find(|i| i.name == name) else {
                 continue;
             };
+            // Like `worktree rm` without --force: edits or new commits keep it open.
+            if let Err(e) = self.check_removable(rt, info).await {
+                info!("keeping idle preview {name}: {e:#}");
+                // Ask again after another TTL, not every minute.
+                history::History::update(&rt.project.root, |h| {
+                    if let Some(p) = h.previews.get_mut(&name) {
+                        p.last_active = now;
+                    }
+                })?;
+                continue;
+            }
             info!(
                 "closing preview {name}: no activity for {} h",
                 rt.project.settings.preview_ttl_hours
