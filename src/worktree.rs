@@ -16,7 +16,7 @@ use git2::{BranchType, Oid, Repository, Status, StatusOptions, WorktreePruneOpti
 use tracing::{info, warn};
 
 use crate::{
-    config::{Project, dns_label, valid_label},
+    config::{Project, valid_label, worktree_label},
     sync::Syncer,
 };
 
@@ -41,7 +41,7 @@ pub fn list(root: &Path) -> Result<Vec<Info>> {
         let Ok(path) = wt.path().canonicalize() else {
             continue;
         };
-        let name = dns_label(&path.file_name().unwrap_or_default().to_string_lossy());
+        let name = worktree_label(admin);
         if out.iter().any(|i| i.name == name) {
             warn!(
                 "worktree {} has the same name as another one ({name}); skipping it",
@@ -125,11 +125,15 @@ pub fn create(
     let path = dir.join(name);
     if path.join(".git").exists() {
         let existing = path.canonicalize()?;
-        if list(root)?.iter().any(|i| i.path == existing) {
-            info!("worktree {name} already exists");
-            return Ok(existing);
+        // Only the worktree of this very name: never hand out another's checkout.
+        match list(root)?.iter().find(|i| i.path == existing) {
+            Some(i) if i.name == name => {
+                info!("worktree {name} already exists");
+                return Ok(existing);
+            }
+            Some(i) => bail!("{} is worktree {}, not {name}", path.display(), i.name),
+            None => bail!("{} exists and is not a worktree", path.display()),
         }
-        bail!("{} exists and is not a worktree", path.display());
     }
     if path.exists() {
         bail!("{} already exists", path.display());
@@ -817,6 +821,69 @@ mod tests {
             token_host: "github.com".into(),
         };
         (dir, project, syncer)
+    }
+
+    #[test]
+    fn names_are_unique() {
+        let (d, project, syncer) = fixture();
+        // Long requested names that share their first 32 characters get their own.
+        let long = "implement-the-very-long-feature-name";
+        let a = create(
+            &project,
+            &syncer,
+            &worktree_label(&format!("{long} one")),
+            None,
+        )
+        .unwrap();
+        let b = create(
+            &project,
+            &syncer,
+            &worktree_label(&format!("{long} two")),
+            None,
+        )
+        .unwrap();
+        assert_ne!(a, b);
+
+        // Same directory name elsewhere (plain `git worktree add`): git numbers the
+        // admin dir, and list and `localforest env` agree on the name.
+        let repo = Repository::open(&project.root).unwrap();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        for (admin, dir) in [("dup", "x"), ("dup1", "y")] {
+            let branch = repo.branch(admin, &head, false).unwrap();
+            let r = branch.into_reference();
+            std::fs::create_dir_all(d.path().join(dir)).unwrap();
+            repo.worktree(
+                admin,
+                &d.path().join(dir).join("dup"),
+                Some(WorktreeAddOptions::new().reference(Some(&r))),
+            )
+            .unwrap();
+        }
+        let infos = list(&project.root).unwrap();
+        let mut names: Vec<&str> = infos.iter().map(|i| i.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names.len(), 4, "{names:?}");
+        assert!(names.contains(&"dup") && names.contains(&"dup1"));
+        for i in &infos {
+            let (_, name, _) = crate::config::locate(&i.path).unwrap();
+            assert_eq!(name.as_deref(), Some(i.name.as_str()));
+        }
+
+        // A directory holding another worktree is never handed out under a new name.
+        std::fs::create_dir_all(project.worktrees_dir()).unwrap();
+        let taken = project.worktrees_dir().join("other");
+        let r = repo
+            .branch("other-branch", &head, false)
+            .unwrap()
+            .into_reference();
+        repo.worktree(
+            "other-admin",
+            &taken,
+            Some(WorktreeAddOptions::new().reference(Some(&r))),
+        )
+        .unwrap();
+        let err = create(&project, &syncer, "other", None).unwrap_err();
+        assert!(err.to_string().contains("is worktree other-admin"), "{err}");
     }
 
     #[test]

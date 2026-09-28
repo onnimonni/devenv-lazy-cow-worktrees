@@ -255,6 +255,20 @@ pub fn dns_label(s: &str) -> String {
     if out.is_empty() { "x".into() } else { out }
 }
 
+/// Name of a worktree, from its git admin directory name (`.git/worktrees/<name>`),
+/// which is unique in the repository: git names it after the worktree's directory and
+/// numbers repeats. Kept as is when it is already a DNS label; otherwise normalized,
+/// shortened and suffixed with a hash of the original, so two worktrees never share a
+/// name (and with it hostnames, databases, role, Redis and ports).
+pub fn worktree_label(name: &str) -> String {
+    if valid_label(name) {
+        return name.to_string();
+    }
+    let hash = hex::encode(&Sha256::digest(name.as_bytes())[..3]);
+    let base: String = dns_label(name).chars().take(32 - 1 - hash.len()).collect();
+    format!("{}-{hash}", base.trim_end_matches('-'))
+}
+
 pub fn valid_label(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 32
@@ -696,8 +710,9 @@ pub fn locate(path: &Path) -> Result<(PathBuf, Option<String>, PathBuf)> {
     if top == root {
         return Ok((root, None, top));
     }
-    let name = dns_label(&top.file_name().unwrap_or_default().to_string_lossy());
-    Ok((root, Some(name), top))
+    // A linked worktree's git dir is `<common>/worktrees/<admin name>`.
+    let admin = repo.path().file_name().context("worktree git dir")?;
+    Ok((root, Some(worktree_label(&admin.to_string_lossy())), top))
 }
 
 #[cfg(test)]
@@ -857,6 +872,17 @@ mod tests {
     #[test]
     fn names() {
         assert_eq!(dns_label("Fix Login_Bug!"), "fix-login-bug");
+        assert_eq!(worktree_label("fix-login-bug"), "fix-login-bug");
+        // Names that aren't labels get a hash, so they can't meet another's label.
+        let a = worktree_label("Fix Login_Bug!");
+        assert!(valid_label(&a) && a.starts_with("fix-login-bug-"), "{a}");
+        assert_ne!(a, worktree_label("fix login bug"));
+        let long = "a-very-long-task-name-that-goes-past-32-characters";
+        let x = worktree_label(&format!("{long}-one"));
+        let y = worktree_label(&format!("{long}-two"));
+        assert!(valid_label(&x) && valid_label(&y) && x != y, "{x} {y}");
+        assert_eq!(x, worktree_label(&format!("{long}-one")));
+        assert!(valid_label(&worktree_label("---")));
         assert_eq!(co(None).host(), "my-app.localhost");
         assert_eq!(co(Some("fix-it")).host(), "fix-it.my-app.localhost");
         assert_eq!(co(Some("fix-it")).dev_db(), "my_app_dev_fix_it");

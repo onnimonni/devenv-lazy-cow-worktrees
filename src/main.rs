@@ -413,7 +413,7 @@ async fn main() -> Result<()> {
             match h {
                 HookCmd::WorktreeCreate => {
                     let name = v["name"].as_str().context("no name in hook input")?;
-                    let r = create(root_of(&dir)?, config::dns_label(name), None).await?;
+                    let r = create(root_of(&dir)?, config::worktree_label(name), None).await?;
                     println!("{}", r.path.display());
                 }
                 HookCmd::WorktreeRemove => {
