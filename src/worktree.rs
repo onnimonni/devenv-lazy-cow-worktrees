@@ -16,7 +16,7 @@ use git2::{BranchType, Oid, Repository, Status, StatusOptions, WorktreePruneOpti
 use tracing::{info, warn};
 
 use crate::{
-    config::{Project, dns_label, valid_label},
+    config::{self, Project, valid_label, worktree_label},
     sync::Syncer,
 };
 
@@ -41,7 +41,7 @@ pub fn list(root: &Path) -> Result<Vec<Info>> {
         let Ok(path) = wt.path().canonicalize() else {
             continue;
         };
-        let name = dns_label(&path.file_name().unwrap_or_default().to_string_lossy());
+        let name = worktree_label(admin);
         if out.iter().any(|i| i.name == name) {
             warn!(
                 "worktree {} has the same name as another one ({name}); skipping it",
@@ -61,6 +61,97 @@ pub fn list(root: &Path) -> Result<Vec<Info>> {
         out.push(Info { name, path, branch });
     }
     Ok(out)
+}
+
+/// The worktree's base port, recorded in its git admin dir (gone with it).
+const PORT_FILE: &str = "localforest-port";
+
+/// Admin dir of the worktree at `path`, from its `.git` file (`gitdir: <dir>`),
+/// without opening the repository.
+fn admin_dir(path: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(path.join(".git")).ok()?;
+    let dir = Path::new(text.strip_prefix("gitdir:")?.trim());
+    Some(path.join(dir))
+}
+
+/// The base port recorded in the worktree's git admin dir.
+pub fn recorded_port(path: &Path) -> Option<u16> {
+    let p: u16 = std::fs::read_to_string(admin_dir(path)?.join(PORT_FILE))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    (config::WORKTREE_PORTS.contains(&p) && p.is_multiple_of(10)).then_some(p)
+}
+
+/// First free slot from `name`'s hashed one on (linear probing, wrapping).
+fn probe(project: &str, name: &str, used: &HashSet<u16>) -> u16 {
+    let first = config::worktree_port(project, name);
+    let slots = config::WORKTREE_PORTS.len() as u16 / 10;
+    (0..slots)
+        .map(|k| {
+            let slot = ((first - config::WORKTREE_PORTS.start) / 10 + k) % slots;
+            config::WORKTREE_PORTS.start + slot * 10
+        })
+        .find(|p| !used.contains(p))
+        .unwrap_or(first)
+}
+
+/// Base port of every worktree of `projects` (all registered ones: the daemon's, or
+/// `state.json` for `localforest env`), by path. Recorded ports hold; the others
+/// get, in order of (project root, name), the first slot from their hashed one that
+/// no primary, recorded or earlier worktree has. Pure: the daemon and `localforest
+/// env` get the same answer from the same projects and admin dirs.
+pub fn plan_ports(projects: &[Project]) -> Result<Vec<(PathBuf, u16, bool)>> {
+    let mut used: HashSet<u16> = projects.iter().map(|p| p.settings.port).collect();
+    let mut recorded = Vec::new();
+    let mut open = Vec::new();
+    let mut projects: Vec<&Project> = projects.iter().collect();
+    projects.sort_by(|a, b| a.root.cmp(&b.root));
+    for p in projects {
+        let mut infos = list(&p.root)?;
+        infos.sort_by(|a, b| a.name.cmp(&b.name));
+        for i in infos {
+            match recorded_port(&i.path) {
+                Some(port) => {
+                    if !used.insert(port) {
+                        warn!(
+                            "worktree {} shares port {port} with another",
+                            i.path.display()
+                        );
+                    }
+                    recorded.push((i.path, port, true));
+                }
+                None => open.push((p.name.clone(), i)),
+            }
+        }
+    }
+    for (project, i) in open {
+        let port = probe(&project, &i.name, &used);
+        used.insert(port);
+        recorded.push((i.path, port, false));
+    }
+    Ok(recorded)
+}
+
+/// Serializes recording (the daemon's projects reconcile concurrently).
+static RECORDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// `plan_ports` and record the new ones, so they never move while their worktree
+/// lives (daemon only). Blocking: call from `spawn_blocking`.
+pub fn assign_ports(projects: &[Project]) -> Result<Vec<(PathBuf, u16)>> {
+    let _g = RECORDING.lock().unwrap_or_else(|e| e.into_inner());
+    let plan = plan_ports(projects)?;
+    for (path, port, recorded) in &plan {
+        if *recorded {
+            continue;
+        }
+        let Some(admin) = admin_dir(path) else {
+            continue;
+        };
+        std::fs::write(admin.join(PORT_FILE), format!("{port}\n"))?;
+    }
+    Ok(plan.into_iter().map(|(p, port, _)| (p, port)).collect())
 }
 
 /// `git worktree add --no-checkout` for an existing branch.
@@ -125,14 +216,25 @@ pub fn create(
     let path = dir.join(name);
     if path.join(".git").exists() {
         let existing = path.canonicalize()?;
-        if list(root)?.iter().any(|i| i.path == existing) {
-            info!("worktree {name} already exists");
-            return Ok(existing);
+        // Only the worktree of this very name: never hand out another's checkout.
+        match list(root)?.iter().find(|i| i.path == existing) {
+            Some(i) if i.name == name => {
+                info!("worktree {name} already exists");
+                return Ok(existing);
+            }
+            Some(i) => bail!("{} is worktree {}, not {name}", path.display(), i.name),
+            None => bail!("{} exists and is not a worktree", path.display()),
         }
-        bail!("{} exists and is not a worktree", path.display());
     }
     if path.exists() {
         bail!("{} already exists", path.display());
+    }
+    // E.g. git numbered a `feat` elsewhere's admin dir `feat1`.
+    if let Some(i) = list(root)?.iter().find(|i| i.name == name) {
+        bail!(
+            "worktree name {name} is taken by {} (its git admin dir); pick another name",
+            i.path.display()
+        );
     }
 
     let repo = Repository::open(root)?;
@@ -326,6 +428,35 @@ fn worktree_include(root: &Path) -> Option<HashSet<String>> {
 const ENV_BEGIN: &str = "# >>> localforest: this worktree's environment (regenerated) >>>";
 const ENV_END: &str = "# <<< localforest <<<";
 
+/// A `.env` value. Single-quoted, which dotenvy, Node and Ruby dotenv, docker compose,
+/// direnv and `set -a; . .env` read verbatim (no escapes, no `$` expansion; Bun
+/// still expands `$VAR` in single quotes), unless it holds `'` or a line break,
+/// which single quotes can't carry; then double-quoted with `\\`, `\"`, `\$` and `\n`
+/// escaped, the escapes dotenvy, Ruby dotenv and docker compose share (a `\r` stays
+/// raw: dotenvy rejects the escape), and each backtick as a single-quoted piece
+/// (`"a"'`'"b"`: dotenvy has no `` \` `` escape), so a shell sourcing it runs nothing.
+/// Loaders differ on that fallback: Node dotenv keeps its backslashes, Ruby dotenv
+/// and docker compose don't join quoted pieces, sh reads `\n` as backslash-n.
+fn dotenv_quote(v: &str) -> String {
+    if !v.contains(['\'', '\n', '\r']) {
+        return format!("'{v}'");
+    }
+    let mut out = String::from("\"");
+    for c in v.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '$' => out.push_str("\\$"),
+            // No escape for it that dotenvy takes: a single-quoted piece.
+            '`' => out.push_str("\"'`'\""),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Write `env` into the worktree's `.env` (as a block at the top, so first-wins
 /// loaders see it), making sure `.env` is gitignored (`.git/info/exclude` if not)
 /// and never touching a tracked one. Keys of the rest of the file (e.g. a `.env`
@@ -369,10 +500,13 @@ pub fn write_env(path: &Path, env: &[(String, String)]) -> Result<()> {
     let ours: HashSet<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
     let mut out = format!("{ENV_BEGIN}\n");
     for (k, v) in env {
-        out.push_str(&format!(
-            "{k}=\"{}\"\n",
-            v.replace('\\', "\\\\").replace('"', "\\\"")
-        ));
+        if v.contains('$') {
+            warn!(
+                "{}: .env value of {k} contains '$', which some loaders (Bun) expand",
+                path.display()
+            );
+        }
+        out.push_str(&format!("{k}={}\n", dotenv_quote(v)));
     }
     out.push_str(ENV_END);
     out.push('\n');
@@ -415,6 +549,25 @@ const NOT_CACHES: &[&str] = &[
     ".lexical",
     ".expert",
 ];
+
+/// `git worktree lock`ed: automatic removal leaves it alone.
+pub fn is_locked(root: &Path, info: &Info) -> bool {
+    let Ok(repo) = Repository::open(root) else {
+        return false;
+    };
+    repo.worktrees()
+        .ok()
+        .into_iter()
+        .flat_map(|names| {
+            names
+                .iter()
+                .filter_map(|n| n.ok().flatten().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .filter_map(|n| repo.find_worktree(&n).ok())
+        .find(|wt| wt.path().canonicalize().ok().as_deref() == Some(info.path.as_path()))
+        .is_some_and(|wt| matches!(wt.is_locked(), Ok(git2::WorktreeLockStatus::Locked(_))))
+}
 
 /// `git worktree add` is still creating it (git locks it meanwhile).
 pub fn initializing(root: &Path, info: &Info) -> bool {
@@ -489,6 +642,35 @@ pub fn carry_caches(root: &Path, info: &Info) -> Result<bool> {
     Ok(true)
 }
 
+/// Uncommitted and untracked (not ignored) paths.
+pub fn uncommitted(path: &Path) -> Result<Vec<String>> {
+    let repo = Repository::open(path)?;
+    let mut opts = StatusOptions::new();
+    opts.include_untracked(true)
+        .include_ignored(false)
+        .exclude_submodules(true);
+    Ok(repo
+        .statuses(Some(&mut opts))?
+        .iter()
+        .filter(|e| e.status() != Status::CURRENT)
+        .filter_map(|e| e.path().ok().map(str::to_string))
+        .collect())
+}
+
+/// `a, b, c` (the first 20, then `…`).
+pub fn short_list(items: &[String]) -> String {
+    let mut s = items
+        .iter()
+        .take(20)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if items.len() > 20 {
+        s.push_str(", …");
+    }
+    s
+}
+
 pub fn is_dirty(path: &Path) -> Result<bool> {
     let repo = Repository::open(path)?;
     let mut opts = StatusOptions::new();
@@ -499,6 +681,106 @@ pub fn is_dirty(path: &Path) -> Result<bool> {
         .statuses(Some(&mut opts))?
         .iter()
         .any(|e| e.status() != Status::CURRENT))
+}
+
+/// Rebuilt or regenerated on their own: never reported as lost.
+const REBUILDABLE: &[&str] = &[
+    "_build",
+    "deps",
+    "node_modules",
+    "target",
+    ".git",
+    ".devenv",
+    ".direnv",
+    ".venv",
+    "venv",
+];
+
+/// Gitignored paths in the worktree at `path` that removal would delete for good:
+/// not build caches or per-checkout indexes, and not copies of the primary checkout
+/// at `root` (same file contents; directories with the same files and sizes).
+/// Sockets and fifos are skipped.
+pub fn ignored_files(root: &Path, path: &Path) -> Result<Vec<String>> {
+    let repo = Repository::open(path)?;
+    let mut opts = StatusOptions::new();
+    opts.include_untracked(false)
+        .include_ignored(true)
+        .recurse_ignored_dirs(false)
+        .exclude_submodules(true);
+    Ok(repo
+        .statuses(Some(&mut opts))?
+        .iter()
+        .filter(|e| e.status().contains(Status::IGNORED))
+        .filter_map(|e| e.path().ok().map(str::to_string))
+        .filter(|p| {
+            let top = p.split('/').next().unwrap_or_default();
+            let rel = p.trim_end_matches('/');
+            !REBUILDABLE.contains(&top)
+                && !PER_CHECKOUT.contains(&top)
+                && !is_copy(&path.join(rel), &root.join(rel)).unwrap_or(false)
+        })
+        .collect())
+}
+
+/// Ok(true): `a` is the same as `b` (or not a file worth reporting: a socket, fifo).
+fn is_copy(a: &Path, b: &Path) -> Result<bool> {
+    let ma = std::fs::symlink_metadata(a)?;
+    let kind = ma.file_type();
+    if !(kind.is_file() || kind.is_dir() || kind.is_symlink()) {
+        return Ok(true);
+    }
+    let Ok(mb) = std::fs::symlink_metadata(b) else {
+        return Ok(false);
+    };
+    if kind.is_symlink() {
+        return Ok(mb.file_type().is_symlink() && std::fs::read_link(a)? == std::fs::read_link(b)?);
+    }
+    if kind.is_dir() {
+        return Ok(mb.is_dir() && tree_sizes(a)? == tree_sizes(b)?);
+    }
+    if !mb.is_file() || ma.len() != mb.len() {
+        return Ok(false);
+    }
+    if ma.modified()? == mb.modified()? {
+        // Cloned or copied with its mtime: git-cow, copy_tree.
+        return Ok(true);
+    }
+    same_bytes(a, b)
+}
+
+/// Every regular file under `dir` (relative path, size), sorted.
+fn tree_sizes(dir: &Path) -> Result<Vec<(PathBuf, u64)>> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d)?.flatten() {
+            let meta = entry.metadata()?;
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else if meta.is_file() {
+                let rel = entry.path().strip_prefix(dir)?.to_path_buf();
+                out.push((rel, meta.len()));
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn same_bytes(a: &Path, b: &Path) -> Result<bool> {
+    use std::io::Read;
+    let (mut fa, mut fb) = (std::fs::File::open(a)?, std::fs::File::open(b)?);
+    let (mut ba, mut bb) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
+    loop {
+        let n = fa.read(&mut ba)?;
+        if n == 0 {
+            return Ok(fb.read(&mut bb)? == 0);
+        }
+        fb.read_exact(&mut bb[..n])?;
+        if ba[..n] != bb[..n] {
+            return Ok(false);
+        }
+    }
 }
 
 pub enum Safety {
@@ -542,7 +824,9 @@ pub fn safety(info: &Info, remote: &str, base: &str) -> Result<Safety> {
 }
 
 /// Commits in `head` not in `hidden`, ignoring conflict-free merges of the base
-/// branch that localforest made (they add nothing of the branch's own).
+/// branch that localforest made (they add nothing of the branch's own). One with that
+/// message but a tree other than the clean merge of its parents (edited, conflicts
+/// resolved by hand) counts.
 pub fn ahead(
     repo: &Repository,
     head: Oid,
@@ -559,12 +843,86 @@ pub fn ahead(
     let mut n = 0;
     for id in walk {
         let c = repo.find_commit(id?)?;
-        if c.parent_count() > 1 && c.message().is_ok_and(|m| m.starts_with(&auto)) {
+        if c.message().is_ok_and(|m| m.starts_with(&auto)) && is_clean_merge(repo, &c) {
             continue;
         }
         n += 1;
     }
     Ok(n)
+}
+
+/// Does a two-parent merge add nothing of its own? Every path it changed relative to
+/// its first parent must match the second parent, or else the conflict-free merge
+/// libgit2 computes. Cheap (tree diff; the merge is computed only when needed), and
+/// tolerant of merges `git merge` made differently (renames, criss-cross): a path
+/// taken from either side as is never counts. A path matching neither side nor the
+/// clean merge (an edit, a conflict resolved by hand) does. Anything unreadable
+/// (a parent missing in a shallow clone) counts as work. Cached per commit.
+fn is_clean_merge(repo: &Repository, c: &git2::Commit) -> bool {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<Oid, bool>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(v) = cache.lock().unwrap().get(&c.id()) {
+        return *v;
+    }
+    let clean = merge_adds_nothing(repo, c).unwrap_or(false);
+    cache.lock().unwrap().insert(c.id(), clean);
+    clean
+}
+
+fn merge_adds_nothing(repo: &Repository, c: &git2::Commit) -> Result<bool> {
+    if c.parent_count() != 2 {
+        return Ok(false);
+    }
+    let (p1, p2) = (c.parent(0)?, c.parent(1)?);
+    let (t1, t2, tm) = (p1.tree()?, p2.tree()?, c.tree()?);
+    let diff = repo.diff_tree_to_tree(Some(&t1), Some(&tm), None)?;
+    let blob = |t: &git2::Tree, p: &Path| t.get_path(p).ok().map(|e| e.id());
+    let mut clean: Option<Option<git2::Tree>> = None;
+    for delta in diff.deltas() {
+        let Some(p) = delta.new_file().path().or(delta.old_file().path()) else {
+            return Ok(false);
+        };
+        let ours = blob(&tm, p);
+        if ours == blob(&t2, p) {
+            continue;
+        }
+        let merged = clean.get_or_insert_with(|| {
+            let mut index = repo.merge_commits(&p1, &p2, None).ok()?;
+            if index.has_conflicts() {
+                return None;
+            }
+            repo.find_tree(index.write_tree_to(repo).ok()?).ok()
+        });
+        match merged {
+            Some(t) if blob(t, p) == ours => {}
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
+/// When the worktree was made (its `.git` file's mtime), as unix seconds.
+pub fn created_at(info: &Info) -> Result<i64> {
+    let t = std::fs::symlink_metadata(info.path.join(".git"))?.modified()?;
+    Ok(t.duration_since(std::time::UNIX_EPOCH)?.as_secs() as i64)
+}
+
+/// Clock skew allowed between this machine and GitHub.
+const MERGE_GRACE_SECS: i64 = 300;
+
+/// Was the worktree made clearly (by [`MERGE_GRACE_SECS`]) before a PR merged at
+/// `merged_at`? Err when unknown or too close to call.
+pub fn made_before(info: &Info, merged_at: i64) -> Result<()> {
+    let made = created_at(info)?;
+    if made + MERGE_GRACE_SECS > merged_at {
+        bail!(
+            "{} was made {}s before the PR merged (or after); not the PR's worktree",
+            info.name,
+            merged_at - made
+        );
+    }
+    Ok(())
 }
 
 /// After a PR merged `branch` at `pr_head`: is everything in the worktree in it?
@@ -586,14 +944,35 @@ pub fn covered_by_pr(info: &Info, pr_head: Oid, remote: &str, base: &str) -> Res
     Ok(ahead(&repo, head, &hidden, remote, base)? == 0)
 }
 
-/// Move the worktree out of the way, drop git's metadata and its own branch, then
-/// delete the files in the background.
-pub fn remove_files(root: &Path, info: &Info) -> Result<()> {
+/// Own commits of the worktree's HEAD that are neither on the base branch (local or
+/// remote) nor pushed to its branch on `remote`: deleting the branch would lose them.
+pub fn unpushed(info: &Info, remote: &str, base: &str) -> Result<usize> {
+    let repo = Repository::open(&info.path)?;
+    let head = repo.head()?.peel_to_commit()?.id();
+    let mut refs = vec![
+        format!("refs/heads/{base}"),
+        format!("refs/remotes/{remote}/{base}"),
+    ];
+    if let Some(b) = &info.branch {
+        refs.push(format!("refs/remotes/{remote}/{b}"));
+    }
+    let hidden: Vec<Oid> = refs
+        .iter()
+        .filter_map(|r| repo.find_reference(r).ok()?.peel_to_commit().ok())
+        .map(|c| c.id())
+        .collect();
+    ahead(&repo, head, &hidden, remote, base)
+}
+
+/// Move the worktree out of the way, drop git's metadata and its own branch (kept
+/// as `<name>-kept-<sha>` without `delete_branch`: Ok(Some(that name))), then delete
+/// the files in the background.
+pub fn remove_files(root: &Path, info: &Info, delete_branch: bool) -> Result<Option<String>> {
     let repo = Repository::open(root)?;
     let trash_dir = repo.commondir().join("localforest-trash");
     std::fs::create_dir_all(&trash_dir)?;
     let trash = trash_dir.join(format!("{}.{}", info.name, std::process::id()));
-    let trash = if trash.exists() {
+    let mut trash = if trash.exists() {
         trash_dir.join(format!(
             "{}.{}.{}",
             info.name,
@@ -605,30 +984,113 @@ pub fn remove_files(root: &Path, info: &Info) -> Result<()> {
     } else {
         trash
     };
+    // Ours (even if locked), then any other stale unlocked admin dir (what `git
+    // worktree prune` does: worktrees deleted by hand). Locked ones, e.g. on an
+    // unmounted volume, are left alone.
+    let own = repo
+        .worktrees()?
+        .iter()
+        .filter_map(|n| n.ok().flatten().map(str::to_string))
+        .find(|n| {
+            repo.find_worktree(n)
+                .is_ok_and(|wt| wt.path().canonicalize().ok().as_deref() == Some(&*info.path))
+        });
     // Same volume: a rename instead of deleting thousands of files in the foreground.
-    std::fs::rename(&info.path, &trash)
-        .with_context(|| format!("moving {} away", info.path.display()))?;
-    for admin in repo.worktrees()?.iter().filter_map(|n| n.ok().flatten()) {
-        if let Ok(wt) = repo.find_worktree(admin)
+    // Worktrees on another volume than the git dir go to a hidden sibling instead.
+    if let Err(e) = std::fs::rename(&info.path, &trash) {
+        if e.raw_os_error() != Some(libc::EXDEV) {
+            return Err(e).with_context(|| format!("moving {} away", info.path.display()));
+        }
+        trash = info.path.with_file_name(format!(
+            "{SIBLING_TRASH}{}",
+            trash.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        std::fs::rename(&info.path, &trash)
+            .with_context(|| format!("moving {} away", info.path.display()))?;
+    }
+    // The worktree is gone now: the rest is tidying up, not worth failing over.
+    let tidy = || -> Result<Option<String>> {
+        if let Some(wt) = own.and_then(|n| repo.find_worktree(&n).ok())
             && wt.validate().is_err()
         {
             let _ = wt.unlock();
             wt.prune(Some(WorktreePruneOptions::new().locked(true)))?;
         }
-    }
-    if let Some(b) = &info.branch
-        && *b == info.name
-        && let Ok(mut branch) = repo.find_branch(b, BranchType::Local)
-    {
-        branch.delete()?;
-        info!("deleted branch {b}");
-    }
+        for admin in repo.worktrees()?.iter().filter_map(|n| n.ok().flatten()) {
+            if let Ok(wt) = repo.find_worktree(admin)
+                && wt.validate().is_err()
+                && matches!(wt.is_locked(), Ok(git2::WorktreeLockStatus::Unlocked))
+            {
+                wt.prune(None)?;
+            }
+        }
+        if let Some(b) = &info.branch
+            && *b == info.name
+            && let Ok(mut branch) = repo.find_branch(b, BranchType::Local)
+        {
+            if delete_branch {
+                branch.delete()?;
+                info!("deleted branch {b}");
+            } else {
+                // Out of the way, so a new worktree of the same name starts fresh.
+                let short = branch
+                    .get()
+                    .target()
+                    .map(|o| o.to_string()[..7].to_string())
+                    .unwrap_or_default();
+                let name = format!("{b}-kept-{short}");
+                branch.rename(&name, false)?;
+                warn!("kept branch {b} as {name}: it has commits that aren't merged or pushed");
+                return Ok(Some(name));
+            }
+        }
+        Ok(None)
+    };
+    let kept = tidy().unwrap_or_else(|e| {
+        warn!("{}: cleaning up git metadata: {e:#}", info.name);
+        None
+    });
     std::thread::spawn(move || {
         if let Err(e) = std::fs::remove_dir_all(&trash) {
             warn!("removing {}: {e}", trash.display());
         }
     });
-    Ok(())
+    Ok(kept)
+}
+
+/// Prefix of a removed worktree moved next to itself (another volume than the git dir).
+const SIBLING_TRASH: &str = ".localforest-trash.";
+
+/// Delete what an interrupted removal left behind: the git dir's trash and hidden
+/// siblings in `worktrees_dir`.
+pub fn clean_trash(root: &Path, worktrees_dir: &Path) {
+    let Ok(repo) = Repository::open(root) else {
+        return;
+    };
+    let mut stale: Vec<PathBuf> = std::fs::read_dir(repo.commondir().join("localforest-trash"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    stale.extend(
+        std::fs::read_dir(worktrees_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(SIBLING_TRASH))
+            .map(|e| e.path()),
+    );
+    if stale.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        for p in stale {
+            if let Err(e) = std::fs::remove_dir_all(&p) {
+                warn!("removing {}: {e}", p.display());
+            }
+        }
+    });
 }
 
 /// Every process as (pid, parent pid, cwd, executable path).
@@ -717,26 +1179,35 @@ fn processes() -> Vec<(i32, i32, Vec<u8>, Vec<u8>)> {
 
 /// Processes running in `dir` (cwd or executable inside it: the BEAM, esbuild,
 /// tailwind, node, ...) and all their descendants, except `keep`, this process and
-/// its ancestors.
+/// their ancestors.
 fn processes_in(dir: &Path, keep: &[i32]) -> Vec<i32> {
     let dir = dir.as_os_str().as_bytes();
     let inside = |p: &[u8]| p.starts_with(dir) && (p.len() == dir.len() || p[dir.len()] == b'/');
-    let procs = processes();
-    let parent: HashMap<i32, i32> = procs.iter().map(|(p, pp, _, _)| (*p, *pp)).collect();
-    let mut spared: HashSet<i32> = keep.iter().copied().collect();
-    let mut me = std::process::id() as i32;
-    while me > 1 && spared.insert(me) {
-        me = parent.get(&me).copied().unwrap_or(0);
-    }
+    let procs: Vec<(i32, i32, bool)> = processes()
+        .into_iter()
+        .map(|(p, pp, cwd, exe)| (p, pp, inside(&cwd) || inside(&exe)))
+        .collect();
+    let mut roots = keep.to_vec();
+    roots.push(std::process::id() as i32);
+    sweep(&procs, &roots)
+}
+
+/// Of `procs` as (pid, parent pid, runs inside the dir): those inside and their
+/// descendants, except `keep` and their ancestors. The sweep doesn't go through a
+/// spared process: its other children (MCP servers, hook shells) are only hit when
+/// they themselves run inside.
+fn sweep(procs: &[(i32, i32, bool)], keep: &[i32]) -> Vec<i32> {
+    let parent: HashMap<i32, i32> = procs.iter().map(|(p, pp, _)| (*p, *pp)).collect();
+    let spared = with_ancestors(&parent, keep);
     let mut hit: HashSet<i32> = procs
         .iter()
-        .filter(|(_, _, cwd, exe)| inside(cwd) || inside(exe))
+        .filter(|(p, _, inside)| *inside && !spared.contains(p) && *p > 1)
         .map(|(p, ..)| *p)
         .collect();
     loop {
         let before = hit.len();
-        for (p, pp, ..) in &procs {
-            if hit.contains(pp) {
+        for (p, pp, _) in procs {
+            if hit.contains(pp) && !spared.contains(p) {
                 hit.insert(*p);
             }
         }
@@ -744,9 +1215,31 @@ fn processes_in(dir: &Path, keep: &[i32]) -> Vec<i32> {
             break;
         }
     }
-    hit.into_iter()
-        .filter(|p| !spared.contains(p) && *p > 1)
-        .collect()
+    hit.into_iter().collect()
+}
+
+/// This process's ancestors, from the process table (sent along with removals so
+/// the daemon can spare them even when it can't see them all).
+pub fn ancestors() -> Vec<i32> {
+    let parent: HashMap<i32, i32> = processes().iter().map(|(p, pp, ..)| (*p, *pp)).collect();
+    let mut out: Vec<i32> = with_ancestors(&parent, &[std::process::id() as i32])
+        .into_iter()
+        .collect();
+    out.push(unsafe { libc::getppid() });
+    out
+}
+
+/// `pids` and every ancestor of each (a hook's shell runs under Claude Code, which
+/// may sit in the worktree being removed).
+fn with_ancestors(parent: &HashMap<i32, i32>, pids: &[i32]) -> HashSet<i32> {
+    let mut out = HashSet::new();
+    for &p in pids {
+        let mut p = p;
+        while p > 1 && out.insert(p) {
+            p = parent.get(&p).copied().unwrap_or(0);
+        }
+    }
+    out
 }
 
 /// SIGKILL everything running in `dir` (dev servers and their watchers): a dev server
@@ -772,6 +1265,44 @@ mod tests {
     use crate::config::ProjectSettings;
     use git2::{Signature, WorktreeAddOptions};
     use tempfile::TempDir;
+
+    #[test]
+    fn env_values_read_back_verbatim() {
+        let values = [
+            "postgres://u:pw@127.0.0.1:55432/db",
+            "a $HOME ${HOME} $(id) `id` b",
+            "it's",
+            "say \"hi\" \\ back\\slash",
+            "two\nlines",
+            "it's $HOME\nand \"more\"\\n",
+            "it's `id` $(id)",
+            "cr\r\nlf",
+            "",
+            "#not a comment",
+        ];
+        assert_eq!(dotenv_quote("a $B"), "'a $B'");
+        assert_eq!(dotenv_quote("it's $B\n"), "\"it's \\$B\\n\"");
+        // Backticks in single-quoted pieces: `set -a; . .env` must not run them.
+        assert_eq!(
+            dotenv_quote("it's `id` $(id) \"q\" \\"),
+            r#""it's "'`'"id"'`'" \$(id) \"q\" \\""#
+        );
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join(".env");
+        let text: String = values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| format!("K{i}={}\n", dotenv_quote(v)))
+            .collect();
+        std::fs::write(&file, text).unwrap();
+        let parsed: HashMap<String, String> = dotenvy::from_path_iter(&file)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        for (i, v) in values.iter().enumerate() {
+            assert_eq!(parsed[&format!("K{i}")], *v, "value {i}");
+        }
+    }
 
     fn settings() -> ProjectSettings {
         ProjectSettings {
@@ -820,6 +1351,128 @@ mod tests {
     }
 
     #[test]
+    fn names_are_unique() {
+        let (d, project, syncer) = fixture();
+        // Long requested names that share their first 32 characters get their own.
+        let long = "implement-the-very-long-feature-name";
+        let a = create(
+            &project,
+            &syncer,
+            &worktree_label(&format!("{long} one")),
+            None,
+        )
+        .unwrap();
+        let b = create(
+            &project,
+            &syncer,
+            &worktree_label(&format!("{long} two")),
+            None,
+        )
+        .unwrap();
+        assert_ne!(a, b);
+
+        // Same directory name elsewhere (plain `git worktree add`): git numbers the
+        // admin dir, and list and `localforest env` agree on the name.
+        let repo = Repository::open(&project.root).unwrap();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        for (admin, dir) in [("dup", "x"), ("dup1", "y")] {
+            let branch = repo.branch(admin, &head, false).unwrap();
+            let r = branch.into_reference();
+            std::fs::create_dir_all(d.path().join(dir)).unwrap();
+            repo.worktree(
+                admin,
+                &d.path().join(dir).join("dup"),
+                Some(WorktreeAddOptions::new().reference(Some(&r))),
+            )
+            .unwrap();
+        }
+        let infos = list(&project.root).unwrap();
+        let mut names: Vec<&str> = infos.iter().map(|i| i.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names.len(), 4, "{names:?}");
+        assert!(names.contains(&"dup") && names.contains(&"dup1"));
+        for i in &infos {
+            let (_, name, _) = crate::config::locate(&i.path).unwrap();
+            assert_eq!(name.as_deref(), Some(i.name.as_str()));
+        }
+
+        // A directory holding another worktree is never handed out under a new name.
+        std::fs::create_dir_all(project.worktrees_dir()).unwrap();
+        let taken = project.worktrees_dir().join("other");
+        let r = repo
+            .branch("other-branch", &head, false)
+            .unwrap()
+            .into_reference();
+        repo.worktree(
+            "other-admin",
+            &taken,
+            Some(WorktreeAddOptions::new().reference(Some(&r))),
+        )
+        .unwrap();
+        let err = create(&project, &syncer, "other", None).unwrap_err();
+        assert!(err.to_string().contains("is worktree other-admin"), "{err}");
+        // A name git gave another worktree's admin dir.
+        let err = create(&project, &syncer, "dup1", None).unwrap_err();
+        assert!(err.to_string().contains("pick another name"), "{err}");
+    }
+
+    #[test]
+    fn ports_never_collide() {
+        let port_of = |plan: &[(PathBuf, u16, bool)], p: &Path| {
+            plan.iter()
+                .find(|(q, ..)| q == p)
+                .map(|(_, port, _)| *port)
+                .unwrap()
+        };
+        let (_d, project, syncer) = fixture();
+        let a = create(&project, &syncer, "a", None).unwrap();
+        let b = create(&project, &syncer, "b", None).unwrap();
+        // Uncontested: the hashed slot, recorded by assign_ports only.
+        let plan = plan_ports(std::slice::from_ref(&project)).unwrap();
+        assert_eq!(port_of(&plan, &b), config::worktree_port("app", "b"));
+        assert_eq!(recorded_port(&b), None);
+        assign_ports(std::slice::from_ref(&project)).unwrap();
+        assert_eq!(recorded_port(&b), Some(config::worktree_port("app", "b")));
+
+        // a holds c's slot (a hash collision): c moves on, and env's plan agrees.
+        let slot_c = config::worktree_port("app", "c");
+        std::fs::write(
+            admin_dir(&a).unwrap().join(PORT_FILE),
+            format!("{slot_c}\n"),
+        )
+        .unwrap();
+        let c = create(&project, &syncer, "c", None).unwrap();
+        let planned = port_of(&plan_ports(std::slice::from_ref(&project)).unwrap(), &c);
+        let assigned = assign_ports(std::slice::from_ref(&project)).unwrap();
+        let pc = assigned.iter().find(|(p, _)| *p == c).unwrap().1;
+        assert_eq!(pc, planned);
+        assert_ne!(pc, slot_c);
+        assert!(config::WORKTREE_PORTS.contains(&pc) && pc.is_multiple_of(10));
+        // Recorded: stable, and what `checkout` reads.
+        assert_eq!(project.checkout(Some("c"), c.clone()).port, pc);
+        assert_eq!(recorded_port(&c), Some(pc));
+
+        // Other projects' worktrees count too.
+        let (_d2, mut other, syncer2) = fixture();
+        other.name = "other".into();
+        let x = create(&other, &syncer2, "x", None).unwrap();
+        let slot_d = config::worktree_port("app", "d");
+        std::fs::write(
+            admin_dir(&x).unwrap().join(PORT_FILE),
+            format!("{slot_d}\n"),
+        )
+        .unwrap();
+        let d = create(&project, &syncer, "d", None).unwrap();
+        let both = [project.clone(), other.clone()];
+        let pd = port_of(&plan_ports(&both).unwrap(), &d);
+        assert_ne!(pd, slot_d);
+        assert_eq!(
+            port_of(&plan_ports(std::slice::from_ref(&project)).unwrap(), &d),
+            slot_d
+        );
+    }
+
+    #[test]
     fn creates_lists_and_removes() {
         let (_d, project, syncer) = fixture();
         let path = create(&project, &syncer, "feat-x", None).unwrap();
@@ -864,13 +1517,240 @@ mod tests {
         assert!(safety(info, "origin", "main").is_err());
         std::fs::remove_file(path.join("c.txt")).unwrap();
 
-        remove_files(&project.root, info).unwrap();
+        assert_eq!(unpushed(info, "origin", "main").unwrap(), 1);
+        remove_files(&project.root, info, true).unwrap();
         assert!(!path.exists());
         assert!(list(&project.root).unwrap().is_empty());
         let repo = Repository::open(&project.root).unwrap();
         assert!(repo.find_branch("feat-x", BranchType::Local).is_err());
         // Can be created again.
         create(&project, &syncer, "feat-x", None).unwrap();
+    }
+
+    #[test]
+    fn counts_auto_merges_with_changes_of_their_own() {
+        let d = TempDir::new().unwrap();
+        let repo = Repository::init(d.path()).unwrap();
+        let sig = Signature::now("T", "t@example.com").unwrap();
+        let commit = |files: &[(&str, &str)], parents: &[Oid], msg: &str| {
+            let mut tb = repo.treebuilder(None).unwrap();
+            for (name, content) in files {
+                tb.insert(name, repo.blob(content.as_bytes()).unwrap(), 0o100644)
+                    .unwrap();
+            }
+            let tree = repo.find_tree(tb.write().unwrap()).unwrap();
+            let parents: Vec<_> = parents
+                .iter()
+                .map(|p| repo.find_commit(*p).unwrap())
+                .collect();
+            let parents: Vec<_> = parents.iter().collect();
+            repo.commit(None, &sig, &sig, msg, &tree, &parents).unwrap()
+        };
+        let a = commit(&[("a", "1")], &[], "init");
+        let own = commit(&[("a", "1"), ("b", "own")], &[a], "own");
+        let main = commit(&[("a", "2")], &[a], "main");
+        let msg = "Merge remote-tracking branch 'origin/main' into x";
+        let clean = commit(&[("a", "2"), ("b", "own")], &[own, main], msg);
+        assert_eq!(
+            ahead(&repo, clean, &[own, main], "origin", "main").unwrap(),
+            0
+        );
+        let evil = commit(
+            &[("a", "2"), ("b", "own"), ("c", "extra")],
+            &[own, main],
+            msg,
+        );
+        assert_eq!(
+            ahead(&repo, evil, &[own, main], "origin", "main").unwrap(),
+            1
+        );
+        // Not what libgit2 would make, but every path is one side's as is (as a
+        // `git merge` with other rename detection might do): nothing of its own.
+        let other = commit(&[("a", "1"), ("b", "own")], &[own, main], msg);
+        assert_eq!(
+            ahead(&repo, other, &[own, main], "origin", "main").unwrap(),
+            0
+        );
+        // A hand-resolved path, in neither side nor the clean merge: work.
+        let resolved = commit(&[("a", "3"), ("b", "own")], &[own, main], msg);
+        assert_eq!(
+            ahead(&repo, resolved, &[own, main], "origin", "main").unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn pushed_commits_are_not_unpushed() {
+        let (_d, project, syncer) = fixture();
+        let path = create(&project, &syncer, "feat-x", None).unwrap();
+        let info = list(&project.root).unwrap().remove(0);
+        assert_eq!(unpushed(&info, "origin", "main").unwrap(), 0);
+        let repo = Repository::open(&path).unwrap();
+        let sig = Signature::now("T", "t@example.com").unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        let head = repo
+            .commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "own",
+                &parent.tree().unwrap(),
+                &[&parent],
+            )
+            .unwrap();
+        assert_eq!(unpushed(&info, "origin", "main").unwrap(), 1);
+        repo.reference("refs/remotes/origin/feat-x", head, true, "push")
+            .unwrap();
+        assert_eq!(unpushed(&info, "origin", "main").unwrap(), 0);
+    }
+
+    #[test]
+    fn lists_ignored_files_only_the_worktree_has() {
+        let (_d, project, syncer) = fixture();
+        let path = create(&project, &syncer, "feat-x", None).unwrap();
+        // Carried from the primary (cache/), build caches: quiet.
+        std::fs::create_dir(path.join("node_modules")).unwrap();
+        std::fs::write(path.join("node_modules/x"), "").unwrap();
+        let exclude = project.root.join(".git/info/exclude");
+        std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        std::fs::write(&exclude, "*.local\n.env\n").unwrap();
+        std::fs::write(project.root.join("same.local"), "x\n").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(path.join("same.local"), "x\n").unwrap();
+        let fifo = CString::new(path.join("pipe.local").as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+        assert_eq!(
+            ignored_files(&project.root, &path).unwrap(),
+            Vec::<String>::new()
+        );
+        // Own files, edited copies, a carried dir with more in it, .env: reported.
+        std::fs::write(path.join("secrets.local"), "mine\n").unwrap();
+        std::fs::write(path.join("same.local"), "edit\n").unwrap();
+        std::fs::write(path.join("cache/notes"), "mine\n").unwrap();
+        std::fs::write(path.join(".env"), "KEY=1\n").unwrap();
+        let mut files = ignored_files(&project.root, &path).unwrap();
+        files.sort();
+        assert_eq!(files, vec![".env", "cache/", "same.local", "secrets.local"]);
+    }
+
+    #[test]
+    fn spares_whole_ancestor_chains() {
+        // 1 <- 100 (claude) <- 200 (sh) <- 300 (localforest); 1 <- 400 <- 500
+        let parent = HashMap::from([(100, 1), (200, 100), (300, 200), (400, 1), (500, 400)]);
+        assert_eq!(
+            with_ancestors(&parent, &[300, 500]),
+            HashSet::from([100, 200, 300, 400, 500])
+        );
+        // Unknown pids are kept themselves.
+        assert_eq!(with_ancestors(&parent, &[42]), HashSet::from([42]));
+    }
+
+    #[test]
+    fn sweep_does_not_go_through_spared_processes() {
+        // claude 100 (inside) <- sh 200 <- localforest 300; claude <- mcp 110 (outside)
+        // <- 111; claude <- server 120 (inside) <- watcher 121; other 400 (outside).
+        let procs = [
+            (100, 1, true),
+            (200, 100, false),
+            (300, 200, false),
+            (110, 100, false),
+            (111, 110, false),
+            (120, 100, true),
+            (121, 120, false),
+            (400, 1, false),
+        ];
+        let mut hit = sweep(&procs, &[300]);
+        hit.sort();
+        assert_eq!(hit, vec![120, 121]);
+    }
+
+    #[test]
+    fn removal_prunes_stale_unlocked_but_not_locked_worktrees() {
+        let (_d, project, syncer) = fixture();
+        let away = create(&project, &syncer, "away", None).unwrap();
+        let by_hand = create(&project, &syncer, "by-hand", None).unwrap();
+        create(&project, &syncer, "gone", None).unwrap();
+        let repo = Repository::open(&project.root).unwrap();
+        // Locked on purpose, its volume unmounted: invalid, but not ours to prune.
+        repo.find_worktree("away")
+            .unwrap()
+            .lock(Some("on a usb disk"))
+            .unwrap();
+        let infos = list(&project.root).unwrap();
+        let find = |n: &str| infos.iter().find(|i| i.name == n).unwrap();
+        assert!(is_locked(&project.root, find("away")));
+        assert!(!is_locked(&project.root, find("gone")));
+        std::fs::rename(&away, away.with_file_name("away-unmounted")).unwrap();
+        std::fs::remove_dir_all(&by_hand).unwrap();
+
+        remove_files(&project.root, find("gone"), true).unwrap();
+        let wt = repo.find_worktree("away").unwrap();
+        assert!(matches!(
+            wt.is_locked().unwrap(),
+            git2::WorktreeLockStatus::Locked(_)
+        ));
+        assert!(repo.find_worktree("gone").is_err());
+        assert!(repo.find_worktree("by-hand").is_err());
+    }
+
+    #[test]
+    fn cleans_up_trash_of_interrupted_removals() {
+        let (_d, project, _) = fixture();
+        let trash = project.root.join(".git/localforest-trash/old.123");
+        let sibling = project
+            .worktrees_dir()
+            .join(format!("{SIBLING_TRASH}old.123"));
+        let keep = project.worktrees_dir().join("feat-x");
+        for d in [&trash, &sibling, &keep] {
+            std::fs::create_dir_all(d.join("sub")).unwrap();
+        }
+        clean_trash(&project.root, &project.worktrees_dir());
+        for _ in 0..100 {
+            if !trash.exists() && !sibling.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!trash.exists() && !sibling.exists());
+        assert!(keep.exists());
+    }
+
+    #[test]
+    fn removal_can_keep_the_branch() {
+        let (_d, project, syncer) = fixture();
+        let path = create(&project, &syncer, "keep-me", None).unwrap();
+        let info = list(&project.root).unwrap().remove(0);
+        assert_eq!(unpushed(&info, "origin", "main").unwrap(), 0);
+        std::fs::write(path.join("new.txt"), "x").unwrap();
+        std::fs::write(path.join("a.txt"), "changed").unwrap();
+        let mut dirty = uncommitted(&path).unwrap();
+        dirty.sort();
+        assert_eq!(dirty, vec!["a.txt", "new.txt"]);
+        let repo = Repository::open(&project.root).unwrap();
+        let head = repo.head().unwrap().target().unwrap().to_string();
+
+        let kept = remove_files(&project.root, &info, false).unwrap().unwrap();
+        assert_eq!(kept, format!("keep-me-kept-{}", &head[..7]));
+        assert!(!info.path.exists());
+        assert!(repo.find_branch(&kept, BranchType::Local).is_ok());
+        assert!(repo.find_branch("keep-me", BranchType::Local).is_err());
+    }
+
+    #[test]
+    fn knows_when_a_worktree_was_made() {
+        let (_d, project, syncer) = fixture();
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        create(&project, &syncer, "feat-x", None).unwrap();
+        let info = list(&project.root).unwrap().remove(0);
+        let t = created_at(&info).unwrap();
+        assert!((before - 1..=before + 60).contains(&t), "{t} vs {before}");
+        // Merged 10 minutes later: before. Within the clock-skew grace, or earlier: not.
+        assert!(made_before(&info, t + 600).is_ok());
+        assert!(made_before(&info, t + 60).is_err());
+        assert!(made_before(&info, t - 3600).is_err());
     }
 
     #[test]
@@ -958,7 +1838,7 @@ mod tests {
         assert_eq!(
             text,
             format!(
-                "{ENV_BEGIN}\nDATABASE_URL=\"postgres://wt\"\nPORT=\"20000\"\n{ENV_END}\n\
+                "{ENV_BEGIN}\nDATABASE_URL='postgres://wt'\nPORT='20000'\n{ENV_END}\n\
                  # overridden by localforest: DATABASE_URL=postgres://primary\nOTHER=1\n"
             )
         );

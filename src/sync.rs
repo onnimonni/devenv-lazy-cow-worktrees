@@ -446,7 +446,8 @@ mod tests {
         assert_eq!(got, f.main.canonicalize().unwrap());
         let (root, wt, _) = crate::config::locate(&f.wt).unwrap();
         assert_eq!(root, got);
-        assert_eq!(wt.as_deref(), Some("wt-feat"));
+        // Named after its git admin dir (`feat`), unique in the repository.
+        assert_eq!(wt.as_deref(), Some("feat"));
         assert_eq!(Syncer::default_base(&f.main, "origin"), "main");
     }
 

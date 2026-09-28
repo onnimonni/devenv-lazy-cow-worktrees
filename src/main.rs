@@ -182,9 +182,23 @@ async fn create(root: PathBuf, name: String, base: Option<String>) -> Result<dae
     client::post("/worktrees", &daemon::CreateReq { root, name, base }).await
 }
 
+/// A worktree name as is; a path (`.`, `../x`, `/abs`) made absolute here: the daemon
+/// has another cwd.
+fn rm_target(cwd: &Path, name: &str) -> Result<String> {
+    if config::valid_label(name) {
+        return Ok(name.to_string());
+    }
+    let path = cwd
+        .join(name)
+        .canonicalize()
+        .with_context(|| format!("no worktree {name}"))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
 async fn remove(root: PathBuf, name: String, force: bool) -> Result<()> {
-    let keep = vec![std::process::id() as i32, unsafe { libc::getppid() }];
-    client::post::<Value>(
+    // The daemon spares these and their ancestors: the shell, the Claude Code session.
+    let keep = worktree::ancestors();
+    let r: Value = client::post(
         "/worktrees/remove",
         &daemon::RemoveReq {
             root,
@@ -194,6 +208,9 @@ async fn remove(root: PathBuf, name: String, force: bool) -> Result<()> {
         },
     )
     .await?;
+    for w in r["warnings"].as_array().into_iter().flatten() {
+        eprintln!("warning: {}", w.as_str().unwrap_or_default());
+    }
     Ok(())
 }
 
@@ -222,6 +239,9 @@ fn print_status(s: &daemon::Status) {
                 c.databases.join(", "),
                 if c.redis { " redis" } else { "" },
             );
+            if let Some(e) = &c.migrate_error {
+                println!("    migrations failed: {e}");
+            }
             for s in &c.services {
                 println!(
                     "    {:<20} :{:<5} {:<45} {}",
@@ -261,7 +281,22 @@ async fn main() -> Result<()> {
         } => {
             let (root, wt, co_path) = config::locate(&path)?;
             let p = Project::new(root, project);
-            let c = p.checkout(wt.as_deref(), co_path);
+            // The port the daemon records (or will): same plan over the same projects.
+            let port = if wt.is_some() && worktree::recorded_port(&co_path).is_none() {
+                let mut all = daemon::registered_projects();
+                all.retain(|o| o.root != p.root);
+                all.push(p.clone());
+                worktree::plan_ports(&all)
+                    .ok()
+                    .and_then(|plan| plan.into_iter().find(|(path, ..)| *path == co_path))
+                    .map(|(_, port, _)| port)
+            } else {
+                None
+            };
+            let c = match port {
+                Some(port) => p.checkout_on(wt.as_deref(), co_path, port),
+                None => p.checkout(wt.as_deref(), co_path),
+            };
             let env = match service.as_deref() {
                 Some(s) if c.service(s).is_none() => anyhow::bail!("no service {s}"),
                 Some(s) => c.service_env(&cli.global, Some(s)),
@@ -286,7 +321,9 @@ async fn main() -> Result<()> {
             println!("{}", r.path.display());
             Ok(())
         }
-        Cmd::Worktree(WorktreeCmd::Rm { name, force }) => remove(root_of(&cwd)?, name, force).await,
+        Cmd::Worktree(WorktreeCmd::Rm { name, force }) => {
+            remove(root_of(&cwd)?, rm_target(&cwd, &name)?, force).await
+        }
         Cmd::Worktree(WorktreeCmd::List) => {
             let root = root_of(&cwd)?;
             let s: daemon::Status = client::get("/status").await?;
@@ -413,7 +450,7 @@ async fn main() -> Result<()> {
             match h {
                 HookCmd::WorktreeCreate => {
                     let name = v["name"].as_str().context("no name in hook input")?;
-                    let r = create(root_of(&dir)?, config::dns_label(name), None).await?;
+                    let r = create(root_of(&dir)?, config::worktree_label(name), None).await?;
                     println!("{}", r.path.display());
                 }
                 HookCmd::WorktreeRemove => {
@@ -427,5 +464,23 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rm_target_makes_paths_absolute() {
+        let d = tempfile::TempDir::new().unwrap();
+        let wt = d.path().join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        let abs = wt.canonicalize().unwrap().to_string_lossy().into_owned();
+        assert_eq!(rm_target(d.path(), "feat-x").unwrap(), "feat-x");
+        assert_eq!(rm_target(&wt, ".").unwrap(), abs);
+        assert_eq!(rm_target(d.path(), "./wt").unwrap(), abs);
+        assert_eq!(rm_target(Path::new("/"), &abs).unwrap(), abs);
+        assert!(rm_target(d.path(), "./missing").is_err());
     }
 }

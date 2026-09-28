@@ -13,7 +13,7 @@ $ curl https://fix-login.web.myapp.localhost   # starts web (and the worker it d
 $ curl https://fix-login.api.myapp.localhost   # starts api (same DATABASE_URL and REDIS_URL)
 $ cd .claude/worktrees/fix-login && eval "$(localforest env)"
 $ echo $DATABASE_URL $REDIS_URL
-postgres://myapp-fix-login:4c1f…@127.0.0.1:55432/myapp_dev_fix_login redis://:myapp-fix-login@127.0.0.1:6380/0
+postgres://myapp--fix-login:4c1f…@127.0.0.1:55432/myapp_dev_fix_login redis://:myapp--fix-login@127.0.0.1:6380/0
 ```
 
 ## Why
@@ -47,22 +47,26 @@ the project's services, started on demand; the environment comes from
 
 | | |
 |---|---|
-| **Worktrees** | `git worktree add` without a checkout, then filled with copy-on-write clones of the primary checkout, build caches included ([git-cow](https://github.com/onnimonni/git-cow)): ~0 disk, nothing to recompile. In `.claude/worktrees/<name>`, where Claude Code puts its own. |
+| **Worktrees** | `git worktree add` without a checkout, then filled with copy-on-write clones of the primary checkout, build caches included ([git-cow](https://github.com/onnimonni/git-cow)): ~0 disk, nothing to recompile. In `.claude/worktrees/<name>`, where Claude Code puts its own. A worktree's name (hostname, databases, role, Redis, port) is its git admin dir's (`.git/worktrees/<name>`, unique per repository); one that isn't a DNS label of at most 32 characters is shortened and gets a hash suffix, so two names never share a worktree. Database and role names are kept within PostgreSQL's 63 bytes the same way (test partitions included). |
 | **File watcher** | Watches `.git/worktrees`: a worktree made any way (plain `git`, git-cow, Claude Code) is provisioned; one deleted by hand is cleaned up. |
 | **Services** | Every checkout runs the project's services (`localforest.services`), each with its own port and `https://<worktree>.<service>.<project>.localhost` (`<service>.<project>.localhost` in the primary). The first request to a service starts it, after the services it depends on; workers without http run as dependencies. |
-| **PostgreSQL** | One PostgreSQL 18 on an APFS RAM disk, `fsync=off`. localforest is a proxy in front of it: the user in the connection picks the checkout, a database is created on first connect as a copy-on-write clone of its template (always `SET file_copy_method = clone` + `STRATEGY FILE_COPY`: 200 MB in ~40 ms instead of ~450 ms), and a checkout can only open its own databases. Every checkout has its own role and password. |
+| **PostgreSQL** | One PostgreSQL 18 on an APFS RAM disk, `fsync=off`. localforest is a proxy in front of it: the user in the connection picks the checkout, a database is created on first connect as a copy-on-write clone of its template (always `SET file_copy_method = clone` + `STRATEGY FILE_COPY`: 200 MB in ~40 ms instead of ~450 ms), and a checkout can only open its own databases; users that are no checkout's role are refused. Every checkout has its own role and password. |
 | **Redis** | One port; the password picks the checkout's own `redis-server`, on a private unix socket, started on first use and killed with the worktree. Real Redis: pub/sub, Lua, streams, `FLUSHALL` only touch that one. |
 | **HTTPS** | Local CA, websockets included. `https://localforest.localhost` lists everything. |
-| **GitHub** | Webhook websocket (polling without repo admin rights): pushes pull every branch and merge the base branch into worktrees (conflict-free merges only, dirty worktrees skipped). A worktree whose PR merged is removed unless it has newer work. |
-| **Migrations** | When the base branch moves: the migrate commands run in the primary checkout, then the template is refreshed from its database; they also run in every worktree the base branch was merged into. |
+| **GitHub** | Webhook websocket (polling without repo admin rights): pushes pull every branch and merge the base branch into worktrees (conflict-free merges only, dirty worktrees skipped). A worktree whose PR merged is removed unless it has newer work or wasn't made at least 5 minutes before the merge (a new task reusing the branch name; `worktree rm` without `--force` refuses it too). |
+| **Migrations** | When the base branch moves: the migrate commands run in the primary checkout, then the template is refreshed from its database; they also run in every worktree the base branch was merged into, and once in each new worktree after its database is cloned (its branch may carry migrations the template lacks; done is recorded per database, so one recreated after a reboot is migrated again). A worktree's services start only once its migrations succeeded; a failure shows in `localforest status` and on its 502 page and is retried with a growing backoff. Migrations don't block creating, syncing or removing other worktrees. A freshly created primary database (first start, after a reboot) is migrated and seeded whatever branch the primary is on, but the template is only made from an up-to-date base branch. Until it exists, worktrees clone the primary's database instead, so they do get the primary's feature-branch migrations (then their own on top). |
 | **Gone pages** | A removed worktree's hostnames answer 503 with why it's gone (pull request merged, removed, deleted), links to the PR, branch and commit on GitHub / GitLab / Bitbucket / Gitea, and a button that recreates it as a preview. |
 | **LSP proxy** | `localforest lsp -- <server>` runs one language server per worktree, routes each request by file, and drops results from other worktrees. |
 
 Removing a worktree SIGKILLs everything running in it (each service's process group,
 plus any process whose working directory or executable is inside it, with all
-descendants: the BEAM, esbuild, tailwind, node, …), stops its redis-server, drops
-its databases and role, deletes its branch and moves the files away for background
-deletion.
+descendants: the BEAM, esbuild, tailwind, node, …; never the process asking for the
+removal or its ancestors, such as the Claude Code session), stops its redis-server, drops
+its databases and role, deletes its branch (even `--force` keeps one with commits
+that aren't on the base branch, pushed, or in its merged PR, renamed to
+`<name>-kept-<sha>`; uncommitted files it deletes are listed) and moves the files away
+for background deletion. Gitignored files it deletes that are neither build caches nor
+copies of the primary checkout's are printed as warnings and listed on its gone page.
 
 ## Install
 
@@ -160,16 +164,18 @@ so one session gets answers from the worktree each file belongs to.
 |---|---|---|
 | `localforest.project` | directory name | hostnames, database prefix, role name |
 | `localforest.port` | `4000` | base port of the primary checkout's services |
-| `localforest.migrate` | none | migrate command: primary when the base branch moves (then the template is refreshed), worktrees the base branch was merged into |
+| `localforest.migrate` | none | migrate command: primary when the base branch moves (then the template is refreshed) or its database was just created, new worktrees once, worktrees the base branch was merged into |
 | `localforest.seed` | none | seed command: primary, after `migrate`, when its database was just created; worktrees get seeded data via the template |
 | `localforest.setup` | none | runs once in every new checkout (localforest, `git worktree add`, Claude Code), e.g. `mix deps.get` |
 | `localforest.services.<name>` | none | see below |
 | `localforest.server` | none | shorthand for `localforest.services.web.exec` |
 | `localforest.previewTtlHours` | `48` | close previews after this many hours without activity; `0` keeps them |
-| `localforest.httpsPort` | `443` | HTTPS proxy port |
+| `localforest.httpsPort` | `null` | HTTPS proxy port; unset: 443 where unprivileged processes may bind it, else 8443 |
+| `localforest.httpPort` | `null` | HTTP port redirecting to HTTPS, 0 disables; unset: 80 where unprivileged processes may bind it, else off |
 | `localforest.lsp.<name>` | none | adds `localforest-lsp-<name>` for Claude Code's `lspServers` |
 | `localforest.postgres.package` | `pkgs.postgresql_18` | PostgreSQL build (18+ for copy-on-write databases) |
-| `localforest.postgres.extensions` | none | as in devenv: `extensions: [ extensions.postgis extensions.pgvector ]`; enable with `CREATE EXTENSION` |
+| `localforest.postgres.extensions` | none | as in devenv: `extensions: [ extensions.postgis extensions.pgvector ]`; trusted ones: enable with `CREATE EXTENSION` |
+| `localforest.postgres.createExtensions` | `[]` | created as superuser in `template1` (so every database made afterwards) and the primaries' databases, for untrusted extensions checkout roles can't create, e.g. `[ "postgis" "vector" ]`; migrations' `CREATE EXTENSION IF NOT EXISTS` is then a no-op |
 | `localforest.postgres.settings` | `{}` | extra postgresql.conf settings, e.g. `shared_preload_libraries` |
 | `localforest.postgres.ramdiskMB` | `4096` | RAM disk size (used as it fills); resizing needs `localforest down --eject`, which empties every database |
 | `localforest.redis` | `pkgs.redis` | Redis build |
@@ -188,9 +194,38 @@ Service options:
 | `env` | `{}` | extra environment |
 | `restart` | `"no"` | when it exits on its own: `"no"`, `"on-failure"` (non-zero exit) or `"always"`; backs off 1–30 s, `localforest service stop` keeps it down |
 | `restartOnPull` | `false` | restart it (if running) after the base branch was pulled into its checkout and migrated; for servers without a code reloader |
+| `ports.<name>` | `{}` | further ports it listens on; see below |
 
 Commands are split like a shell would, then run directly (no shell) with the
 service's environment and the project's `PATH`. Logs: `localforest service log -s <name>`.
+
+Named ports, for a service that listens on more than `$PORT` (a debugger, a test
+endpoint), so the app reads a variable instead of computing an offset:
+
+```nix
+localforest.services.web = {
+  exec = "mix phx.server";
+  ports = {
+    debugger = { env = "LIVE_DEBUGGER_PORT"; http = true; };  # https://[<worktree>.]debugger.<project>.localhost
+    test.env = "TEST_PORT";                                   # no hostname
+  };
+};
+```
+
+| | default | |
+|---|---|---|
+| `env` | `<NAME>_PORT` | variable with the port, in every environment of the checkout (plus `LOCALFOREST_<SERVICE>_<NAME>_PORT`, and `_URL` with `http`) |
+| `http` | `false` | gets `https://[<worktree>.]<name>.<project>.localhost`; its first request starts the service and waits for this port |
+| `offset` | highest free | port = checkout base port + offset (0–9) |
+
+They share the checkout's 10-port block with the services: services keep their
+offsets, the rest are filled from the top down (9, 8, …) by service and port name.
+With only `web` on base 4000: web 4000, debugger 4009, test 4008. Adding a port or
+service can shift the others, so give `offset` to any port whose number is written
+down anywhere instead of read from its variable. `env` may not name a variable
+localforest sets (`PORT`, `DATABASE_URL`, `PG*`, `REDIS_URL`, `PHX_HOST`, …,
+`LOCALFOREST_*`). An `http` port's first request waits 5 s for it once the service's
+main port listens, then answers 502.
 
 ## Environment
 
@@ -200,14 +235,20 @@ needed), e.g. for services `web` (default), `api` and
 
 | | primary | worktree `fix-login` |
 |---|---|---|
-| `PORT` | base (`localforest.port`) + offset | base (20000–28990, hashed from the name) + offset |
+| `PORT` | base (`localforest.port`) + offset | base (20000–28990: hashed from the name, else the next slot no other worktree has; recorded in its git admin dir as `localforest-port`) + offset |
 | `LOCALFOREST_URL` | `web.myapp.localhost` | `fix-login.web.myapp.localhost` |
-| `DATABASE_URL`, `PG*` | `myapp_dev` as role `myapp` | `myapp_dev_fix_login` as role `myapp-fix-login` |
+| `DATABASE_URL`, `PG*` | `myapp_dev` as role `myapp` | `myapp_dev_fix_login` as role `myapp--fix-login` |
 | `TEST_DATABASE_URL` | `myapp_test` | `myapp_test_fix_login` |
-| `REDIS_URL` | password `myapp` | password `myapp-fix-login` |
+| `REDIS_URL` | password `myapp` | password `myapp--fix-login` |
 | `LOCALFOREST_<SERVICE>_URL`, `_PORT` | every service's | every service's |
+| named ports' `env`, `LOCALFOREST_<SERVICE>_<NAME>_PORT`, `_URL` | every service's | every service's |
 | `LOCALFOREST_SERVICE`, `LOCALFOREST_WORKTREE`, `LOCALFOREST_PROJECT` | | |
 | `NODE_EXTRA_CA_CERTS` | the local CA | |
+
+Worktree roles were `<project>-<worktree>` before; the daemon renames an old role to
+the new name on its next start (or, if that name was shared by two checkouts, makes
+the new role a member of it). The Redis password and the role changed, so restart
+anything a worktree runs by hand with an old `.env` / `localforest env`.
 
 Detected from the manifests in the service's `cwd`, set to its hostname so the dev
 server accepts it (the service's `env` overrides them):
@@ -223,7 +264,15 @@ base port.
 
 Point your apps at `DATABASE_URL` / `REDIS_URL` (Ecto: `url: System.fetch_env!("DATABASE_URL")`).
 Test databases (and `MIX_TEST_PARTITION` ones) are the app's to create (`mix ecto.create`
-works through the proxy); only the dev database is cloned from the template.
+works through the proxy); only the dev database is cloned from the template. A checkout
+owns its dev and test databases and partitions named `<test db><N>` (Ecto's usual
+`System.get_env("TEST_DATABASE_URL") <> System.get_env("MIX_TEST_PARTITION", "")`:
+`myapp_test_fix_login2`) or `<prefix>_test<N>_<worktree>` (`myapp_test2_fix_login`).
+`<test db><N>` is ambiguous when a worktree is named like another plus digits (`x2`
+vs `x` + 2): the exact name, then the longest test database, wins among existing
+checkouts. An equal claim (project `shop` worktree `dev-x` and project `shop-dev`
+worktree `x` both get `shop_dev_dev_x`) is nobody's: refused, never dropped. Removing
+a checkout drops only databases its role created.
 
 All services of a checkout share its `DATABASE_URL` and `REDIS_URL` for now
 (FIXME: databases and redis-servers per service).
@@ -240,7 +289,7 @@ the primary's paths.
 
 Every worktree gets its environment in `.env` too (a marked block at the top,
 rewritten on each start; keys of a `.env` cloned from the primary are commented
-out). If `.env` isn't gitignored it's added to `.git/info/exclude`; a tracked `.env`
+out). Values are single-quoted, which dotenvy, Ruby/Node dotenv, docker compose, direnv and `set -a; . .env` read literally; a value holding `'` or a line break is double-quoted instead, with `\\ \" \$ \n` escaped and backticks as single-quoted pieces so sourcing it runs nothing (loaders differ there: Node dotenv keeps the backslashes, Ruby dotenv and docker compose don't join quoted pieces, sh reads `\n` literally). Bun expands `$VAR` even in single quotes, so a value containing `$` is logged as a warning. If `.env` isn't gitignored it's added to `.git/info/exclude`; a tracked `.env`
 is left alone. Then `localforest.setup` runs once in it.
 
 ## Removed worktrees and previews
@@ -255,7 +304,9 @@ worktree back at the commit it was at (fetched from the remote or the pull reque
 head if it's no longer local), with a fresh copy of the template database, and sends
 you back to the page, whose service then starts on demand. A preview isn't
 auto-removed for its merged pull request; it closes after `localforest.previewTtlHours`
-(48) without requests or database / Redis connections, and the page shows the
+(48) without requests or database / Redis connections, unless it has uncommitted
+changes or commits that are neither pushed nor in its merged pull request (a pushed
+branch loses nothing, merged or not), and the page shows the
 original reason again.
 
 ## Commands
@@ -289,9 +340,31 @@ All configurable (`--pg-port`, `--redis-port`, `--https-port`, `--http-port` or
 
 - The RAM disk is volatile: a reboot or `localforest down --eject` empties every
   database; the next start seeds the primary again through the migrate command.
-- Worktree checkout roles are `SUPERUSER` (dev tooling expects it: extensions,
-  `ecto.create`, objects owned by the primary's role in cloned databases); which
-  databases they can open is enforced by the proxy.
+- Checkout roles are not superusers: `CREATEDB` only. A checkout owns its
+  databases (`mix ecto.create` / `ecto.drop` work) and everything in its cloned dev
+  database: the template's objects belong to a no-login role named after it
+  (`<prefix>_template`), handed to the worktree's role on clone. It can't drop or alter
+  other checkouts' databases or roles, run programs (`COPY ... TO PROGRAM`) or read
+  server files; which databases it can open is enforced by the proxy, which also
+  refuses a database another checkout's role created under its name. Trusted
+  extensions (`pgcrypto`, `citext`, `pg_trgm`, `hstore`, `uuid-ossp`, ...) are created
+  by the app as usual; others (`postgis`, `vector`) need
+  `localforest.postgres.createExtensions`. What still needs a superuser: disabling
+  constraint triggers (Rails fixtures' `disable_referential_integrity` warns) and
+  `COMMENT ON EXTENSION` for pre-created extensions in a `structure.sql`. Keep
+  `dblink` / `postgres_fdw` out of `createExtensions`: they connect past the proxy.
+- This boundary covers SQL through the proxy only. The real server's socket
+  (`~/.local/state/localforest/pg`) trusts `postgres` without a password: any local
+  process that finds it is a superuser. It isolates checkouts from each other (agents,
+  tools), not from other programs running as you.
+- On start the daemon revokes `SUPERUSER` from every role but `postgres` (checkout
+  roles used to be superusers), and on provisioning hands a checkout's role the
+  databases it owns by name that an unregistered role made (its role under an older
+  naming scheme), with their objects; event triggers, which need a superuser owner,
+  go to `postgres`. If that fails, provisioning fails and is retried a minute later.
+  Handing over locks every object of a database in one transaction: with many
+  thousands of objects raise `max_locks_per_transaction` in
+  `localforest.postgres.settings` if it runs out of shared memory.
 - macOS has no API for RAM disks, so `hdiutil`/`diskutil` are run for it; PostgreSQL,
   redis-server, the migrate and service commands and language servers are also
   separate processes. Everything else (git, GitHub, certificates, keychain) is

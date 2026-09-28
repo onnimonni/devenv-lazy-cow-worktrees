@@ -355,9 +355,25 @@ struct Pull {
     head: PullHead,
 }
 
+#[derive(Debug, Clone)]
+pub struct MergedPr {
+    pub number: u64,
+    /// Head commit sha.
+    pub head: String,
+    /// Unix seconds.
+    pub merged_at: i64,
+}
+
+/// GitHub's `2024-05-01T12:00:00Z` as unix seconds.
+fn unix_seconds(ts: &str) -> Result<i64> {
+    let t = time::OffsetDateTime::parse(ts, &time::format_description::well_known::Rfc3339)
+        .with_context(|| format!("bad timestamp {ts:?}"))?;
+    Ok(t.unix_timestamp())
+}
+
 impl Client {
-    /// Latest merged PR from this repository (not a fork) for `branch`: (number, head sha).
-    pub async fn merged_pr(&self, branch: &str) -> Result<Option<(u64, String)>> {
+    /// Latest merged PR from this repository (not a fork) for `branch`.
+    pub async fn merged_pr(&self, branch: &str) -> Result<Option<MergedPr>> {
         let url = format!(
             "{}/repos/{}/{}/pulls",
             self.api, self.repo.owner, self.repo.name
@@ -376,7 +392,7 @@ impl Client {
             .json()
             .await?;
         let full = self.repo.to_string();
-        Ok(pulls
+        pulls
             .into_iter()
             .filter(|p| {
                 p.merged_at.is_some()
@@ -387,7 +403,14 @@ impl Client {
                         .is_some_and(|r| r.full_name.eq_ignore_ascii_case(&full))
             })
             .max_by_key(|p| p.number)
-            .map(|p| (p.number, p.head.sha)))
+            .map(|p| {
+                Ok(MergedPr {
+                    number: p.number,
+                    merged_at: unix_seconds(p.merged_at.as_deref().unwrap_or_default())?,
+                    head: p.head.sha,
+                })
+            })
+            .transpose()
     }
 }
 
@@ -477,6 +500,12 @@ mod tests {
         let raw = format!(r#"{{"Header":{{"X-Github-Event":["pull_request"]}},"Body":"{body}"}}"#);
         let ev: WsEvent = serde_json::from_str(&raw).unwrap();
         assert_eq!(ev.event().unwrap(), None);
+    }
+
+    #[test]
+    fn parses_merged_at() {
+        assert_eq!(unix_seconds("2024-05-01T12:00:00Z").unwrap(), 1_714_564_800);
+        assert!(unix_seconds("").is_err());
     }
 
     #[test]

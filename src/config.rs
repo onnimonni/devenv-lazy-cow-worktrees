@@ -98,12 +98,28 @@ pub struct Global {
     /// {"shared_preload_libraries": "pg_stat_statements"}.
     #[arg(long, env = "LOCALFOREST_POSTGRES_SETTINGS", global = true)]
     pub postgres_settings: Option<String>,
+    /// Extensions to create in template1 (so in every database made afterwards) and
+    /// the primaries' databases, as superuser: for extensions that aren't trusted
+    /// (postgis, vector), which checkout roles can't create. Comma or space separated.
+    #[arg(long, env = "LOCALFOREST_POSTGRES_EXTENSIONS", global = true)]
+    pub postgres_extensions: Option<String>,
     /// The `redis-server` to run [default: from PATH].
     #[arg(long, env = "LOCALFOREST_REDIS_SERVER", global = true)]
     pub redis_server: Option<PathBuf>,
 }
 
 impl Global {
+    /// `--postgres-extensions` as names.
+    pub fn postgres_extensions(&self) -> Vec<String> {
+        self.postgres_extensions
+            .as_deref()
+            .unwrap_or_default()
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
     /// `postgres_settings` as `name=value` pairs.
     pub fn postgres_settings(&self) -> Result<Vec<(String, String)>> {
         let Some(json) = self
@@ -210,29 +226,35 @@ pub fn ca_cert_path() -> PathBuf {
 /// Per-machine random secret that checkout passwords derive from, created on first
 /// use (0600), so `localforest env` and the daemon agree without talking.
 pub fn secret() -> Result<Vec<u8>> {
+    secret_in(&home())
+}
+
+fn secret_in(dir: &Path) -> Result<Vec<u8>> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    let path = home().join("secret");
+    let path = dir.join("secret");
     if let Ok(s) = std::fs::read(&path)
         && s.len() >= 32
     {
         return Ok(s);
     }
-    std::fs::create_dir_all(home())?;
+    std::fs::create_dir_all(dir)?;
     let mut s = vec![0u8; 32];
     std::fs::File::open("/dev/urandom")
         .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut s))
         .context("reading /dev/urandom")?;
-    match std::fs::OpenOptions::new()
+    // Written in full, then linked into place: a racing reader never sees it partial.
+    let tmp = dir.join(format!("secret.{}.tmp", hex::encode(&s[..8])));
+    std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(&path)
-    {
-        Ok(mut f) => {
-            f.write_all(&s)?;
-            Ok(s)
-        }
+        .open(&tmp)?
+        .write_all(&s)?;
+    let linked = std::fs::hard_link(&tmp, &path);
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => Ok(s),
         // Another process won the race.
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(std::fs::read(&path)?),
         Err(e) => Err(e.into()),
@@ -253,6 +275,20 @@ pub fn dns_label(s: &str) -> String {
     let out: String = out.trim_matches('-').chars().take(32).collect();
     let out = out.trim_end_matches('-').to_string();
     if out.is_empty() { "x".into() } else { out }
+}
+
+/// Name of a worktree, from its git admin directory name (`.git/worktrees/<name>`),
+/// which is unique in the repository: git names it after the worktree's directory and
+/// numbers repeats. Kept as is when it is already a DNS label; otherwise normalized,
+/// shortened and suffixed with a hash of the original, so two worktrees never share a
+/// name (and with it hostnames, databases, role, Redis and ports).
+pub fn worktree_label(name: &str) -> String {
+    if valid_label(name) {
+        return name.to_string();
+    }
+    let hash = hex::encode(&Sha256::digest(name.as_bytes())[..3]);
+    let base: String = dns_label(name).chars().take(32 - 1 - hash.len()).collect();
+    format!("{}-{hash}", base.trim_end_matches('-'))
 }
 
 pub fn valid_label(s: &str) -> bool {
@@ -298,11 +334,20 @@ impl Project {
         self.root.join(&self.settings.worktrees_dir)
     }
 
+    /// A worktree's port is the one recorded in its git admin dir (the daemon records
+    /// them, `worktree::assign_ports`), else its hashed slot. Reads only: `localforest
+    /// env` computes an unrecorded one with `worktree::plan_ports` first.
     pub fn checkout(&self, worktree: Option<&str>, path: PathBuf) -> Checkout {
         let port = match worktree {
             None => self.settings.port,
-            Some(w) => worktree_port(&self.name, w),
+            Some(w) => crate::worktree::recorded_port(&path)
+                .unwrap_or_else(|| worktree_port(&self.name, w)),
         };
+        self.checkout_on(worktree, path, port)
+    }
+
+    /// `checkout` with a given base port.
+    pub fn checkout_on(&self, worktree: Option<&str>, path: PathBuf, port: u16) -> Checkout {
         Checkout {
             project: self.name.clone(),
             db_prefix: self.db_prefix(),
@@ -314,11 +359,17 @@ impl Project {
     }
 }
 
-/// 20000-28990 in steps of 10, from a hash of project and worktree: every tool can
-/// compute it. The worktree's services use this port and the 9 above it.
+/// Worktree base ports: 900 slots of 10 (a worktree's services use its base port and
+/// the 9 above it).
+pub const WORKTREE_PORTS: std::ops::Range<u16> = 20000..29000;
+
+/// A worktree's first-choice slot, from a hash of project and worktree. Its actual
+/// port is recorded in its git admin dir by `worktree::port`, which moves on to the
+/// next free slot when another worktree has this one.
 pub fn worktree_port(project: &str, worktree: &str) -> u16 {
     let h = Sha256::digest(format!("{project}/{worktree}").as_bytes());
-    20000 + (u32::from_be_bytes([h[0], h[1], h[2], h[3]]) % 900) as u16 * 10
+    let slots = u32::from(WORKTREE_PORTS.end - WORKTREE_PORTS.start) / 10;
+    WORKTREE_PORTS.start + (u32::from_be_bytes([h[0], h[1], h[2], h[3]]) % slots) as u16 * 10
 }
 
 fn yes() -> bool {
@@ -370,6 +421,72 @@ pub struct Service {
     /// the migrations ran, for servers without a code reloader.
     #[serde(default)]
     pub restart_on_pull: bool,
+    /// Further ports it listens on (e.g. a debugger), by name, from the same 10-port
+    /// block, exported to every environment of the checkout.
+    #[serde(default)]
+    pub ports: BTreeMap<String, ExtraPort>,
+}
+
+/// A service's secondary port (`localforest.services.<svc>.ports.<name>`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExtraPort {
+    /// Variable holding the port [default: `<NAME>_PORT`].
+    #[serde(default)]
+    pub env: Option<String>,
+    /// Served at https://<worktree>.<name>.<project>.localhost, whose first request
+    /// starts the owning service.
+    #[serde(default)]
+    pub http: bool,
+    /// Port = the checkout's base port + this (0-9) [default: the highest free one].
+    #[serde(default)]
+    pub offset: Option<u16>,
+}
+
+/// A secondary port placed in a checkout's 10-port block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortSlot {
+    pub service: String,
+    pub name: String,
+    pub offset: u16,
+    pub env: String,
+    pub http: bool,
+}
+
+/// Every port of a checkout's block: services' offsets and their secondary ports.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Layout {
+    pub services: BTreeMap<String, u16>,
+    pub ports: Vec<PortSlot>,
+}
+
+fn env_var_name(name: &str) -> String {
+    name.to_ascii_uppercase().replace('-', "_")
+}
+
+/// Variables `Checkout::service_env` sets besides `LOCALFOREST_*`; a named port's
+/// `env` may not replace them.
+pub const RESERVED_ENV: &[&str] = &[
+    "PORT",
+    "PGHOST",
+    "PGPORT",
+    "PGUSER",
+    "PGPASSWORD",
+    "PGDATABASE",
+    "DATABASE_URL",
+    "TEST_DATABASE_URL",
+    "REDIS_URL",
+    "NODE_EXTRA_CA_CERTS",
+    "PHX_HOST",
+    "RAILS_DEVELOPMENT_HOSTS",
+    "__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS",
+];
+
+fn valid_env_name(s: &str) -> bool {
+    let mut b = s.bytes();
+    b.next()
+        .is_some_and(|c| c.is_ascii_uppercase() || c == b'_')
+        && b.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -400,22 +517,8 @@ impl std::str::FromStr for Services {
 
 impl Services {
     fn validate(&self) -> std::result::Result<(), String> {
-        let mut seen = BTreeMap::new();
+        self.layout()?;
         for (name, s) in &self.0 {
-            if !valid_label(name) {
-                return Err(format!(
-                    "service {name}: use a-z, 0-9 and '-' (it's a hostname)"
-                ));
-            }
-            let off = self.offset(name);
-            if off > 9 {
-                return Err(format!("service {name}: port offset {off} is over 9"));
-            }
-            if let Some(other) = seen.insert(off, name) {
-                return Err(format!(
-                    "services {other} and {name} share port offset {off}"
-                ));
-            }
             for d in &s.depends_on {
                 if !self.0.contains_key(d) {
                     return Err(format!("service {name} depends on unknown service {d}"));
@@ -428,10 +531,107 @@ impl Services {
         Ok(())
     }
 
+    /// Place every port in the 10-port block: services at their `portOffset` (default:
+    /// position by name), then their secondary ports at their `offset`, the rest from
+    /// the top down (9, 8, ...) by service and port name. Pure: `localforest env` and
+    /// the daemon agree.
+    pub fn layout(&self) -> std::result::Result<Layout, String> {
+        fn take(
+            taken: &mut BTreeMap<u16, String>,
+            off: u16,
+            what: String,
+        ) -> std::result::Result<(), String> {
+            if off > 9 {
+                return Err(format!("{what}: port offset {off} is over 9"));
+            }
+            match taken.insert(off, what.clone()) {
+                Some(other) => Err(format!("{other} and {what} share port offset {off}")),
+                None => Ok(()),
+            }
+        }
+        let mut taken = BTreeMap::new();
+        let mut layout = Layout::default();
+        for (i, (name, s)) in self.0.iter().enumerate() {
+            if !valid_label(name) {
+                return Err(format!(
+                    "service {name}: use a-z, 0-9 and '-' (it's a hostname)"
+                ));
+            }
+            let off = s.port_offset.unwrap_or(i as u16);
+            take(&mut taken, off, format!("service {name}"))?;
+            layout.services.insert(name.clone(), off);
+        }
+        let mut envs: BTreeMap<String, String> = BTreeMap::new();
+        // LOCALFOREST_<SERVICE>_PORT / _<SERVICE>_<PORT>_PORT (and _URL) must not collide.
+        let mut generated: BTreeMap<String, String> = BTreeMap::new();
+        for name in self.0.keys() {
+            generated.insert(env_var_name(name), format!("service {name}"));
+        }
+        let mut hosts: BTreeMap<&str, &str> = BTreeMap::new();
+        for (svc, s) in &self.0 {
+            for (name, p) in &s.ports {
+                let what = format!("port {svc}.{name}");
+                if !valid_label(name) {
+                    return Err(format!("{what}: use a-z, 0-9 and '-' in its name"));
+                }
+                if p.http {
+                    if self.0.contains_key(name) {
+                        return Err(format!("{what}: its hostname is service {name}'s"));
+                    }
+                    if let Some(other) = hosts.insert(name, svc) {
+                        return Err(format!("{what}: service {other} has an http port {name}"));
+                    }
+                }
+                let env = p
+                    .env
+                    .clone()
+                    .unwrap_or_else(|| format!("{}_PORT", env_var_name(name)));
+                if !valid_env_name(&env) {
+                    return Err(format!("{what}: env {env} is not [A-Z_][A-Z0-9_]*"));
+                }
+                if RESERVED_ENV.contains(&env.as_str()) || env.starts_with("LOCALFOREST_") {
+                    return Err(format!("{what}: env {env} is set by localforest"));
+                }
+                if let Some(other) = envs.insert(env.clone(), what.clone()) {
+                    return Err(format!("{other} and {what} share env {env}"));
+                }
+                let var = format!("{}_{}", env_var_name(svc), env_var_name(name));
+                if let Some(other) = generated.insert(var.clone(), what.clone()) {
+                    return Err(format!(
+                        "{other} and {what} both set LOCALFOREST_{var}_PORT"
+                    ));
+                }
+                if let Some(off) = p.offset {
+                    take(&mut taken, off, what)?;
+                }
+                layout.ports.push(PortSlot {
+                    service: svc.clone(),
+                    name: name.clone(),
+                    offset: p.offset.unwrap_or(u16::MAX),
+                    env,
+                    http: p.http,
+                });
+            }
+        }
+        for slot in layout.ports.iter_mut().filter(|p| p.offset == u16::MAX) {
+            let what = format!("port {}.{}", slot.service, slot.name);
+            let off = (0..=9u16)
+                .rev()
+                .find(|o| !taken.contains_key(o))
+                .ok_or_else(|| {
+                    format!("{what}: no free port offset (the 10-port block is full)")
+                })?;
+            take(&mut taken, off, what)?;
+            slot.offset = off;
+        }
+        Ok(layout)
+    }
+
     pub fn offset(&self, name: &str) -> u16 {
-        let s = &self.0[name];
-        s.port_offset
-            .unwrap_or_else(|| self.0.keys().position(|k| k == name).unwrap_or(0) as u16)
+        self.layout()
+            .ok()
+            .and_then(|l| l.services.get(name).copied())
+            .unwrap_or(0)
     }
 
     /// The service served at the checkout's own hostname.
@@ -442,6 +642,59 @@ impl Services {
             .or_else(|| self.0.get_key_value("web").filter(|(_, s)| s.http))
             .or_else(|| self.0.iter().find(|(_, s)| s.http))
             .map(|(k, _)| k.as_str())
+    }
+}
+
+/// PostgreSQL's longest name (NAMEDATALEN - 1); it silently truncates longer ones.
+pub const PG_NAME_MAX: usize = 63;
+
+/// Longest infix a checkout's database names get: `_test_p<N>` of test partitions.
+const LONGEST_DB_INFIX: &str = "_test_p9999";
+
+fn short_hash(s: &str) -> String {
+    hex::encode(&Sha256::digest(s.as_bytes())[..4])
+}
+
+/// Every database and role name localforest makes: kept when it fits PostgreSQL's 63
+/// bytes, else cut and suffixed with a hash of the whole, so two long names can't
+/// truncate to the same one.
+pub fn pg_name(s: &str) -> String {
+    if s.len() <= PG_NAME_MAX {
+        return s.to_string();
+    }
+    let hash = short_hash(s);
+    let mut head = String::new();
+    for c in s.chars() {
+        if head.len() + c.len_utf8() > PG_NAME_MAX - hash.len() - 1 {
+            break;
+        }
+        head.push(c);
+    }
+    format!("{head}_{hash}")
+}
+
+/// A worktree's databases and role under its pre-upgrade name (`Checkout::legacy`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Legacy {
+    pub name: String,
+    pub role: String,
+    /// (old, new) dev and test databases.
+    pub dbs: [(String, String); 2],
+    test_prefix: String,
+    suffix: String,
+}
+
+impl Legacy {
+    /// Test partitions under the old name (dropped: tests recreate them).
+    pub fn owns_partition(&self, db: &str) -> bool {
+        let Some(mid) = db
+            .strip_prefix(&self.test_prefix)
+            .and_then(|r| r.strip_suffix(&self.suffix))
+        else {
+            return false;
+        };
+        let mid = mid.trim_start_matches('_').trim_start_matches('p');
+        !mid.is_empty() && mid.bytes().all(|b| b.is_ascii_digit())
     }
 }
 
@@ -467,11 +720,23 @@ impl Checkout {
         }
     }
 
+    /// `_<worktree>` of its database names, shortened (with a hash of the worktree)
+    /// where the longest name built from it, a `<prefix>_test_p<NNNN>_<wt>` partition,
+    /// would pass PostgreSQL's 63 bytes: its truncation would cut the end, where
+    /// worktrees differ.
     fn suffix(&self) -> String {
-        self.worktree
-            .as_deref()
-            .map(|w| format!("_{}", w.replace('-', "_")))
-            .unwrap_or_default()
+        let Some(w) = self.worktree.as_deref() else {
+            return String::new();
+        };
+        let full = format!("_{}", w.replace('-', "_"));
+        let room = PG_NAME_MAX.saturating_sub(self.db_prefix.len() + LONGEST_DB_INFIX.len());
+        if full.len() <= room {
+            return full;
+        }
+        let hash = short_hash(w);
+        let keep = room.saturating_sub(hash.len() + 1).max(1);
+        let head: String = full.chars().take(keep).collect();
+        format!("{}_{hash}", head.trim_end_matches('_'))
     }
 
     pub fn service(&self, name: &str) -> Option<&Service> {
@@ -502,7 +767,19 @@ impl Checkout {
             .iter()
             .filter(|(_, s)| s.http)
             .map(|(n, _)| (Some(n.clone()), self.service_host(n), self.service_port(n)))
+            .chain(self.port_slots().into_iter().filter(|p| p.http).map(|p| {
+                (
+                    Some(p.service),
+                    self.service_host(&p.name),
+                    self.port + p.offset,
+                )
+            }))
             .collect()
+    }
+
+    /// The services' secondary ports.
+    pub fn port_slots(&self) -> Vec<PortSlot> {
+        self.services.layout().map(|l| l.ports).unwrap_or_default()
     }
 
     /// Host of the default service (the checkout's own without services).
@@ -514,41 +791,109 @@ impl Checkout {
     }
 
     pub fn dev_db(&self) -> String {
-        format!("{}_dev{}", self.db_prefix, self.suffix())
+        pg_name(&format!("{}_dev{}", self.db_prefix, self.suffix()))
     }
 
     pub fn test_db(&self) -> String {
-        format!("{}_test{}", self.db_prefix, self.suffix())
+        pg_name(&format!("{}_test{}", self.db_prefix, self.suffix()))
     }
 
     /// The project's template database, which worktrees' dev databases are cloned from.
     pub fn template_db(&self) -> String {
-        format!("{}_template", self.db_prefix)
+        pg_name(&format!("{}_template", self.db_prefix))
     }
 
-    /// Databases this checkout owns: dev, test and MIX_TEST_PARTITION style
-    /// `<prefix>_test<N>_<wt>` / `<prefix>_test_p<N>_<wt>`.
+    /// Databases this checkout may own: dev, test, and MIX_TEST_PARTITION ones,
+    /// `<test db><N>` (Ecto's usual `"..._test#{partition}"` on TEST_DATABASE_URL) or
+    /// `<prefix>_test<N>_<worktree>`. No other form: `<prefix>_test_<N>_<wt>` and
+    /// `<prefix>_test_p<N>_<wt>` are test databases of worktrees `<N>-<wt>` and
+    /// `p<N>-<wt>`. `<test db><N>` still overlaps worktrees named like this one plus
+    /// digits (`x` + 2 vs worktree `x2`): `db_owner` settles those.
     pub fn owns_db(&self, db: &str) -> bool {
         if db == self.dev_db() || db == self.test_db() {
             return true;
         }
-        let Some(rest) = db.strip_prefix(&format!("{}_test", self.db_prefix)) else {
-            return false;
-        };
-        let Some(mid) = rest.strip_suffix(&self.suffix()) else {
-            return false;
-        };
-        let mid = mid.trim_start_matches('_').trim_start_matches('p');
-        !mid.is_empty() && mid.bytes().all(|b| b.is_ascii_digit())
+        let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        if db.strip_prefix(&self.test_db()).is_some_and(digits) {
+            return true;
+        }
+        // Worktrees only: for the primary it's `<test db><N>` again.
+        let suffix = self.suffix();
+        !suffix.is_empty()
+            && db
+                .strip_prefix(&format!("{}_test", self.db_prefix))
+                .and_then(|rest| rest.strip_suffix(&suffix))
+                .is_some_and(digits)
+    }
+
+    /// The same checkout (project and worktree), whatever its settings.
+    pub fn same(&self, other: &Checkout) -> bool {
+        (&self.project, &self.worktree) == (&other.project, &other.worktree)
     }
 
     /// Key for per-checkout processes and logs; also its PostgreSQL role and the
     /// Redis password that picks its redis-server behind the shared Redis port.
+    /// `<project>--<worktree>`: project names never contain `--` (`dns_label`), so
+    /// project `shop` + worktree `admin-foo` and project `shop-admin` + worktree `foo`
+    /// stay apart. Over PostgreSQL's 63-byte names, shortened with a hash of the whole.
     pub fn id(&self) -> String {
         match &self.worktree {
-            Some(w) => format!("{}-{w}", self.project),
+            Some(w) => pg_name(&format!("{}--{w}", self.project)),
             None => self.project.clone(),
         }
+    }
+
+    /// Databases and role of this worktree under its name before worktree names
+    /// came from git admin dirs (`dns_label` of its directory), when that differs:
+    /// (old name, old role, (old, new) dev and test databases).
+    pub fn legacy(&self) -> Option<Legacy> {
+        let w = self.worktree.as_deref()?;
+        let old = dns_label(&self.path.file_name()?.to_string_lossy());
+        if old == w {
+            return None;
+        }
+        // The old code didn't shorten names; PostgreSQL truncated them.
+        let trunc = |s: String| s.chars().take(PG_NAME_MAX).collect::<String>();
+        let suffix = format!("_{}", old.replace('-', "_"));
+        Some(Legacy {
+            dbs: [
+                (
+                    trunc(format!("{}_dev{suffix}", self.db_prefix)),
+                    self.dev_db(),
+                ),
+                (
+                    trunc(format!("{}_test{suffix}", self.db_prefix)),
+                    self.test_db(),
+                ),
+            ],
+            role: trunc(format!("{}-{old}", self.project)),
+            test_prefix: format!("{}_test", self.db_prefix),
+            suffix,
+            name: old,
+        })
+    }
+
+    /// The id (role name) worktrees had before `id` used `--` (and, for one whose
+    /// name changed, before names came from git admin dirs: `legacy`); None for the
+    /// primary, whose id didn't change.
+    pub fn legacy_id(&self) -> Option<String> {
+        let w = self.worktree.as_deref()?;
+        if let Some(old) = self.legacy() {
+            return Some(old.role);
+        }
+        // PostgreSQL truncated long role names.
+        Some(
+            format!("{}-{w}", self.project)
+                .chars()
+                .take(PG_NAME_MAX)
+                .collect(),
+        )
+    }
+
+    /// Key of a one-off command's log (`setup`, `seed`) in the checkout; `+` can't
+    /// meet a checkout or service id.
+    pub fn run_id(&self, what: &str) -> String {
+        format!("{}+{what}", self.id())
     }
 
     /// Key of a service's process and log.
@@ -624,13 +969,26 @@ impl Checkout {
             ),
         ];
         for (n, s) in &self.services.0 {
-            let var = n.to_ascii_uppercase().replace('-', "_");
+            let var = env_var_name(n);
             env.push((
                 format!("LOCALFOREST_{var}_PORT"),
                 self.service_port(n).to_string(),
             ));
             if s.http {
                 env.push((format!("LOCALFOREST_{var}_URL"), url(&self.service_host(n))));
+            }
+        }
+        for p in self.port_slots() {
+            let port = (self.port + p.offset).to_string();
+            let var = format!(
+                "LOCALFOREST_{}_{}",
+                env_var_name(&p.service),
+                env_var_name(&p.name)
+            );
+            env.push((p.env, port.clone()));
+            env.push((format!("{var}_PORT"), port));
+            if p.http {
+                env.push((format!("{var}_URL"), url(&self.service_host(&p.name))));
             }
         }
         let svc = service.and_then(|n| self.service(n));
@@ -696,8 +1054,39 @@ pub fn locate(path: &Path) -> Result<(PathBuf, Option<String>, PathBuf)> {
     if top == root {
         return Ok((root, None, top));
     }
-    let name = dns_label(&top.file_name().unwrap_or_default().to_string_lossy());
-    Ok((root, Some(name), top))
+    // A linked worktree's git dir is `<common>/worktrees/<admin name>`.
+    let admin = repo.path().file_name().context("worktree git dir")?;
+    Ok((root, Some(worktree_label(&admin.to_string_lossy())), top))
+}
+
+/// Which of `checkouts` a database belongs to, when more than one could own it by
+/// name: the one whose dev or test database it is, else the one whose partition it is
+/// with the longest test database name (`app_test_x2` is worktree `x2`'s own, not `x`'s
+/// partition 2; `app_test_x22` is `x2`'s partition 2 while `x22` doesn't exist).
+/// None when nobody claims it, or when checkouts tie (project `shop` worktree `dev-x`
+/// and project `shop-dev` worktree `x` both name theirs `shop_dev_dev_x`): then
+/// neither may open or drop it.
+pub fn db_owner<'a>(
+    db: &str,
+    checkouts: impl IntoIterator<Item = &'a Checkout>,
+) -> Option<&'a Checkout> {
+    let key = |c: &Checkout| (db == c.dev_db() || db == c.test_db(), c.test_db().len());
+    let mut best: Vec<&Checkout> = Vec::new();
+    for c in checkouts.into_iter().filter(|c| c.owns_db(db)) {
+        match best.first().map(|b| key(b).cmp(&key(c))) {
+            Some(std::cmp::Ordering::Greater) => {}
+            Some(std::cmp::Ordering::Equal) => {
+                if !best.iter().any(|b| b.same(c)) {
+                    best.push(c);
+                }
+            }
+            _ => best = vec![c],
+        }
+    }
+    match best[..] {
+        [one] => Some(one),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -754,7 +1143,7 @@ mod tests {
         assert_eq!(env["PORT"], "20000");
         assert_eq!(env["LOCALFOREST_URL"], "https://wt.api.my-app.localhost");
         assert_eq!(env["PGDATABASE"], "my_app_dev_wt");
-        assert!(env["REDIS_URL"].starts_with("redis://:my-app-wt@"));
+        assert!(env["REDIS_URL"].starts_with("redis://:my-app--wt@"));
         assert_eq!(
             env["LOCALFOREST_WEB_URL"],
             "https://wt.web.my-app.localhost"
@@ -784,6 +1173,133 @@ mod tests {
     }
 
     #[test]
+    fn named_ports() {
+        let mut c = with_services(
+            r#"{"web": {"exec": "mix phx.server", "ports": {
+                    "debugger": {"env": "LIVE_DEBUGGER_PORT", "http": true},
+                    "test": {"env": "TEST_PORT"}}},
+                "worker": {"exec": "mix run", "http": false,
+                    "ports": {"metrics": {"offset": 5}, "admin": {}}}}"#,
+        );
+        c.worktree = None;
+        c.port = 4000;
+        // Services by name (web 0, worker 1); explicit offsets; the rest top down by
+        // service then port name: web.debugger 9, web.test 8, worker.admin 7.
+        let slots: Vec<_> = c
+            .port_slots()
+            .into_iter()
+            .map(|p| (p.service, p.name, p.offset, p.env))
+            .collect();
+        assert_eq!(
+            slots,
+            [
+                (
+                    "web".into(),
+                    "debugger".into(),
+                    9,
+                    "LIVE_DEBUGGER_PORT".into()
+                ),
+                ("web".into(), "test".into(), 8, "TEST_PORT".into()),
+                ("worker".into(), "admin".into(), 7, "ADMIN_PORT".into()),
+                ("worker".into(), "metrics".into(), 5, "METRICS_PORT".into()),
+            ]
+        );
+        assert_eq!(c.service_port("web"), 4000);
+        assert_eq!(c.service_port("worker"), 4001);
+        assert_eq!(
+            c.routes(),
+            vec![
+                (Some("web".into()), "web.my-app.localhost".into(), 4000),
+                (Some("web".into()), "debugger.my-app.localhost".into(), 4009),
+            ]
+        );
+        let wt = Checkout {
+            worktree: Some("wt".into()),
+            ..c.clone()
+        };
+        assert!(wt.routes().contains(&(
+            Some("web".into()),
+            "wt.debugger.my-app.localhost".into(),
+            4009
+        )));
+        // In every environment of the checkout.
+        for svc in [None, Some("web"), Some("worker")] {
+            let env: BTreeMap<_, _> = c.service_env(&global(), svc).into_iter().collect();
+            assert_eq!(env["LIVE_DEBUGGER_PORT"], "4009");
+            assert_eq!(env["TEST_PORT"], "4008");
+            assert_eq!(env["ADMIN_PORT"], "4007");
+            assert_eq!(env["METRICS_PORT"], "4005");
+            assert_eq!(env["LOCALFOREST_WEB_DEBUGGER_PORT"], "4009");
+            assert_eq!(
+                env["LOCALFOREST_WEB_DEBUGGER_URL"],
+                "https://debugger.my-app.localhost"
+            );
+            assert_eq!(env["LOCALFOREST_WEB_TEST_PORT"], "4008");
+            assert!(!env.contains_key("LOCALFOREST_WEB_TEST_URL"));
+        }
+
+        let err = |json: &str| json.parse::<Services>().unwrap_err();
+        // Full block: 1 service + 10 ports.
+        let ports: Vec<String> = (0..10).map(|i| format!("\"p{i}\": {{}}")).collect();
+        let full = format!(
+            r#"{{"web": {{"exec": "x", "ports": {{{}}}}}}}"#,
+            ports.join(",")
+        );
+        assert!(err(&full).contains("block is full"), "{}", err(&full));
+        assert!(
+            err(r#"{"web": {"exec": "x", "ports": {"a": {"offset": 0}}}}"#)
+                .contains("share port offset 0")
+        );
+        assert!(
+            err(r#"{"web": {"exec": "x", "ports": {"a": {"offset": 10}}}}"#).contains("over 9")
+        );
+        assert!(
+            err(
+                r#"{"web": {"exec": "x", "ports": {"api": {"http": true}}}, "api": {"exec": "y"}}"#
+            )
+            .contains("service api's")
+        );
+        assert!(
+            err(r#"{"a": {"exec": "x", "ports": {"d": {"http": true}}}, "b": {"exec": "y", "ports": {"d": {"http": true, "env": "D2"}}}}"#)
+                .contains("http port d")
+        );
+        assert!(
+            err(r#"{"a": {"exec": "x", "ports": {"p": {}}}, "b": {"exec": "y", "ports": {"q": {"env": "P_PORT"}}}}"#)
+                .contains("share env P_PORT")
+        );
+        assert!(
+            err(r#"{"a": {"exec": "x", "ports": {"p": {"env": "lower"}}}}"#).contains("not [A-Z_]")
+        );
+        assert!(err(r#"{"a": {"exec": "x", "ports": {"P": {}}}}"#).contains("a-z"));
+        for reserved in RESERVED_ENV.iter().chain(&["LOCALFOREST_X"]) {
+            let json =
+                format!(r#"{{"a": {{"exec": "x", "ports": {{"p": {{"env": "{reserved}"}}}}}}}}"#);
+            assert!(err(&json).contains("set by localforest"), "{reserved}");
+        }
+        assert!(
+            err(r#"{"web": {"exec": "x", "ports": {"debugger": {}}}, "web-debugger": {"exec": "y"}}"#)
+                .contains("both set LOCALFOREST_WEB_DEBUGGER_PORT")
+        );
+        // Everything else service_env sets is reserved.
+        let env = c.service_env(&global(), Some("web"));
+        let ports: Vec<String> = c.port_slots().into_iter().map(|p| p.env).collect();
+        for (k, _) in env {
+            assert!(
+                k.starts_with("LOCALFOREST_")
+                    || RESERVED_ENV.contains(&k.as_str())
+                    || ports.contains(&k),
+                "{k} not in RESERVED_ENV"
+            );
+        }
+        // Null options, as the devenv module's JSON has them.
+        assert!(
+            r#"{"a": {"exec": "x", "ports": {"p": {"env": null, "http": false, "offset": null}}}}"#
+                .parse::<Services>()
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn detects_frameworks() {
         let dir = tempfile::TempDir::new().unwrap();
         let d = dir.path();
@@ -809,6 +1325,7 @@ mod tests {
             r#"{"devDependencies": {"vite": "^7"}}"#,
         )
         .unwrap();
+        assert!(keys(d).iter().all(|k| RESERVED_ENV.contains(&k.as_str())));
         assert_eq!(
             keys(d),
             [
@@ -825,6 +1342,19 @@ mod tests {
         )
         .unwrap();
         assert!(keys(other.path()).is_empty());
+    }
+
+    #[test]
+    fn postgres_extensions() {
+        assert_eq!(
+            global().postgres_extensions(),
+            ["postgis", "vector", "pg_trgm"]
+        );
+        let none = Global {
+            postgres_extensions: None,
+            ..global()
+        };
+        assert!(none.postgres_extensions().is_empty());
     }
 
     #[test]
@@ -851,18 +1381,133 @@ mod tests {
                 r#"{"shared_preload_libraries": "x", "jit": false, "n": 3}"#.into(),
             ),
             redis_server: None,
+            postgres_extensions: Some("postgis, vector  pg_trgm,".into()),
         }
     }
 
     #[test]
     fn names() {
         assert_eq!(dns_label("Fix Login_Bug!"), "fix-login-bug");
+        assert_eq!(worktree_label("fix-login-bug"), "fix-login-bug");
+        // Names that aren't labels get a hash, so they can't meet another's label.
+        let a = worktree_label("Fix Login_Bug!");
+        assert!(valid_label(&a) && a.starts_with("fix-login-bug-"), "{a}");
+        assert_ne!(a, worktree_label("fix login bug"));
+        let long = "a-very-long-task-name-that-goes-past-32-characters";
+        let x = worktree_label(&format!("{long}-one"));
+        let y = worktree_label(&format!("{long}-two"));
+        assert!(valid_label(&x) && valid_label(&y) && x != y, "{x} {y}");
+        assert_eq!(x, worktree_label(&format!("{long}-one")));
+        assert!(valid_label(&worktree_label("---")));
         assert_eq!(co(None).host(), "my-app.localhost");
         assert_eq!(co(Some("fix-it")).host(), "fix-it.my-app.localhost");
         assert_eq!(co(Some("fix-it")).dev_db(), "my_app_dev_fix_it");
         assert_eq!(co(None).test_db(), "my_app_test");
+        // Project `shop` + worktree `admin-foo` vs project `shop-admin` + worktree `foo`.
+        let id = |p: &str, w: Option<&str>| {
+            Checkout {
+                project: p.into(),
+                ..co(w)
+            }
+            .id()
+        };
+        assert_eq!(id("shop", Some("admin-foo")), "shop--admin-foo");
+        assert_ne!(id("shop", Some("admin-foo")), id("shop-admin", Some("foo")));
+        assert_ne!(id("shop-foo", None), id("shop", Some("foo")));
+        assert_ne!(co(Some("x")).run_id("setup"), co(Some("x-setup")).id());
+        // Fits PostgreSQL's 63-byte role names, still unique.
+        let (a, b) = ("a".repeat(32), "b".repeat(31));
+        let long = id(&a, Some(&format!("{b}1")));
+        assert_eq!(long.len(), 63);
+        assert_ne!(long, id(&a, Some(&format!("{b}2"))));
+        // Old role names, for the upgrade.
+        let wt = Checkout {
+            path: "/r/wt".into(),
+            ..co(Some("wt"))
+        };
+        assert_eq!(wt.legacy_id().as_deref(), Some("my-app-wt"));
+        // Renamed by the git-admin-dir naming too: its pre-upgrade role.
+        let renamed = Checkout {
+            path: "/r/.claude/worktrees/Fix_It".into(),
+            ..co(Some(&worktree_label("Fix_It")))
+        };
+        assert_eq!(renamed.legacy_id().as_deref(), Some("my-app-fix-it"));
+        assert_eq!(co(None).legacy_id(), None);
         let p = worktree_port("a", "b");
         assert!((20000..29000).contains(&p) && p.is_multiple_of(10));
+    }
+
+    #[test]
+    fn secret_created_once_under_races() {
+        for _ in 0..20 {
+            let dir = tempfile::TempDir::new().unwrap();
+            let secrets: Vec<Vec<u8>> = std::thread::scope(|sc| {
+                let hs: Vec<_> = (0..8)
+                    .map(|_| sc.spawn(|| secret_in(dir.path()).unwrap()))
+                    .collect();
+                hs.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            assert!(secrets.iter().all(|s| s.len() == 32 && *s == secrets[0]));
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn database_names_fit_postgres() {
+        let long = |p: &str, w: &str| Checkout {
+            project: p.into(),
+            db_prefix: p.replace('-', "_"),
+            ..co(Some(w))
+        };
+        let p = "a-project-name-of-thirty-two-chr";
+        assert_eq!(p.len(), 32);
+        let w1 = format!("{}-1", "w".repeat(30));
+        let w2 = format!("{}-2", "w".repeat(30));
+        let (a, b) = (long(p, &w1), long(p, &w2));
+        for c in [&a, &b] {
+            for db in [c.dev_db(), c.test_db(), c.id()] {
+                assert!(db.len() <= PG_NAME_MAX, "{db}");
+            }
+            // Partitions fit too, so PostgreSQL never truncates them.
+            for part in [
+                format!("{}9999", c.test_db()),
+                format!("{}_test9999{}", c.db_prefix, c.suffix()),
+            ] {
+                assert!(part.len() <= PG_NAME_MAX, "{part}");
+                assert!(c.owns_db(&part), "{part}");
+            }
+            assert!(c.owns_db(&c.dev_db()));
+        }
+        assert_ne!(a.dev_db(), b.dev_db());
+        assert_ne!(a.test_db(), b.test_db());
+        assert_ne!(a.id(), b.id());
+        assert!(!a.owns_db(&b.test_db()));
+        assert!(!a.owns_db(&format!("{}_test3{}", b.db_prefix, b.suffix())));
+        assert!(!a.owns_db(&format!("{}3", b.test_db())));
+        // Short names are unchanged.
+        assert_eq!(co(Some("wt")).dev_db(), "my_app_dev_wt");
+        assert_eq!(pg_name(&"x".repeat(63)), "x".repeat(63));
+        assert_eq!(pg_name(&"x".repeat(64)).len(), 63);
+        assert_ne!(pg_name(&"x".repeat(64)), pg_name(&"x".repeat(65)));
+    }
+
+    #[test]
+    fn legacy_names() {
+        let c = Checkout {
+            path: "/r/.claude/worktrees/Fix_It".into(),
+            ..co(Some(&worktree_label("Fix_It")))
+        };
+        let old = c.legacy().unwrap();
+        assert_eq!(old.name, "fix-it");
+        assert_eq!(old.role, "my-app-fix-it");
+        assert_eq!(old.dbs[0], ("my_app_dev_fix_it".into(), c.dev_db()));
+        assert!(old.owns_partition("my_app_test2_fix_it"));
+        assert!(!old.owns_partition("my_app_test_fix_it"));
+        let same = Checkout {
+            path: "/r/wt".into(),
+            ..co(Some("wt"))
+        };
+        assert!(same.legacy().is_none());
     }
 
     #[test]
@@ -870,10 +1515,77 @@ mod tests {
         let c = co(Some("wt"));
         assert!(c.owns_db("my_app_dev_wt"));
         assert!(c.owns_db("my_app_test_wt"));
+        // MIX_TEST_PARTITION: appended to the test database, or `_test<N>_<wt>`.
+        assert!(c.owns_db("my_app_test_wt2"));
+        assert!(c.owns_db("my_app_test_wt12"));
         assert!(c.owns_db("my_app_test2_wt"));
-        assert!(c.owns_db("my_app_test_p3_wt"));
+        assert!(!c.owns_db("my_app_test_wt_2"));
         assert!(!c.owns_db("my_app_test_other_wt"));
         assert!(!c.owns_db("my_app_dev"));
-        assert!(!co(None).owns_db("my_app_dev_wt"));
+        assert!(!c.owns_db("my_app_dev_wt2"));
+        let p = co(None);
+        assert!(p.owns_db("my_app_dev") && p.owns_db("my_app_test"));
+        assert!(p.owns_db("my_app_test2"));
+        assert!(!p.owns_db("my_app_dev_wt"));
+        assert!(!p.owns_db("my_app_test_"));
+    }
+
+    #[test]
+    fn database_names_never_collide() {
+        // Old forms that were other worktrees' test databases.
+        assert!(!co(Some("x")).owns_db(&co(Some("1-x")).test_db()));
+        assert!(!co(Some("x")).owns_db(&co(Some("p1-x")).test_db()));
+        assert!(!co(None).owns_db(&co(Some("2")).test_db()));
+        assert!(!co(None).owns_db(&co(Some("p2")).test_db()));
+        // Nobody else's dev or test database is a `_test<N>_<wt>` partition.
+        let names = ["x", "1-x", "p1-x", "2", "p2", "x2", "test2-x", "dev"];
+        for a in names.iter().map(|n| co(Some(n))).chain([co(None)]) {
+            for b in names.iter().map(|n| co(Some(n))).chain([co(None)]) {
+                if a != b {
+                    for db in [b.dev_db(), b.test_db()] {
+                        let exact_overlap = db.strip_prefix(&a.test_db()).is_some();
+                        assert!(!a.owns_db(&db) || exact_overlap, "{a:?} owns {db}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn partition_owner() {
+        let (x, x2, x22) = (co(Some("x")), co(Some("x2")), co(Some("x22")));
+        let all = [x.clone(), x2.clone(), x22.clone()];
+        let owner =
+            |db: &str, cs: &[Checkout]| db_owner(db, cs).map(|c| c.worktree.clone().unwrap());
+        // x's partition 2 is worktree x2's test database while x2 exists.
+        assert_eq!(owner("my_app_test_x2", &all).as_deref(), Some("x2"));
+        assert_eq!(owner("my_app_test_x2", &all[..1]).as_deref(), Some("x"));
+        // Longest test database wins among partitions.
+        assert_eq!(owner("my_app_test_x23", &all).as_deref(), Some("x2"));
+        assert_eq!(owner("my_app_test_x22", &all).as_deref(), Some("x22"));
+        assert_eq!(owner("my_app_test_x3", &all).as_deref(), Some("x"));
+        assert_eq!(owner("my_app_test2_x", &all).as_deref(), Some("x"));
+        assert_eq!(owner("my_app_test_other", &all), None);
+        let p = [co(None), co(Some("2"))];
+        assert_eq!(owner("my_app_test_2", &p).as_deref(), Some("2"));
+        assert_eq!(db_owner("my_app_test2", &p), Some(&p[0]));
+        // The same checkout twice (registered, and the caller's copy) is no tie.
+        assert_eq!(
+            owner("my_app_test_x", &[x.clone(), x.clone()]).as_deref(),
+            Some("x")
+        );
+        // Different projects' equal names: a tie, nobody owns it.
+        let a = Checkout {
+            project: "shop".into(),
+            db_prefix: "shop".into(),
+            ..co(Some("dev-x"))
+        };
+        let b = Checkout {
+            project: "shop-dev".into(),
+            db_prefix: "shop_dev".into(),
+            ..co(Some("x"))
+        };
+        assert_eq!(db_owner("shop_dev_dev_x", [&a, &b]), None);
+        assert_eq!(db_owner("shop_dev_dev_x", [&a]), Some(&a));
     }
 }

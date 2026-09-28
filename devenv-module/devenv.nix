@@ -45,6 +45,27 @@ let
     else
       cfg.postgres.package;
 
+  extraPort = types.submodule {
+    options = {
+      env = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "LIVE_DEBUGGER_PORT";
+        description = "Variable holding the port (default: `<NAME>_PORT`); also always LOCALFOREST_<SERVICE>_<NAME>_PORT (and _URL with http).";
+      };
+      http = mkOption {
+        type = types.bool;
+        default = false;
+        description = "Served at https://<worktree>.<name>.<project>.localhost, whose first request starts the service.";
+      };
+      offset = mkOption {
+        type = types.nullOr (types.ints.between 0 9);
+        default = null;
+        description = "Port = the checkout's base port + this (default: the highest free offset, 9 down).";
+      };
+    };
+  };
+
   service = types.submodule {
     options = {
       exec = mkOption {
@@ -99,6 +120,18 @@ let
         default = "no";
         description = "When it exits on its own: leave it down, start it again after a non-zero exit, or after any exit (backing off 1-30 s; `localforest service stop` keeps it down).";
       };
+      ports = mkOption {
+        type = types.attrsOf extraPort;
+        default = { };
+        example = {
+          debugger = {
+            env = "LIVE_DEBUGGER_PORT";
+            http = true;
+          };
+          test.env = "TEST_PORT";
+        };
+        description = "Further ports the service listens on, from the checkout's 10-port block, in every environment of the checkout.";
+      };
       restartOnPull = mkOption {
         type = types.bool;
         default = false;
@@ -132,7 +165,16 @@ in
         type = types.nullOr (types.functionTo (types.listOf types.package));
         default = null;
         example = lib.literalExpression "extensions: [ extensions.postgis extensions.pgvector ]";
-        description = "Extensions to install, as in devenv's services.postgres.extensions (`package.withPackages`). Enable them with CREATE EXTENSION (checkout roles are superusers).";
+        description = "Extensions to install, as in devenv's services.postgres.extensions (`package.withPackages`). Checkout roles aren't superusers: they can CREATE EXTENSION trusted ones (pgcrypto, citext, ...); list the others in createExtensions.";
+      };
+      createExtensions = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        example = [
+          "postgis"
+          "vector"
+        ];
+        description = "Extensions the daemon creates as superuser in template1 (so in every database made afterwards) and the primaries' databases: the untrusted ones checkout roles can't create. Migrations' CREATE EXTENSION IF NOT EXISTS is then a no-op.";
       };
       settings = mkOption {
         type = types.attrsOf (
@@ -205,9 +247,16 @@ in
       description = "Close a preview (a removed worktree recreated from its \"gone\" page) after this many hours without requests or database / Redis connections; 0 keeps previews until removed.";
     };
     httpsPort = mkOption {
-      type = types.port;
-      default = 443;
-      description = "HTTPS proxy port.";
+      type = types.nullOr types.port;
+      default = null;
+      example = 8443;
+      description = "HTTPS proxy port (default: 443 where unprivileged processes may bind it, i.e. macOS or Linux with net.ipv4.ip_unprivileged_port_start <= 443, else 8443).";
+    };
+    httpPort = mkOption {
+      type = types.nullOr types.port;
+      default = null;
+      example = 0;
+      description = "Plain HTTP port that redirects to HTTPS; 0 disables (default: 80 where unprivileged processes may bind it, else off).";
     };
     lsp = mkOption {
       type = types.attrsOf (types.listOf types.str);
@@ -239,14 +288,16 @@ in
 
     env = {
       LOCALFOREST_PORT = toString cfg.port;
-      LOCALFOREST_HTTPS_PORT = toString cfg.httpsPort;
       LOCALFOREST_SERVICES = builtins.toJSON cfg.services;
       LOCALFOREST_PREVIEW_TTL_HOURS = toString cfg.previewTtlHours;
       LOCALFOREST_RAMDISK_MB = toString cfg.postgres.ramdiskMB;
       LOCALFOREST_POSTGRES_BIN = "${postgres}/bin";
       LOCALFOREST_POSTGRES_SETTINGS = builtins.toJSON cfg.postgres.settings;
+      LOCALFOREST_POSTGRES_EXTENSIONS = lib.concatStringsSep "," cfg.postgres.createExtensions;
       LOCALFOREST_REDIS_SERVER = lib.getExe' cfg.redis "redis-server";
     }
+    // lib.optionalAttrs (cfg.httpsPort != null) { LOCALFOREST_HTTPS_PORT = toString cfg.httpsPort; }
+    // lib.optionalAttrs (cfg.httpPort != null) { LOCALFOREST_HTTP_PORT = toString cfg.httpPort; }
     // lib.optionalAttrs (cfg.project != null) { LOCALFOREST_PROJECT = cfg.project; }
     // lib.optionalAttrs (cfg.migrate != null) { LOCALFOREST_MIGRATE = cfg.migrate; }
     // lib.optionalAttrs (cfg.seed != null) { LOCALFOREST_SEED = cfg.seed; }

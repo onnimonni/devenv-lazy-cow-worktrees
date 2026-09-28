@@ -92,9 +92,12 @@ impl Routes {
 pub type Dashboard = Arc<dyn Fn() -> String + Send + Sync>;
 
 /// Called with the host when nothing listens on its port: starts the worktree's
-/// server and resolves once it listens (or it gave up).
+/// server and resolves once it listens, or with why it couldn't (a failed
+/// migration, say), shown on the 502 page.
 pub type Ensure = Arc<
-    dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync,
+    dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>
+        + Send
+        + Sync,
 >;
 
 /// A request to a host without a route (method, host, path, Origin header).
@@ -215,7 +218,7 @@ async fn redirect_loop(listener: TcpListener, https_port: u16) {
                     .get(header::HOST)
                     .and_then(|h| h.to_str().ok())
                     .unwrap_or("localhost");
-                let host = host.split(':').next().unwrap_or(host);
+                let host = strip_port(host);
                 let port = if https_port == 443 {
                     String::new()
                 } else {
@@ -237,6 +240,15 @@ async fn redirect_loop(listener: TcpListener, https_port: u16) {
     }
 }
 
+/// Host header without its port; an IPv6 literal keeps its brackets (`[::1]:8443` ->
+/// `[::1]`).
+fn strip_port(host: &str) -> &str {
+    if host.starts_with('[') {
+        return host.find(']').map_or(host, |end| &host[..=end]);
+    }
+    host.split(':').next().unwrap_or(host)
+}
+
 fn is_upgrade(req: &Request<Incoming>) -> bool {
     req.headers()
         .get(header::CONNECTION)
@@ -254,11 +266,8 @@ async fn handle(
         .get(header::HOST)
         .and_then(|h| h.to_str().ok())
         .or_else(|| req.uri().host())
-        .unwrap_or_default()
-        .split(':')
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+        .unwrap_or_default();
+    let host = strip_port(host).to_ascii_lowercase();
     if host == "localforest.localhost" || host == "localhost" {
         return Ok(full(
             StatusCode::OK,
@@ -299,8 +308,15 @@ async fn handle(
     if tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
         .is_err()
+        && let Some(e) = (shared.ensure)(host.clone()).await
     {
-        (shared.ensure)(host.clone()).await;
+        return Ok(full(
+            StatusCode::BAD_GATEWAY,
+            "text/plain; charset=utf-8",
+            format!(
+                "localforest: could not start {host}: {e}\nSee `localforest status` and the logs in ~/.local/state/localforest/logs.\n"
+            ),
+        ));
     }
     let path = req.uri().path_and_query().map_or("/", |p| p.as_str());
     let Ok(uri) = format!("http://127.0.0.1:{port}{path}").parse() else {
@@ -351,6 +367,15 @@ async fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strips_port_from_host() {
+        assert_eq!(strip_port("[::1]:8443"), "[::1]");
+        assert_eq!(strip_port("[::1]"), "[::1]");
+        assert_eq!(strip_port("host:443"), "host");
+        assert_eq!(strip_port("host"), "host");
+        assert_eq!(strip_port(""), "");
+    }
 
     #[test]
     fn lookup_falls_back_to_parent() {

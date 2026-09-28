@@ -28,10 +28,17 @@ work=$(mktemp -d)
 export LOCALFOREST_HOME=$home LOCALFOREST_PROJECT=demo LOCALFOREST_PORT=4100
 export LOCALFOREST_PG_PORT=55499 LOCALFOREST_REDIS_PORT=6399
 export LOCALFOREST_HTTPS_PORT=8443 LOCALFOREST_HTTP_PORT=0 LOCALFOREST_RAMDISK_MB=512
-export LOCALFOREST_MIGRATE="psql -v ON_ERROR_STOP=1 -c 'CREATE TABLE IF NOT EXISTS seeds(x int); INSERT INTO seeds VALUES (1)'"
+# Fails in the worktree named "broken".
+cat >"$home/migrate.sh" <<'EOF'
+[[ ${LOCALFOREST_WORKTREE:-} == broken ]] && { echo "migration broke" >&2; exit 1; }
+exec psql -v ON_ERROR_STOP=1 -c 'CREATE TABLE IF NOT EXISTS seeds(x int); INSERT INTO seeds VALUES (1)'
+EOF
+export LOCALFOREST_MIGRATE="bash $home/migrate.sh"
 export LOCALFOREST_SETUP="sh -c 'echo \"\$LOCALFOREST_WORKTREE\" >> $home/setup.log'"
-web="sh -c 'exec $python -m http.server \"\$PORT\" --bind 127.0.0.1'"
-LOCALFOREST_SERVICES=$(jq -nc --arg web "$web" '{web: {exec: $web}}')
+# Also serves on its named secondary port, like Phoenix's LiveDebugger; never binds `idle`.
+web="sh -c '$python -m http.server \"\$DEBUGGER_PORT\" --bind 127.0.0.1 & exec $python -m http.server \"\$PORT\" --bind 127.0.0.1'"
+LOCALFOREST_SERVICES=$(jq -nc --arg web "$web" \
+  '{web: {exec: $web, ports: {debugger: {http: true}, test: {env: "TEST_PORT"}, idle: {http: true, offset: 5}}}}')
 export LOCALFOREST_SERVICES
 unset GH_TOKEN GITHUB_TOKEN
 
@@ -90,11 +97,31 @@ wt=$("$bin" worktree new feat-a 2>/dev/null)
 pass "worktree new: $wt"
 
 eval "$(cd "$wt" && "$bin" env)"
-[[ $(psql -tAc "select count(*) from seeds") == 1 ]] || fail "worktree database not cloned from the template"
+# A template refresh racing the first connect: the clone still gets the template.
+"$bin" snapshot & snap=$!
+# Row counts depend on how the template is made; the marker says it was migrated.
+(($(psql -tAc "select count(*) from seeds") >= 1)) || fail "worktree database not cloned from the template"
+wait "$snap" || fail "snapshot failed"
+[[ -f $(git -C "$wt" rev-parse --absolute-git-dir)/localforest-migrated ]] || fail "new worktree not migrated"
+template_seeded || fail "template lost by the snapshot"
+[[ -z $(admin_psql "select 1 from pg_database where datname = 'demo_template_next'") ]] || fail "demo_template_next left behind"
 [[ $(psql -tAc "select current_database()") == demo_dev_feat_a ]] || fail "wrong database"
-pass "worktree database cloned from the template on first connect"
+pass "worktree database cloned from the template and migrated"
 if psql -d demo_dev -tAc "select 1" >/dev/null 2>&1; then fail "worktree could open the primary's database"; fi
 pass "other checkouts' databases refused"
+psql -d postgres -qc "CREATE DATABASE demo_test_feat_a2" || fail "could not create a partition database"
+[[ $(psql -d demo_test_feat_a2 -tAc "select 1") == 1 ]] || fail "MIX_TEST_PARTITION database <test db>2 refused"
+pass "MIX_TEST_PARTITION database opened"
+if out=$(PGUSER=stranger PGPASSWORD=x psql -d postgres -tAc "select 1" 2>&1); then fail "unknown user got through"; fi
+[[ $out == *"not the role of a checkout"* ]] || fail "unknown user not refused by the proxy: $out"
+pass "users that are no checkout's role refused"
+[[ $(psql -tAc "select rolsuper::text from pg_roles where rolname = current_user") == false ]] || fail "checkout role is a superuser"
+psql -qc "ALTER TABLE seeds ADD COLUMN y int" || fail "worktree can't migrate the template's tables"
+for sql in "DROP DATABASE demo_dev" "ALTER ROLE demo SUPERUSER" "COPY (SELECT 1) TO PROGRAM 'true'"; do
+  if psql -d postgres -qc "$sql" 2>/dev/null; then fail "worktree role could: $sql"; fi
+done
+[[ $(admin_psql "select 1 from pg_database where datname = 'demo_dev'") == 1 ]] || fail "primary's database gone"
+pass "worktree role owns its clone, can't touch other checkouts"
 
 redis-cli --no-auth-warning -u "$REDIS_URL" set k worktree >/dev/null
 primary_redis=$(cd "$work/app" && "$bin" env --json | jq -r .REDIS_URL)
@@ -102,14 +129,41 @@ primary_redis=$(cd "$work/app" && "$bin" env --json | jq -r .REDIS_URL)
 [[ $(redis-cli --no-auth-warning -u "$REDIS_URL" get k) == worktree ]] || fail "redis lost the key"
 pass "redis isolated per checkout"
 
+base=$(cd "$wt" && "$bin" env --json | jq -r .PORT)
+[[ $DEBUGGER_PORT == $((base + 9)) && $TEST_PORT == $((base + 8)) ]] ||
+  fail "named ports: DEBUGGER_PORT=$DEBUGGER_PORT TEST_PORT=$TEST_PORT (base $base)"
+[[ $LOCALFOREST_WEB_DEBUGGER_URL == https://feat-a.debugger.demo.localhost:8443 ]] ||
+  fail "LOCALFOREST_WEB_DEBUGGER_URL=$LOCALFOREST_WEB_DEBUGGER_URL"
+pass "named ports in env: DEBUGGER_PORT=$DEBUGGER_PORT TEST_PORT=$TEST_PORT"
+
+web_log=$(cd "$wt" && "$bin" service log -s web)
+out=$(curl_lf "https://feat-a.debugger.demo.localhost:8443/" 2>&1) || true
+[[ $out == primary ]] || { cat "$web_log" >&2; fail "named http port did not start its service: $out"; }
+pass "https://feat-a.debugger.demo.localhost started web on demand"
+
 out=$(curl_lf "https://feat-a.web.demo.localhost:8443/" 2>&1) || true
-[[ $out == primary ]] || { cat "$home/logs/demo-feat-a.web.log" >&2; fail "https service not started on demand: $out"; }
-pass "https://feat-a.web.demo.localhost started its service on demand"
+[[ $out == primary ]] || { cat "$web_log" >&2; fail "https service not served: $out"; }
+pass "https://feat-a.web.demo.localhost served"
+
+start=$SECONDS
+code=$(curl_lf -o "$work/idle.txt" -w '%{http_code}' "https://feat-a.idle.demo.localhost:8443/")
+[[ $code == 502 ]] && grep -q "doesn't listen on its idle port" "$work/idle.txt" && ((SECONDS - start < 20)) ||
+  fail "unbound named port: $code in $((SECONDS - start)) s: $(cat "$work/idle.txt")"
+pass "unbound named port answers 502 after a short grace"
 
 grep -q "DATABASE_URL=" "$wt/.env" || fail ".env not written"
 git -C "$wt" check-ignore -q .env || fail ".env not gitignored"
 [[ -z $(git -C "$wt" status --porcelain) ]] || fail "worktree not clean"
 pass ".env written and gitignored"
+
+"$bin" worktree new broken >/dev/null 2>&1 || fail "worktree new failed on a failing migration"
+"$bin" status | grep -q "migrations failed" || fail "failed migration not in status"
+out=$(curl_lf "https://broken.web.demo.localhost:8443/" 2>&1) || true
+[[ $out == *"migrations failed"* ]] || fail "failed migration not on its page: $out"
+[[ ! -f $(git -C .claude/worktrees/broken rev-parse --absolute-git-dir)/localforest-migrated ]] ||
+  fail "failed migration marked done"
+"$bin" worktree rm --force broken
+pass "failed migration: in status and on the 502 page, services not started"
 
 git worktree add -q -b manual .claude/worktrees/manual
 eventually 30 test -f .claude/worktrees/manual/.env || fail "plain git worktree not provisioned"
@@ -119,12 +173,28 @@ pass "plain git worktree add provisioned, setup ran"
 port=$(cd "$wt" && "$bin" env --json | jq -r .PORT)
 "$bin" worktree rm --force feat-a
 [[ ! -e $wt ]] || fail "worktree still there"
-if curl -s --max-time 2 "http://127.0.0.1:$port/" >/dev/null; then fail "its server survived"; fi
-[[ -z $(admin_psql "select 1 from pg_database where datname = 'demo_dev_feat_a'") ]] || fail "its database survived"
+for p in "$port" "$((port + 9))"; do
+  if curl -s --max-time 2 "http://127.0.0.1:$p/" >/dev/null; then fail "its server on $p survived"; fi
+done
+[[ -z $(admin_psql "select 1 from pg_database where datname in ('demo_dev_feat_a', 'demo_test_feat_a2')") ]] || fail "its databases survived"
 pass "rm killed its service and dropped its database"
 
 code=$(curl_lf -o "$work/gone.html" -w '%{http_code}' "https://feat-a.web.demo.localhost:8443/")
 [[ $code == 503 ]] && grep -q "Recreate worktree" "$work/gone.html" || fail "no gone page ($code)"
 pass "gone page (503) for the removed worktree"
+
+# A fresh primary database (as after a reboot) while the primary is on a feature
+# branch: migrated anyway, but the template is not made from the feature branch.
+g checkout -qb primary-feat
+admin_psql "DROP DATABASE demo_template WITH (FORCE)" >/dev/null
+admin_psql "DROP DATABASE demo_dev WITH (FORCE)" >/dev/null
+git worktree add -q -b fresh .claude/worktrees/fresh
+fresh_marker=$(git -C .claude/worktrees/fresh rev-parse --absolute-git-dir)/localforest-migrated
+eventually 60 test -f "$fresh_marker" || fail "worktree not migrated after the fresh primary"
+(($(PGUSER=postgres psql -h "$home/pg" -p 55500 -d demo_dev -tAc "select count(*) from seeds") >= 1)) ||
+  fail "fresh primary database on a feature branch not migrated"
+[[ -z $(admin_psql "select 1 from pg_database where datname = 'demo_template'") ]] ||
+  fail "template made from a feature branch"
+pass "fresh primary on a feature branch migrated, template left alone"
 
 echo "all passed"
