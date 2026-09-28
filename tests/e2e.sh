@@ -90,9 +90,10 @@ wt=$("$bin" worktree new feat-a 2>/dev/null)
 pass "worktree new: $wt"
 
 eval "$(cd "$wt" && "$bin" env)"
-[[ $(psql -tAc "select count(*) from seeds") == 1 ]] || fail "worktree database not cloned from the template"
+# The template's row, plus one from the migrate command run in the new worktree.
+[[ $(psql -tAc "select count(*) from seeds") == 2 ]] || fail "worktree database not cloned from the template and migrated"
 [[ $(psql -tAc "select current_database()") == demo_dev_feat_a ]] || fail "wrong database"
-pass "worktree database cloned from the template on first connect"
+pass "worktree database cloned from the template and migrated"
 if psql -d demo_dev -tAc "select 1" >/dev/null 2>&1; then fail "worktree could open the primary's database"; fi
 pass "other checkouts' databases refused"
 
@@ -126,5 +127,21 @@ pass "rm killed its service and dropped its database"
 code=$(curl_lf -o "$work/gone.html" -w '%{http_code}' "https://feat-a.web.demo.localhost:8443/")
 [[ $code == 503 ]] && grep -q "Recreate worktree" "$work/gone.html" || fail "no gone page ($code)"
 pass "gone page (503) for the removed worktree"
+
+# A fresh primary database (as after a reboot) while the primary is on a feature
+# branch: migrated anyway, but the template is not made from the feature branch.
+g checkout -qb primary-feat
+admin_psql "DROP DATABASE demo_template WITH (FORCE)" >/dev/null
+admin_psql "DROP DATABASE demo_dev WITH (FORCE)" >/dev/null
+git worktree add -q -b fresh .claude/worktrees/fresh
+fresh_migrated() {
+  [[ $(PGUSER=postgres psql -h "$home/pg" -p 55500 -d demo_dev_fresh -tAc "select count(*) from seeds") == 2 ]]
+}
+eventually 60 fresh_migrated || fail "worktree not cloned from the fresh primary and migrated"
+[[ $(PGUSER=postgres psql -h "$home/pg" -p 55500 -d demo_dev -tAc "select count(*) from seeds") == 1 ]] ||
+  fail "fresh primary database on a feature branch not migrated"
+[[ -z $(admin_psql "select 1 from pg_database where datname = 'demo_template'") ]] ||
+  fail "template made from a feature branch"
+pass "fresh primary on a feature branch migrated, template left alone"
 
 echo "all passed"

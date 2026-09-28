@@ -8,9 +8,9 @@
 //! - watches `.git/worktrees`: worktrees made by anyone (git, git-cow, Claude Code)
 //!   are provisioned, deleted ones cleaned up
 //! - GitHub webhook websocket (polling as fallback): pushes pull branches and merge
-//!   the base branch into worktrees, which are then migrated; when the base branch
-//!   moves, the migrate command runs in the primary checkout and the template is
-//!   refreshed from its database; worktrees whose PR merged are removed (their
+//!   the base branch into worktrees, which are then migrated (new worktrees are
+//!   migrated once too); when the base branch moves, the migrate command runs in the
+//!   primary checkout and the template is refreshed from its database; worktrees whose PR merged are removed (their
 //!   processes killed)
 //!
 //! `localforest serve` in any project either becomes the daemon or registers its project
@@ -427,11 +427,12 @@ impl Daemon {
 
     /// Create a worktree's dev database if missing: a copy-on-write clone of the
     /// template, or of the primary's while there's no template and it's idle.
-    async fn ensure_dev_db(&self, rt: &ProjectRt, c: &Checkout) -> Result<()> {
+    /// Ok(true) when it was created.
+    async fn ensure_dev_db(&self, rt: &ProjectRt, c: &Checkout) -> Result<bool> {
         let dev = c.dev_db();
         let _g = self.create_lock.lock().await;
         if self.pg.exists(&dev).await? {
-            return Ok(());
+            return Ok(false);
         }
         let template = c.template_db();
         let primary = rt.primary().dev_db();
@@ -449,6 +450,23 @@ impl Daemon {
         match &source {
             Some(s) => info!("{dev}: cloned from {s} in {:?}", t.elapsed()),
             None => info!("{dev}: created empty (no template yet)"),
+        }
+        Ok(true)
+    }
+
+    /// A worktree without a dev database (new, or the RAM disk was emptied): clone
+    /// it now instead of on first connect and run the migrate commands in it once,
+    /// since its branch may carry migrations the template lacks. Skipped while the
+    /// primary's fresh database awaits `migrate`, which does it for every worktree
+    /// afterwards.
+    async fn migrate_new_db(&self, rt: &ProjectRt, c: &Checkout) -> Result<()> {
+        let has_migrations = rt.project.settings.migrate.is_some()
+            || c.services.0.values().any(|s| s.migrate.is_some());
+        if !has_migrations || rt.seed_pending.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        if self.ensure_dev_db(rt, c).await? {
+            self.run_migrations(rt, c).await?;
         }
         Ok(())
     }
@@ -561,6 +579,9 @@ impl Daemon {
                             c.port
                         );
                         rt.known.lock().unwrap().insert(name.clone(), c.clone());
+                        if let Err(e) = self.migrate_new_db(rt, c).await {
+                            warn!("{}: {e:#}", c.id());
+                        }
                     }
                     Err(e) => warn!("provisioning {name}: {e:#}"),
                 }
@@ -660,6 +681,9 @@ impl Daemon {
         self.prepare_new(rt, &info, &c).await;
         self.provision(&c).await?;
         rt.known.lock().unwrap().insert(name.to_string(), c.clone());
+        if let Err(e) = self.migrate_new_db(rt, &c).await {
+            warn!("{}: {e:#}", c.id());
+        }
         if let Err(e) = history::History::update(&rt.project.root, |h| {
             h.removed.remove(name);
         }) {
@@ -939,8 +963,16 @@ impl Daemon {
         Ok(())
     }
 
-    /// Base branch moved in the primary checkout: migrate/seed its database, then
-    /// make it the template new worktrees clone.
+    /// Base branch moved in the primary checkout, or its dev database was just
+    /// created: migrate (and seed, when fresh) its database, then make it the
+    /// template new worktrees clone, and migrate worktrees without a database.
+    ///
+    /// A fresh database is migrated and seeded whatever branch the primary is on, or
+    /// the app would face an empty one. The template, though, is only refreshed from
+    /// an up-to-date base branch, even when there is none yet: a feature branch's
+    /// migrations would otherwise reach every new worktree, whose own branch may not
+    /// have them. Without a template, worktrees clone the idle primary's database
+    /// instead (`ensure_dev_db`), until the primary is back on the base branch.
     async fn migrate(&self, rt: &ProjectRt) -> Result<()> {
         let root = rt.project.root.clone();
         let (remote, base) = (rt.project.settings.remote.clone(), rt.base.clone());
@@ -960,19 +992,30 @@ impl Daemon {
             Ok(Some(local))
         })
         .await??;
-        let Some(head) = head else {
-            debug!(
-                "{}: primary checkout is not on an up-to-date {}; not migrating",
-                rt.project.name, rt.base
-            );
-            return Ok(());
-        };
-        if *rt.last_migrated.lock().unwrap() == Some(head) {
-            return Ok(());
+        let fresh = rt.seed_pending.load(Ordering::SeqCst);
+        match head {
+            None if !fresh => {
+                debug!(
+                    "{}: primary checkout is not on an up-to-date {}; not migrating",
+                    rt.project.name, rt.base
+                );
+                return Ok(());
+            }
+            Some(h) if !fresh && *rt.last_migrated.lock().unwrap() == Some(h) => {
+                return Ok(());
+            }
+            _ => {}
         }
         let _g = rt.lock.lock().await;
         let primary = rt.primary();
-        info!("{}: {} is at {head:.7}", rt.project.name, rt.base);
+        match head {
+            Some(h) => info!("{}: {} is at {h:.7}", rt.project.name, rt.base),
+            None => info!(
+                "{}: new database, primary checkout is not on an up-to-date {}; \
+                 migrating it without refreshing the template",
+                rt.project.name, rt.base
+            ),
+        }
         self.run_migrations(rt, &primary).await?;
         if rt.seed_pending.swap(false, Ordering::SeqCst)
             && let Some(cmd) = &rt.project.settings.seed
@@ -987,20 +1030,29 @@ impl Daemon {
             )
             .await?;
         }
-        let dev = primary.dev_db();
-        if self.pg.exists(&dev).await? {
-            let t = std::time::Instant::now();
-            self.pg.snapshot(&dev, &primary.template_db()).await?;
-            info!(
-                "{} refreshed from {dev} in {:?}",
-                primary.template_db(),
-                t.elapsed()
-            );
+        if let Some(head) = head {
+            let dev = primary.dev_db();
+            if self.pg.exists(&dev).await? {
+                let t = std::time::Instant::now();
+                self.pg.snapshot(&dev, &primary.template_db()).await?;
+                info!(
+                    "{} refreshed from {dev} in {:?}",
+                    primary.template_db(),
+                    t.elapsed()
+                );
+            }
+            // Not at startup: only when the base branch moved while we watched.
+            let pulled = rt.last_migrated.lock().unwrap().replace(head).is_some();
+            if pulled {
+                self.restart_on_pull(&primary).await;
+            }
         }
-        // Not at startup: only when the base branch moved while we watched.
-        let pulled = rt.last_migrated.lock().unwrap().replace(head).is_some();
-        if pulled {
-            self.restart_on_pull(&primary).await;
+        // Worktrees provisioned while the primary's database was fresh.
+        let known: Vec<Checkout> = rt.known.lock().unwrap().values().cloned().collect();
+        for c in &known {
+            if let Err(e) = self.migrate_new_db(rt, c).await {
+                warn!("{}: {e:#}", c.id());
+            }
         }
         Ok(())
     }

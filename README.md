@@ -54,7 +54,7 @@ the project's services, started on demand; the environment comes from
 | **Redis** | One port; the password picks the checkout's own `redis-server`, on a private unix socket, started on first use and killed with the worktree. Real Redis: pub/sub, Lua, streams, `FLUSHALL` only touch that one. |
 | **HTTPS** | Local CA, websockets included. `https://localforest.localhost` lists everything. |
 | **GitHub** | Webhook websocket (polling without repo admin rights): pushes pull every branch and merge the base branch into worktrees (conflict-free merges only, dirty worktrees skipped). A worktree whose PR merged is removed unless it has newer work. |
-| **Migrations** | When the base branch moves: the migrate commands run in the primary checkout, then the template is refreshed from its database; they also run in every worktree the base branch was merged into. |
+| **Migrations** | When the base branch moves: the migrate commands run in the primary checkout, then the template is refreshed from its database; they also run in every worktree the base branch was merged into, and once in each new worktree after its database is cloned (its branch may carry migrations the template lacks). A freshly created primary database (first start, after a reboot) is migrated and seeded whatever branch the primary is on, but the template is only ever made from an up-to-date base branch, so feature-branch migrations never reach other worktrees through it; until then worktrees clone the primary's database. |
 | **Gone pages** | A removed worktree's hostnames answer 503 with why it's gone (pull request merged, removed, deleted), links to the PR, branch and commit on GitHub / GitLab / Bitbucket / Gitea, and a button that recreates it as a preview. |
 | **LSP proxy** | `localforest lsp -- <server>` runs one language server per worktree, routes each request by file, and drops results from other worktrees. |
 
@@ -160,7 +160,7 @@ so one session gets answers from the worktree each file belongs to.
 |---|---|---|
 | `localforest.project` | directory name | hostnames, database prefix, role name |
 | `localforest.port` | `4000` | base port of the primary checkout's services |
-| `localforest.migrate` | none | migrate command: primary when the base branch moves (then the template is refreshed), worktrees the base branch was merged into |
+| `localforest.migrate` | none | migrate command: primary when the base branch moves (then the template is refreshed) or its database was just created, new worktrees once, worktrees the base branch was merged into |
 | `localforest.seed` | none | seed command: primary, after `migrate`, when its database was just created; worktrees get seeded data via the template |
 | `localforest.setup` | none | runs once in every new checkout (localforest, `git worktree add`, Claude Code), e.g. `mix deps.get` |
 | `localforest.services.<name>` | none | see below |
