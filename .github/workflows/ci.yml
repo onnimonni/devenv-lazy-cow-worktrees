@@ -41,10 +41,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest]
+        # One native build per system, each pushed to the cache: aarch64-darwin,
+        # x86_64-linux, aarch64-linux. (nixpkgs-unstable dropped x86_64-darwin.)
+        os: [macos-latest, ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v31
+      # Pushes what it builds to localforest.cachix.org, where the devenv module's
+      # default package comes from; pull-only without the token (fork PRs).
+      - uses: cachix/cachix-action@v16
+        with:
+          name: localforest
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
       - run: nix build .#localforest -L
       - run: ./result/bin/localforest --version

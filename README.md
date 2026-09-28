@@ -93,6 +93,31 @@ imports:
   - localforest/devenv-module
 ```
 
+The module's localforest is built with localforest's own pinned nixpkgs
+(`flake.lock`), the exact derivation CI pushes to
+[localforest.cachix.org](https://localforest.cachix.org), so it is downloaded, not
+compiled. The module adds the cache with `cachix.pull`; a multi-user Nix (the
+default on macOS) only uses it if you are in `trusted-users` (`nix store info` shows
+`Trusted: 1`), or add it to the daemon's `nix.conf` yourself:
+
+```text
+extra-substituters = https://localforest.cachix.org
+extra-trusted-public-keys = localforest.cachix.org-1:Tpgmuq5C+NhvrxT3iE/FLHxfYVUV6kRIW4V95BdI1PQ=
+```
+
+In CI, let [cachix-action](https://github.com/cachix/cachix-action) configure it:
+
+```yaml
+- uses: cachix/install-nix-action@v31
+- uses: cachix/cachix-action@v16
+  with:
+    name: localforest          # or your own cache, plus `extraPullNames: localforest`
+```
+
+To build it yourself instead: `localforest.cachix.enable = false;` and
+`localforest.package = pkgs.callPackage (inputs.localforest + "/package.nix") { };`
+(your nixpkgs; compiled locally).
+
 **2. Describe the project** in `devenv.nix`. The module adds localforest,
 PostgreSQL 18 and Redis to the shell, runs `localforest serve` as a devenv process,
 exports the checkout's environment in `enterShell`, and wires Claude Code's
@@ -185,6 +210,8 @@ so one session gets answers from the worktree each file belongs to.
 | `localforest.httpsPort` | `null` | HTTPS proxy port; unset: 443 where unprivileged processes may bind it, else 8443 |
 | `localforest.httpPort` | `null` | HTTP port redirecting to HTTPS, 0 disables; unset: 80 where unprivileged processes may bind it, else off |
 | `localforest.lsp.<name>` | none | adds `localforest-lsp-<name>` for Claude Code's `lspServers` |
+| `localforest.package` | built with localforest's pinned nixpkgs | localforest build; the default is on localforest.cachix.org |
+| `localforest.cachix.enable` | `true` | `cachix.pull = [ "localforest" ]` |
 | `localforest.claude.trustCa` | `true` | sets `NODE_EXTRA_CA_CERTS` to the local CA in `.claude/settings.local.json` (a value you set there wins) |
 | `localforest.home` | `$LOCALFOREST_HOME`, else `~/.local/state/localforest` | where the module looks for the daemon's CA (read from devenv's environment at evaluation; `env.LOCALFOREST_HOME` too) |
 | `localforest.postgres.package` | `pkgs.postgresql_18` | PostgreSQL build (18+ for copy-on-write databases) |
