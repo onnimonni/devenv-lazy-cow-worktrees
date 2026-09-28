@@ -8,9 +8,9 @@
 //! - watches `.git/worktrees`: worktrees made by anyone (git, git-cow, Claude Code)
 //!   are provisioned, deleted ones cleaned up
 //! - GitHub webhook websocket (polling as fallback): pushes pull branches and merge
-//!   the base branch into worktrees, which are then migrated; when the base branch
-//!   moves, the migrate command runs in the primary checkout and the template is
-//!   refreshed from its database; worktrees whose PR merged are removed (their
+//!   the base branch into worktrees, which are then migrated (new worktrees are
+//!   migrated once too); when the base branch moves, the migrate command runs in the
+//!   primary checkout and the template is refreshed from its database; worktrees whose PR merged are removed (their
 //!   processes killed)
 //!
 //! `localforest serve` in any project either becomes the daemon or registers its project
@@ -72,6 +72,24 @@ struct Pending {
     sync: AtomicBool,
     merged: AtomicBool,
     migrate: AtomicBool,
+    /// Worktrees whose database has not been migrated yet (`migrate_worktrees`).
+    migrate_worktrees: AtomicBool,
+}
+
+/// A checkout's last failed migration: shown in `status` and on its 502 page, and
+/// retried (by the sweep) only after a backoff that doubles with every attempt.
+#[derive(Clone)]
+struct MigrateFailure {
+    error: String,
+    attempts: u32,
+    at: std::time::Instant,
+}
+
+impl MigrateFailure {
+    fn backing_off(&self) -> bool {
+        let backoff = Duration::from_secs(60 << self.attempts.min(6).saturating_sub(1));
+        self.at.elapsed() < backoff
+    }
 }
 
 struct ProjectRt {
@@ -90,6 +108,10 @@ struct ProjectRt {
     last_migrated: Mutex<Option<Oid>>,
     /// The primary's dev database was just created: seed it after migrating.
     seed_pending: AtomicBool,
+    /// Per checkout id: held while its migrations run, so its services wait for them
+    /// without holding up `lock`.
+    migrating: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    migrate_failures: Mutex<BTreeMap<String, MigrateFailure>>,
     ws_ok: AtomicBool,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     watcher: Mutex<Option<notify::RecommendedWatcher>>,
@@ -111,6 +133,45 @@ impl ProjectRt {
 
     fn primary(&self) -> Checkout {
         self.project.checkout(None, self.project.root.clone())
+    }
+
+    fn migrate_lock(&self, c: &Checkout) -> Arc<tokio::sync::Mutex<()>> {
+        self.migrating
+            .lock()
+            .unwrap()
+            .entry(c.id())
+            .or_default()
+            .clone()
+    }
+
+    fn has_migrations(&self, c: &Checkout) -> bool {
+        self.project.settings.migrate.is_some()
+            || c.services.0.values().any(|s| s.migrate.is_some())
+    }
+
+    fn migrate_failure(&self, c: &Checkout) -> Option<MigrateFailure> {
+        self.migrate_failures.lock().unwrap().get(&c.id()).cloned()
+    }
+
+    /// Record how migrating `c` went: None when it succeeded.
+    fn migrated(&self, c: &Checkout, error: Option<String>) {
+        let mut failures = self.migrate_failures.lock().unwrap();
+        match error {
+            None => {
+                failures.remove(&c.id());
+            }
+            Some(error) => {
+                let attempts = failures.get(&c.id()).map_or(0, |f| f.attempts) + 1;
+                failures.insert(
+                    c.id(),
+                    MigrateFailure {
+                        error,
+                        attempts,
+                        at: std::time::Instant::now(),
+                    },
+                );
+            }
+        }
     }
 
     fn trigger(&self, flag: &AtomicBool) {
@@ -173,6 +234,9 @@ pub struct CheckoutStatus {
     /// Its redis-server is running.
     pub redis: bool,
     pub branch: Option<String>,
+    /// Its last migration failed (retried with a backoff).
+    #[serde(default)]
+    pub migrate_error: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -332,6 +396,8 @@ impl Daemon {
             wake: Notify::new(),
             last_migrated: Mutex::new(None),
             seed_pending: AtomicBool::new(false),
+            migrating: Default::default(),
+            migrate_failures: Default::default(),
             ws_ok: AtomicBool::new(false),
             tasks: Mutex::new(Vec::new()),
             watcher: Mutex::new(None),
@@ -558,11 +624,12 @@ impl Daemon {
 
     /// Create a worktree's dev database if missing: a copy-on-write clone of the
     /// template, or of the primary's while there's no template and it's idle.
-    async fn ensure_dev_db(&self, rt: &ProjectRt, c: &Checkout) -> Result<()> {
+    /// Ok(true) when it was created.
+    async fn ensure_dev_db(&self, rt: &ProjectRt, c: &Checkout) -> Result<bool> {
         let dev = c.dev_db();
         let _g = self.create_lock.lock().await;
         if self.pg.exists(&dev).await? {
-            return Ok(());
+            return Ok(false);
         }
         let template = c.template_db();
         let primary = rt.primary().dev_db();
@@ -581,7 +648,69 @@ impl Daemon {
             Some(s) => info!("{dev}: cloned from {s} in {:?}", t.elapsed()),
             None => info!("{dev}: created empty (no template yet)"),
         }
-        Ok(())
+        Ok(true)
+    }
+
+    /// Migrate a worktree's dev database (creating it first if missing) unless it
+    /// already was: its branch may carry migrations the template lacks. Done is a
+    /// marker in the worktree's git admin dir holding the database's OID, written
+    /// only on success, so a database made by an early connection, a failed run or
+    /// a database recreated after a reboot all count as not done. `force` runs them
+    /// anyway (the base branch was merged in) and ignores the retry backoff.
+    /// Holds only the checkout's migrate lock, which its services wait on.
+    async fn migrate_worktree(&self, rt: &ProjectRt, c: &Checkout, force: bool) -> Result<()> {
+        if !rt.has_migrations(c) {
+            return Ok(());
+        }
+        let lock = rt.migrate_lock(c);
+        let _g = lock.lock().await;
+        if !force && let Some(f) = rt.migrate_failure(c).filter(MigrateFailure::backing_off) {
+            anyhow::bail!("{} (retried later)", f.error);
+        }
+        self.ensure_dev_db(rt, c).await?;
+        let oid = self
+            .pg
+            .oid(&c.dev_db())
+            .await?
+            .ok_or_else(|| anyhow!("{} vanished", c.dev_db()))?
+            .to_string();
+        let marker = Repository::open(&c.path)
+            .map(|r| r.path().join("localforest-migrated"))
+            .ok();
+        if !force
+            && marker
+                .as_ref()
+                .and_then(|m| std::fs::read_to_string(m).ok())
+                .is_some_and(|m| m.trim() == oid)
+        {
+            return Ok(());
+        }
+        let result = self.run_migrations(rt, c).await;
+        if result.is_ok()
+            && let Some(m) = &marker
+            && let Err(e) = std::fs::write(m, &oid)
+        {
+            warn!("{}: {}: {e}", c.id(), m.display());
+        }
+        rt.migrated(c, result.as_ref().err().map(|e| format!("{e:#}")));
+        result
+    }
+
+    /// Migrate every worktree whose database isn't yet (outside `rt.lock`); not
+    /// while the primary's fresh database awaits `migrate`, which triggers this after.
+    async fn migrate_worktrees(&self, rt: &ProjectRt) {
+        if rt.seed_pending.load(Ordering::SeqCst) {
+            return;
+        }
+        let known: Vec<Checkout> = rt.known.lock().unwrap().values().cloned().collect();
+        for c in &known {
+            if rt.migrate_failure(c).is_some_and(|f| f.backing_off()) {
+                continue;
+            }
+            if let Err(e) = self.migrate_worktree(rt, c, false).await {
+                warn!("{}: {e:#}", c.id());
+            }
+        }
     }
 
     /// PostgreSQL proxy, before the connection is handed to the server (which checks
@@ -634,6 +763,10 @@ impl Daemon {
         }
         self.servers.stop_checkout(c).await;
         self.redis.remove(&c.id()).await;
+        for rt in self.projects.lock().unwrap().values() {
+            rt.migrate_failures.lock().unwrap().remove(&c.id());
+            rt.migrating.lock().unwrap().remove(&c.id());
+        }
         for db in self.pg.databases().await? {
             if c.owns_db(&db) {
                 self.pg.drop(&db).await?;
@@ -698,6 +831,7 @@ impl Daemon {
                             c.port
                         );
                         rt.known.lock().unwrap().insert(name.clone(), c.clone());
+                        rt.trigger(&rt.pending.migrate_worktrees);
                     }
                     Err(e) => warn!("provisioning {name}: {e:#}"),
                 }
@@ -782,8 +916,18 @@ impl Daemon {
 
     async fn create_worktree(&self, req: CreateReq) -> Result<CreateResp> {
         let rt = self.project(&req.root)?;
-        let _g = rt.lock.lock().await;
-        self.create_locked(&rt, &req.name, req.base.clone()).await
+        let resp = {
+            let _g = rt.lock.lock().await;
+            self.create_locked(&rt, &req.name, req.base.clone()).await?
+        };
+        // Before its URL is handed out; a failure shows in status and on its pages.
+        let c = rt.known.lock().unwrap().get(&req.name).cloned();
+        if let Some(c) = c
+            && let Err(e) = self.migrate_worktree(&rt, &c, false).await
+        {
+            warn!("{}: {e:#}", c.id());
+        }
+        Ok(resp)
     }
 
     async fn create_locked(
@@ -1294,9 +1438,40 @@ impl Daemon {
         Ok(())
     }
 
-    /// Base branch moved in the primary checkout: migrate/seed its database, then
-    /// make it the template new worktrees clone.
+    /// Base branch moved in the primary checkout, or its dev database was just
+    /// created: migrate (and seed, when fresh) its database, then make it the
+    /// template new worktrees clone, and migrate worktrees without a database.
+    ///
+    /// A fresh database is migrated and seeded whatever branch the primary is on, or
+    /// the app would face an empty one. The template, though, is only refreshed from
+    /// an up-to-date base branch, even when there is none yet: a feature branch's
+    /// migrations would otherwise reach every new worktree, whose own branch may not
+    /// have them. Without a template (first start or reboot while on a feature
+    /// branch), worktrees clone the idle primary's database instead (`ensure_dev_db`),
+    /// feature-branch migrations included, until the primary is back on an
+    /// up-to-date base branch and the template is made.
+    ///
+    /// Holds the primary's migrate lock (its services wait on it), not `rt.lock`.
     async fn migrate(&self, rt: &ProjectRt) -> Result<()> {
+        let primary = rt.primary();
+        let lock = rt.migrate_lock(&primary);
+        let result = {
+            let _g = lock.lock().await;
+            self.migrate_primary(rt, &primary).await
+        };
+        match &result {
+            Ok(false) => {}
+            Ok(true) => {
+                rt.migrated(&primary, None);
+                rt.trigger(&rt.pending.migrate_worktrees);
+            }
+            Err(e) => rt.migrated(&primary, Some(format!("{e:#}"))),
+        }
+        result.map(|_| ())
+    }
+
+    /// `migrate`'s work; Ok(true) when it ran.
+    async fn migrate_primary(&self, rt: &ProjectRt, primary: &Checkout) -> Result<bool> {
         let root = rt.project.root.clone();
         let (remote, base) = (rt.project.settings.remote.clone(), rt.base.clone());
         let head = tokio::task::spawn_blocking(move || -> Result<Option<Oid>> {
@@ -1315,20 +1490,29 @@ impl Daemon {
             Ok(Some(local))
         })
         .await??;
-        let Some(head) = head else {
-            debug!(
-                "{}: primary checkout is not on an up-to-date {}; not migrating",
-                rt.project.name, rt.base
-            );
-            return Ok(());
-        };
-        if *rt.last_migrated.lock().unwrap() == Some(head) {
-            return Ok(());
+        let fresh = rt.seed_pending.load(Ordering::SeqCst);
+        match head {
+            None if !fresh => {
+                debug!(
+                    "{}: primary checkout is not on an up-to-date {}; not migrating",
+                    rt.project.name, rt.base
+                );
+                return Ok(false);
+            }
+            Some(h) if !fresh && *rt.last_migrated.lock().unwrap() == Some(h) => {
+                return Ok(false);
+            }
+            _ => {}
         }
-        let _g = rt.lock.lock().await;
-        let primary = rt.primary();
-        info!("{}: {} is at {head:.7}", rt.project.name, rt.base);
-        self.run_migrations(rt, &primary).await?;
+        match head {
+            Some(h) => info!("{}: {} is at {h:.7}", rt.project.name, rt.base),
+            None => info!(
+                "{}: new database, primary checkout is not on an up-to-date {}; \
+                 migrating it without refreshing the template",
+                rt.project.name, rt.base
+            ),
+        }
+        self.run_migrations(rt, primary).await?;
         if rt.seed_pending.swap(false, Ordering::SeqCst)
             && let Some(cmd) = &rt.project.settings.seed
         {
@@ -1342,22 +1526,24 @@ impl Daemon {
             )
             .await?;
         }
-        let dev = primary.dev_db();
-        if self.pg.exists(&dev).await? {
-            let t = std::time::Instant::now();
-            self.pg.snapshot(&dev, &primary.template_db()).await?;
-            info!(
-                "{} refreshed from {dev} in {:?}",
-                primary.template_db(),
-                t.elapsed()
-            );
+        if let Some(head) = head {
+            let dev = primary.dev_db();
+            if self.pg.exists(&dev).await? {
+                let t = std::time::Instant::now();
+                self.pg.snapshot(&dev, &primary.template_db()).await?;
+                info!(
+                    "{} refreshed from {dev} in {:?}",
+                    primary.template_db(),
+                    t.elapsed()
+                );
+            }
+            // Not at startup: only when the base branch moved while we watched.
+            let pulled = rt.last_migrated.lock().unwrap().replace(head).is_some();
+            if pulled {
+                self.restart_on_pull(primary).await;
+            }
         }
-        // Not at startup: only when the base branch moved while we watched.
-        let pulled = rt.last_migrated.lock().unwrap().replace(head).is_some();
-        if pulled {
-            self.restart_on_pull(&primary).await;
-        }
-        Ok(())
+        Ok(true)
     }
 
     /// The project's migrate command (with the default service's env) and each
@@ -1439,14 +1625,17 @@ impl Daemon {
         if rt.project.settings.no_sync || !has_remote {
             return Ok(());
         }
-        let _g = rt.lock.lock().await;
-        let syncer = rt.syncer();
-        let moved = tokio::task::spawn_blocking(move || syncer.sync()).await??;
+        let moved = {
+            let _g = rt.lock.lock().await;
+            let syncer = rt.syncer();
+            tokio::task::spawn_blocking(move || syncer.sync()).await??
+        };
+        // Outside `rt.lock`: migrations may take minutes.
         let known: Vec<Checkout> = rt.known.lock().unwrap().values().cloned().collect();
         for path in moved {
             let path = path.canonicalize().unwrap_or(path);
             if let Some(c) = known.iter().find(|c| c.path == path) {
-                if let Err(e) = self.run_migrations(rt, c).await {
+                if let Err(e) = self.migrate_worktree(rt, c, true).await {
                     warn!("{}: {e:#}", c.id());
                 }
                 self.restart_on_pull(c).await;
@@ -1514,12 +1703,35 @@ impl Daemon {
             }
         }
         match best {
-            Some((_, rt, c, svc, port)) => {
+            Some((_, rt, c, svc, port)) => self.ensure_service(&rt, &c, &svc, Some(port)).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Start a service (and what it depends on) once its checkout's database is
+    /// migrated: a worktree's is migrated first if it isn't yet (an error if that
+    /// fails); the primary's services wait for a migration in progress.
+    async fn ensure_service(
+        &self,
+        rt: &ProjectRt,
+        c: &Checkout,
+        svc: &str,
+        port: Option<u16>,
+    ) -> Result<()> {
+        if c.worktree.is_some() {
+            self.migrate_worktree(rt, c, false)
+                .await
+                .context("migrations failed; not starting its services")?;
+        } else {
+            drop(rt.migrate_lock(c).lock().await);
+        }
+        match port {
+            Some(port) => {
                 self.servers
-                    .ensure_port(&rt.project, &c, &svc, port, &self.global)
+                    .ensure_port(&rt.project, c, svc, port, &self.global)
                     .await
             }
-            None => Ok(()),
+            None => self.servers.ensure(&rt.project, c, svc, &self.global).await,
         }
     }
 
@@ -1594,6 +1806,7 @@ impl Daemon {
                     services,
                     redis: self.redis.running(&c.id()),
                     branch,
+                    migrate_error: rt.migrate_failure(&c).map(|f| f.error),
                     checkout: c,
                 });
             }
@@ -1656,6 +1869,9 @@ async fn worker(d: Arc<Daemon>, rt: Arc<ProjectRt>) {
         {
             warn!("{}: {e:#}", rt.project.name);
         }
+        if take(&rt.pending.migrate_worktrees) {
+            d.migrate_worktrees(&rt).await;
+        }
     }
 }
 
@@ -1665,6 +1881,10 @@ async fn ticker(rt: Arc<ProjectRt>) {
     loop {
         tokio::time::sleep(Duration::from_secs(60)).await;
         n += 1;
+        // Retries failed migrations once their backoff is over.
+        if !rt.migrate_failures.lock().unwrap().is_empty() {
+            rt.trigger(&rt.pending.migrate_worktrees);
+        }
         if !rt.ws_ok.load(Ordering::SeqCst) || n.is_multiple_of(10) {
             rt.pending.merged.store(true, Ordering::SeqCst);
             rt.trigger(&rt.pending.sync);
@@ -1841,7 +2061,7 @@ fn api(d: Arc<Daemon>) -> Router {
             post(|State(d): State<Arc<Daemon>>, Json(r): Json<ServiceReq>| async move {
                 let (rt, c, svc) =
                     d.service_named(&r.root, r.worktree.as_deref(), r.service.as_deref())?;
-                d.servers.ensure(&rt.project, &c, &svc, &d.global).await?;
+                d.ensure_service(&rt, &c, &svc, None).await?;
                 ApiResult::Ok(Json(serde_json::json!({
                     "log": crate::server::log_path(&c.service_id(&svc)),
                     "url": c.service(&svc).filter(|s| s.http).map(|_| format!("https://{}", c.service_host(&svc))),
@@ -2227,13 +2447,10 @@ async fn lead(global: Global, project: Option<Project>, listener: UnixListener) 
     let ensure: proxy::Ensure = Arc::new(move |host| {
         let weak = weak.clone();
         Box::pin(async move {
-            let Some(d) = weak.upgrade() else {
-                return Ok(());
-            };
-            d.ensure_server(&host).await.map_err(|e| {
-                warn!("{host}: {e:#}");
-                format!("{e:#}")
-            })
+            let d = weak.upgrade()?;
+            let e = d.ensure_server(&host).await.err()?;
+            warn!("{host}: {e:#}");
+            Some(format!("{e:#}"))
         })
     });
     let weak = Arc::downgrade(&d);
@@ -2311,4 +2528,28 @@ async fn lead(global: Global, project: Option<Project>, listener: UnixListener) 
     tokio::time::sleep(Duration::from_millis(500)).await;
     d.pg.stop().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failed(attempts: u32, ago: Duration) -> MigrateFailure {
+        MigrateFailure {
+            error: String::new(),
+            attempts,
+            at: std::time::Instant::now().checked_sub(ago).unwrap(),
+        }
+    }
+
+    #[test]
+    fn migrate_backoff_doubles_and_caps() {
+        assert!(failed(1, Duration::from_secs(30)).backing_off());
+        assert!(!failed(1, Duration::from_secs(61)).backing_off());
+        assert!(failed(2, Duration::from_secs(100)).backing_off());
+        assert!(!failed(2, Duration::from_secs(121)).backing_off());
+        // Capped at 32 minutes.
+        assert!(failed(50, Duration::from_secs(31 * 60)).backing_off());
+        assert!(!failed(50, Duration::from_secs(33 * 60)).backing_off());
+    }
 }

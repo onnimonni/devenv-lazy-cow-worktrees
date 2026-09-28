@@ -239,6 +239,9 @@ fn print_status(s: &daemon::Status) {
                 c.databases.join(", "),
                 if c.redis { " redis" } else { "" },
             );
+            if let Some(e) = &c.migrate_error {
+                println!("    migrations failed: {e}");
+            }
             for s in &c.services {
                 println!(
                     "    {:<20} :{:<5} {:<45} {}",

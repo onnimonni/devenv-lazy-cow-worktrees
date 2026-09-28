@@ -92,12 +92,10 @@ impl Routes {
 pub type Dashboard = Arc<dyn Fn() -> String + Send + Sync>;
 
 /// Called with the host when nothing listens on its port: starts the worktree's
-/// server and resolves once it listens, or with why it gave up.
+/// server and resolves once it listens, or with why it couldn't (a failed
+/// migration, say), shown on the 502 page.
 pub type Ensure = Arc<
-    dyn Fn(
-            String,
-        )
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
+    dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>
         + Send
         + Sync,
 >;
@@ -310,12 +308,14 @@ async fn handle(
     if tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
         .is_err()
-        && let Err(e) = (shared.ensure)(host.clone()).await
+        && let Some(e) = (shared.ensure)(host.clone()).await
     {
         return Ok(full(
             StatusCode::BAD_GATEWAY,
             "text/plain; charset=utf-8",
-            format!("localforest: {host}: {e}\n"),
+            format!(
+                "localforest: could not start {host}: {e}\nSee `localforest status` and the logs in ~/.local/state/localforest/logs.\n"
+            ),
         ));
     }
     let path = req.uri().path_and_query().map_or("/", |p| p.as_str());
