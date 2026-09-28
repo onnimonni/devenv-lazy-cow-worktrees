@@ -549,6 +549,11 @@ impl Checkout {
                 .is_some_and(digits)
     }
 
+    /// The same checkout (project and worktree), whatever its settings.
+    pub fn same(&self, other: &Checkout) -> bool {
+        (&self.project, &self.worktree) == (&other.project, &other.worktree)
+    }
+
     /// Key for per-checkout processes and logs; also its PostgreSQL role and the
     /// Redis password that picks its redis-server behind the shared Redis port.
     pub fn id(&self) -> String {
@@ -711,14 +716,30 @@ pub fn locate(path: &Path) -> Result<(PathBuf, Option<String>, PathBuf)> {
 /// name: the one whose dev or test database it is, else the one whose partition it is
 /// with the longest test database name (`app_test_x2` is worktree `x2`'s own, not `x`'s
 /// partition 2; `app_test_x22` is `x2`'s partition 2 while `x22` doesn't exist).
+/// None when nobody claims it, or when checkouts tie (project `shop` worktree `dev-x`
+/// and project `shop-dev` worktree `x` both name theirs `shop_dev_dev_x`): then
+/// neither may open or drop it.
 pub fn db_owner<'a>(
     db: &str,
     checkouts: impl IntoIterator<Item = &'a Checkout>,
 ) -> Option<&'a Checkout> {
-    checkouts
-        .into_iter()
-        .filter(|c| c.owns_db(db))
-        .max_by_key(|c| (db == c.dev_db() || db == c.test_db(), c.test_db().len()))
+    let key = |c: &Checkout| (db == c.dev_db() || db == c.test_db(), c.test_db().len());
+    let mut best: Vec<&Checkout> = Vec::new();
+    for c in checkouts.into_iter().filter(|c| c.owns_db(db)) {
+        match best.first().map(|b| key(b).cmp(&key(c))) {
+            Some(std::cmp::Ordering::Greater) => {}
+            Some(std::cmp::Ordering::Equal) => {
+                if !best.iter().any(|b| b.same(c)) {
+                    best.push(c);
+                }
+            }
+            _ => best = vec![c],
+        }
+    }
+    match best[..] {
+        [one] => Some(one),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -945,5 +966,23 @@ mod tests {
         let p = [co(None), co(Some("2"))];
         assert_eq!(owner("my_app_test_2", &p).as_deref(), Some("2"));
         assert_eq!(db_owner("my_app_test2", &p), Some(&p[0]));
+        // The same checkout twice (registered, and the caller's copy) is no tie.
+        assert_eq!(
+            owner("my_app_test_x", &[x.clone(), x.clone()]).as_deref(),
+            Some("x")
+        );
+        // Different projects' equal names: a tie, nobody owns it.
+        let a = Checkout {
+            project: "shop".into(),
+            db_prefix: "shop".into(),
+            ..co(Some("dev-x"))
+        };
+        let b = Checkout {
+            project: "shop-dev".into(),
+            db_prefix: "shop_dev".into(),
+            ..co(Some("x"))
+        };
+        assert_eq!(db_owner("shop_dev_dev_x", [&a, &b]), None);
+        assert_eq!(db_owner("shop_dev_dev_x", [&a]), Some(&a));
     }
 }

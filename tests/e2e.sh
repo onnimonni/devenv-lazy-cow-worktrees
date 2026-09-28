@@ -98,6 +98,9 @@ pass "other checkouts' databases refused"
 psql -d postgres -qc "CREATE DATABASE demo_test_feat_a2" || fail "could not create a partition database"
 [[ $(psql -d demo_test_feat_a2 -tAc "select 1") == 1 ]] || fail "MIX_TEST_PARTITION database <test db>2 refused"
 pass "MIX_TEST_PARTITION database opened"
+if out=$(PGUSER=stranger PGPASSWORD=x psql -d postgres -tAc "select 1" 2>&1); then fail "unknown user got through"; fi
+[[ $out == *"not the role of a checkout"* ]] || fail "unknown user not refused by the proxy: $out"
+pass "users that are no checkout's role refused"
 
 redis-cli --no-auth-warning -u "$REDIS_URL" set k worktree >/dev/null
 primary_redis=$(cd "$work/app" && "$bin" env --json | jq -r .REDIS_URL)
