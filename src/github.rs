@@ -139,7 +139,7 @@ impl Client {
             format!("https://{}/api/v3", repo.host)
         };
         let http = reqwest::Client::builder()
-            .user_agent(concat!("localforest/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("lazy-cow-tree/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Ok(Self {
             http,
@@ -449,12 +449,12 @@ mod tests {
     #[test]
     fn parses_remote_urls() {
         assert_eq!(
-            parse_remote_url("git@github.com:onnimonni/localforest.git"),
-            id("github.com", "onnimonni", "localforest")
+            parse_remote_url("git@github.com:onnimonni/devenv-lazy-cow-worktrees.git"),
+            id("github.com", "onnimonni", "devenv-lazy-cow-worktrees")
         );
         assert_eq!(
-            parse_remote_url("https://github.com/onnimonni/localforest"),
-            id("github.com", "onnimonni", "localforest")
+            parse_remote_url("https://github.com/onnimonni/devenv-lazy-cow-worktrees"),
+            id("github.com", "onnimonni", "devenv-lazy-cow-worktrees")
         );
         assert_eq!(
             parse_remote_url("https://x-access-token:abc@github.com/o/r.git/"),

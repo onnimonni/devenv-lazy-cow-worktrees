@@ -5,7 +5,7 @@
 //! to that checkout's redis-server on a private unix socket, started on first use.
 //! So every worktree has its own keys, pub/sub and FLUSHALL, with real Redis
 //! semantics (Lua, streams, ...), and apps need nothing but the URL. A project with
-//! `LOCALFOREST_REDIS_INSTANCE=shared` maps all its checkouts to one redis-server.
+//! `LAZY_COW_TREE_REDIS_INSTANCE=shared` maps all its checkouts to one redis-server.
 
 use std::{
     collections::HashMap,
@@ -320,7 +320,7 @@ impl Redis {
             Err(e) => {
                 warn!("{e:#}");
                 client
-                    .write_all(format!("-ERR localforest: {e}\r\n").as_bytes())
+                    .write_all(format!("-ERR lazy-cow-tree: {e}\r\n").as_bytes())
                     .await?;
                 return Ok(());
             }

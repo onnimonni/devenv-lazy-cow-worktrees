@@ -1,4 +1,4 @@
-//! localforest: local dev infrastructure for many git worktrees at once, made for coding
+//! lazy-cow-tree: local dev infrastructure for many git worktrees at once, made for coding
 //! agents (Claude Code) that give every task its own worktree.
 //!
 //! - worktrees are copy-on-write clones of the primary checkout (git-cow)
@@ -10,7 +10,7 @@
 //!   worktrees are removed
 //! - a worktree-aware LSP proxy
 //!
-//! See README.md, `localforest --help` and devenv-module/devenv.nix.
+//! See README.md, `lazy-cow-tree --help` and devenv-module/devenv.nix.
 
 mod client;
 mod config;
@@ -65,7 +65,7 @@ enum Cmd {
     },
     /// Stand-in for devenv's `devenv-proxy` (DEVENV_PROXY_BINARY): run the daemon on
     /// the ports and control socket devenv asks for. Also runs as
-    /// `localforest-devenv-proxy [ARGS]`.
+    /// `lazy-cow-tree-devenv-proxy [ARGS]`.
     DevenvProxy {
         #[arg(long)]
         listen: std::net::SocketAddr,
@@ -75,7 +75,7 @@ enum Cmd {
         control_socket: PathBuf,
     },
     /// Print this checkout's environment (PORT, DATABASE_URL, REDIS_URL, ...) as
-    /// shell exports: `eval "$(localforest env)"`.
+    /// shell exports: `eval "$(lazy-cow-tree env)"`.
     Env {
         #[command(flatten)]
         project: ProjectSettings,
@@ -111,10 +111,10 @@ enum Cmd {
         #[arg(long)]
         eject: bool,
     },
-    /// A checkout's services (`localforest.services`).
+    /// A checkout's services (`lazy-cow-tree.services`).
     #[command(subcommand)]
     Service(ServiceCmd),
-    /// Worktree-aware LSP proxy: localforest lsp -- <server> [args]
+    /// Worktree-aware LSP proxy: lazy-cow-tree lsp -- <server> [args]
     Lsp {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
@@ -267,14 +267,14 @@ fn print_status(s: &daemon::Status) {
     }
 }
 
-/// Invoked as `localforest-devenv-proxy` (a link for DEVENV_PROXY_BINARY, which
+/// Invoked as `lazy-cow-tree-devenv-proxy` (a link for DEVENV_PROXY_BINARY, which
 /// takes one path): the `devenv-proxy` subcommand.
 fn devenv_proxy_args(args: impl Iterator<Item = std::ffi::OsString>) -> Vec<std::ffi::OsString> {
     let mut args: Vec<_> = args.collect();
     let invoked = args
         .first()
         .and_then(|a| std::path::Path::new(a).file_name())
-        .is_some_and(|n| n == "localforest-devenv-proxy");
+        .is_some_and(|n| n == "lazy-cow-tree-devenv-proxy");
     if invoked {
         args.insert(1, "devenv-proxy".into());
     }
@@ -287,7 +287,7 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "localforest=info".into()),
+                .unwrap_or_else(|_| "lazy_cow_tree=info".into()),
         )
         .init();
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -342,7 +342,7 @@ async fn main() -> Result<()> {
                 Some(s) => c.service_env(&cli.global, Some(s)),
                 None => c.env(&cli.global),
             };
-            // The checkout's env files (LOCALFOREST_ENV_FILES) win, as for everything
+            // The checkout's env files (LAZY_COW_TREE_ENV_FILES) win, as for everything
             // the daemon runs there.
             let (files, primary_only) = config::env_file_vars(&p.root, &c.path, &p.env_files());
             env.retain(|(k, _)| !files.iter().any(|(f, _)| f == k));
@@ -379,7 +379,7 @@ async fn main() -> Result<()> {
                 .projects
                 .iter()
                 .find(|p| p.project.root == root)
-                .context("this project is not registered; run `localforest serve`")?;
+                .context("this project is not registered; run `lazy-cow-tree serve`")?;
             for c in p.checkouts.iter().filter(|c| c.checkout.worktree.is_some()) {
                 println!(
                     "{}\t{}\t{}",
@@ -419,7 +419,7 @@ async fn main() -> Result<()> {
             tls::trust(&ca)?;
             eprintln!("trusted {}", config::ca_cert_path().display());
             eprintln!(
-                "Firefox and Node use their own stores: NODE_EXTRA_CA_CERTS is in `localforest env`."
+                "Firefox and Node use their own stores: NODE_EXTRA_CA_CERTS is in `lazy-cow-tree env`."
             );
             Ok(())
         }
@@ -433,7 +433,7 @@ async fn main() -> Result<()> {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                // A durable cluster (LOCALFOREST_POSTGRES_DURABLE) has no RAM disk.
+                // A durable cluster (LAZY_COW_TREE_POSTGRES_DURABLE) has no RAM disk.
                 if config::pg_dir().exists() {
                     ramdisk::eject(&config::pg_dir())?;
                 }
@@ -538,7 +538,7 @@ mod tests {
     #[test]
     fn parses_devenv_proxy_arguments_under_its_link_name() {
         let args = [
-            "/nix/store/x/bin/localforest-devenv-proxy",
+            "/nix/store/x/bin/lazy-cow-tree-devenv-proxy",
             "--listen",
             "127.0.0.1:80",
             "--control-socket",
@@ -560,7 +560,7 @@ mod tests {
         assert_eq!(https_listen.map(|a| a.port()), Some(443));
         assert_eq!(control_socket, Path::new("/tmp/devenv-proxy-me.sock"));
         // Under its own name the arguments are left alone.
-        let plain = devenv_proxy_args(["localforest", "status"].map(Into::into).into_iter());
-        assert_eq!(plain, ["localforest", "status"]);
+        let plain = devenv_proxy_args(["lazy-cow-tree", "status"].map(Into::into).into_iter());
+        assert_eq!(plain, ["lazy-cow-tree", "status"]);
     }
 }

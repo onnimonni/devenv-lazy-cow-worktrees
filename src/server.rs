@@ -1,7 +1,7 @@
-//! Checkout services (`localforest.services`): each runs its command with the service's
+//! Checkout services (`lazy-cow-tree.services`): each runs its command with the service's
 //! env (PORT, hostname, database, Redis) in its own process group. An http service is
 //! started by the first request to its https://…localhost hostname that finds nothing
-//! listening (or `localforest service start`), after the services it depends on; all of
+//! listening (or `lazy-cow-tree service start`), after the services it depends on; all of
 //! them are killed (whole group, SIGKILL) with the checkout. `restart` restarts one
 //! that exits on its own; `restartOnPull` one whose checkout pulled the base branch.
 //! `restartOnChange` restarts a running one when the content of files in its `cwd`
@@ -35,8 +35,8 @@ use crate::config::{self, Checkout, Global, Project, Restart, Service};
 /// arguments, `cwd`, and a script whose text names the primary runs as a rewritten
 /// copy), and DEVENV_ROOT / _DOTFILE / _STATE / _RUNTIME are the worktree's.
 /// devenv's own postgres/redis state, exported into the captured project env even
-/// though localforest serves them (the module keeps `services.*.enable` readable): a
-/// process pointing at the primary's data directory would bypass localforest.
+/// though lazy-cow-tree serves them (the module keeps `services.*.enable` readable): a
+/// process pointing at the primary's data directory would bypass lazy-cow-tree.
 const DEVENV_SERVICE_STATE: &[&str] = &["PGDATA", "REDISDATA"];
 
 pub fn command(
@@ -95,7 +95,7 @@ pub fn command(
         c.envs(devenv_vars(checkout));
     }
     for (k, _) in &file_vars {
-        if config::RESERVED_ENV.contains(&k.as_str()) || k.starts_with("LOCALFOREST_") {
+        if config::RESERVED_ENV.contains(&k.as_str()) || k.starts_with("LAZY_COW_TREE_") {
             warn_once(checkout, k);
         }
     }
@@ -107,7 +107,7 @@ pub fn command(
 /// sockets must fit 104 bytes).
 pub fn devenv_vars(checkout: &Path) -> Vec<(String, String)> {
     let h = hex::encode(&sha2::Sha256::digest(checkout.to_string_lossy().as_bytes())[..4]);
-    let runtime = PathBuf::from("/tmp").join(format!("localforest-{h}"));
+    let runtime = PathBuf::from("/tmp").join(format!("lazy-cow-tree-{h}"));
     let _ = std::fs::create_dir_all(&runtime);
     let dotfile = checkout.join(".devenv");
     vec![
@@ -147,13 +147,13 @@ fn rewritten_script(program: &Path, root: &Path, checkout: &Path, dir: &Path) ->
     Some(path)
 }
 
-/// Warn once per checkout and key that an env file overrides a localforest variable.
+/// Warn once per checkout and key that an env file overrides a lazy-cow-tree variable.
 fn warn_once(checkout: &Path, key: &str) {
     static SEEN: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
     let k = format!("{}\0{key}", checkout.display());
     if SEEN.lock().unwrap().insert(k) {
         warn!(
-            "{}: an env file overrides {key}, which localforest sets",
+            "{}: an env file overrides {key}, which lazy-cow-tree sets",
             checkout.display()
         );
     }
@@ -1057,7 +1057,7 @@ mod tests {
             Path::new("/src/app"),
             Path::new("/src/app/.claude/worktrees/wt"),
         );
-        let script = d.path().join("localforest-web");
+        let script = d.path().join("lazy-cow-tree-web");
         std::fs::write(&script, "#!/bin/sh\ncd /src/app/api\nexec mix phx.server\n").unwrap();
         let out = d.path().join("scripts");
         let copy = rewritten_script(&script, root, wt, &out).unwrap();
@@ -1101,7 +1101,7 @@ mod tests {
             ("PATH".into(), format!("{r}/bin:/usr/bin:/bin")),
             ("DEVENV_ROOT".into(), r.clone()),
             ("FROM_PRIMARY".into(), "1".into()),
-            ("LOCALFOREST_ENV_FILES".into(), r#"[".env.local"]"#.into()),
+            ("LAZY_COW_TREE_ENV_FILES".into(), r#"[".env.local"]"#.into()),
             ("PGDATA".into(), format!("{r}/.devenv/state/postgres")),
             ("REDISDATA".into(), format!("{r}/.devenv/state/redis")),
         ];
@@ -1126,14 +1126,14 @@ mod tests {
         assert_eq!(env["PATH"], format!("{w}/bin:/usr/bin:/bin"));
         assert_eq!(env["DEVENV_ROOT"], w);
         assert_eq!(env["DEVENV_STATE"], format!("{w}/.devenv/state"));
-        assert!(env["DEVENV_RUNTIME"].starts_with("/tmp/localforest-"));
+        assert!(env["DEVENV_RUNTIME"].starts_with("/tmp/lazy-cow-tree-"));
         assert_eq!(env["CFG"], format!("{w}/config"));
         // Env files come last: over the derived PORT too.
         assert_eq!(env["SHARED"], "wt");
         assert_eq!(env["PORT"], "1");
         // Only the primary's file set it: gone in the worktree.
         assert!(!env.contains_key("FROM_PRIMARY"));
-        // devenv's own postgres/redis state never reaches what localforest runs.
+        // devenv's own postgres/redis state never reaches what lazy-cow-tree runs.
         assert!(!env.contains_key("PGDATA") && !env.contains_key("REDISDATA"));
 
         // The primary keeps its paths and its own file's values.

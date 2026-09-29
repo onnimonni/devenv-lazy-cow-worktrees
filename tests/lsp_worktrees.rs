@@ -1,4 +1,4 @@
-//! `localforest lsp -- dexter lsp` answers each worktree from that worktree only.
+//! `lazy-cow-tree lsp -- dexter lsp` answers each worktree from that worktree only.
 //!
 //! A primary checkout and two worktrees each define `Foo.hello` on a different line;
 //! go-to-definition from `Bar` (and workspace symbols, references) must stay in the
@@ -102,12 +102,12 @@ impl Lsp {
 }
 
 fn start(primary: &Path, dexter: &Path) -> Lsp {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_localforest"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lazy-cow-tree"))
         .args(["lsp", "--"])
         .arg(dexter)
         .arg("lsp")
         .current_dir(primary)
-        .env("RUST_LOG", "localforest=debug")
+        .env("RUST_LOG", "lazy-cow-tree=debug")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())

@@ -13,7 +13,7 @@
 //!   primary checkout and the template is refreshed from its database; worktrees whose PR merged are removed (their
 //!   processes killed)
 //!
-//! `localforest serve` in any project either becomes the daemon or registers its project
+//! `lazy-cow-tree serve` in any project either becomes the daemon or registers its project
 //! with the running one, then takes over if that one goes away.
 
 use std::{
@@ -279,7 +279,7 @@ pub struct ServiceStatus {
     pub name: String,
     pub url: Option<String>,
     pub port: u16,
-    /// Started by localforest and running.
+    /// Started by lazy-cow-tree and running.
     pub running: bool,
 }
 
@@ -360,7 +360,7 @@ impl Daemon {
             .cloned()
             .ok_or_else(|| {
                 anyhow!(
-                    "{} is not registered; run `localforest serve` in it",
+                    "{} is not registered; run `lazy-cow-tree serve` in it",
                     root.display()
                 )
             })
@@ -406,7 +406,7 @@ impl Daemon {
             .find(|p| p.project.name == project.name && p.project.root != root)
         {
             anyhow::bail!(
-                "project name {} is taken by {}; set localforest.project (LOCALFOREST_PROJECT) to another name",
+                "project name {} is taken by {}; set lazy-cow-tree.project (LAZY_COW_TREE_PROJECT) to another name",
                 project.name,
                 other.project.root.display()
             );
@@ -690,7 +690,7 @@ impl Daemon {
         Ok(())
     }
 
-    /// Setup in the primary checkout, which may predate localforest or its `deps/`
+    /// Setup in the primary checkout, which may predate lazy-cow-tree or its `deps/`
     /// (a fresh clone): run before its first migrate, seed or service start. Needs
     /// its migrate lock. A failure is recorded like a failed migration (status, 502
     /// page) and retried after the same backoff.
@@ -721,7 +721,7 @@ impl Daemon {
         let create = self.create_lock.lock().await;
         let template = c.template_db();
         let primary = rt.primary().dev_db();
-        // LOCALFOREST_POSTGRES_COW=0: empty, then migrated and seeded like a new
+        // LAZY_COW_TREE_POSTGRES_COW=0: empty, then migrated and seeded like a new
         // primary database.
         let source = if !rt.project.copy_on_write() {
             None
@@ -778,7 +778,7 @@ impl Daemon {
             .ok_or_else(|| anyhow!("{} vanished", c.dev_db()))?
             .to_string();
         let marker = Repository::open(&c.path)
-            .map(|r| r.path().join("localforest-migrated"))
+            .map(|r| r.path().join("lazy-cow-tree-migrated"))
             .ok();
         if !force
             && marker
@@ -1206,7 +1206,7 @@ impl Daemon {
                     refspecs.push(format!("+refs/heads/{b}:refs/remotes/{remote}/{b}"));
                 }
                 if let (Some(pr), true) = (rec.pr, gh) {
-                    refspecs.push(format!("+refs/pull/{pr}/head:refs/localforest/pull/{pr}"));
+                    refspecs.push(format!("+refs/pull/{pr}/head:refs/lazy-cow-tree/pull/{pr}"));
                 }
                 if let Err(e) = syncer.fetch_refspecs(&repo, &refspecs) {
                     warn!("fetching {n}'s commit: {e:#}");
@@ -1742,7 +1742,7 @@ impl Daemon {
         }
         if let Some(head) = head {
             let dev = primary.dev_db();
-            // LOCALFOREST_POSTGRES_TEMPLATE_REFRESH=manual: `localforest snapshot` only.
+            // LAZY_COW_TREE_POSTGRES_TEMPLATE_REFRESH=manual: `lazy-cow-tree snapshot` only.
             if !rt.project.template_refresh_manual() && self.pg.exists(&dev).await? {
                 let t = std::time::Instant::now();
                 self.pg
@@ -1908,7 +1908,7 @@ impl Daemon {
                     .is_some_and(|s| s.start == StartMode::Manual)
                 {
                     anyhow::bail!(
-                        "{svc} starts manually: `localforest service start {svc}` in {}",
+                        "{svc} starts manually: `lazy-cow-tree service start {svc}` in {}",
                         c.path.display()
                     );
                 }
@@ -2050,7 +2050,7 @@ impl Daemon {
                 .services
                 .default_name()
                 .ok_or_else(|| {
-                    anyhow!("no services configured (localforest.services in devenv.nix)")
+                    anyhow!("no services configured (lazy-cow-tree.services in devenv.nix)")
                 })?
                 .to_string(),
         };
@@ -2400,7 +2400,7 @@ fn api(d: Arc<Daemon>) -> Router {
 }
 
 /// POSTed by the gone page's button.
-const RECREATE_PATH: &str = "/.localforest/recreate";
+const RECREATE_PATH: &str = "/.lazy-cow-tree/recreate";
 
 impl Daemon {
     /// The project and removed worktree a hostname belonged to:
@@ -2537,7 +2537,7 @@ fn gone_page(
         format!(
             r#"<form method="post" action="{RECREATE_PATH}" onsubmit="this.querySelector('button').disabled=true;this.querySelector('button').textContent='Recreating…'">
 <button type="submit">Recreate worktree to preview {}</button></form>
-<p class="note">Checks out the commit it was at, with a fresh copy of the database; its services start on the first request. A preview isn't removed for its merged pull request: remove it with <code>localforest worktree rm {}</code>.</p>"#,
+<p class="note">Checks out the commit it was at, with a fresh copy of the database; its services start on the first request. A preview isn't removed for its merged pull request: remove it with <code>lazy-cow-tree worktree rm {}</code>.</p>"#,
             e(name),
             e(name)
         )
@@ -2626,10 +2626,10 @@ fn dashboard(d: &Daemon) -> String {
         }
     }
     format!(
-        r#"<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>localforest</title>
+        r#"<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>lazy-cow-tree</title>
 <style>body{{font:14px system-ui;margin:2em;color:#222;background:#fff}}table{{border-collapse:collapse}}td,th{{padding:.3em .8em;border-bottom:1px solid #ddd;text-align:left}}
 @media(prefers-color-scheme:dark){{body{{color:#ddd;background:#111}}a{{color:#8af}}td,th{{border-color:#333}}}}</style></head>
-<body><h1>localforest</h1><p>PostgreSQL 127.0.0.1:{} · Redis 127.0.0.1:{} (password = checkout)</p>
+<body><h1>lazy-cow-tree</h1><p>PostgreSQL 127.0.0.1:{} · Redis 127.0.0.1:{} (password = checkout)</p>
 <table><tr><th>project</th><th>worktree</th><th>services</th><th>databases</th><th>path</th></tr>{rows}</table></body></html>"#,
         d.global.pg_port, d.global.redis_port
     )
@@ -2644,12 +2644,12 @@ fn dashboard(d: &Daemon) -> String {
 fn pg_access(user: &str, c: Option<&Checkout>, db: &str, others: &[Checkout]) -> Result<bool> {
     if user == "postgres" {
         anyhow::bail!(
-            "connect as your checkout's role (PGUSER in `localforest env`), not postgres"
+            "connect as your checkout's role (PGUSER in `lazy-cow-tree env`), not postgres"
         );
     }
     let Some(c) = c else {
         anyhow::bail!(
-            "{user:?} is not the role of a checkout localforest serves; use PGUSER / DATABASE_URL from `localforest env` in the checkout (and `localforest serve` in its project)"
+            "{user:?} is not the role of a checkout lazy-cow-tree serves; use PGUSER / DATABASE_URL from `lazy-cow-tree env` in the checkout (and `lazy-cow-tree serve` in its project)"
         );
     };
     if db == "postgres" || db == "template1" {
@@ -2680,7 +2680,7 @@ fn pg_access(user: &str, c: Option<&Checkout>, db: &str, others: &[Checkout]) ->
 }
 
 /// One PostgreSQL cluster serves every project, so a project wanting other
-/// durability (`LOCALFOREST_POSTGRES_DURABLE`) than the daemon's is refused, naming
+/// durability (`LAZY_COW_TREE_POSTGRES_DURABLE`) than the daemon's is refused, naming
 /// the projects the cluster already serves.
 fn durability_check<'a>(
     daemon: bool,
@@ -2707,7 +2707,7 @@ fn durability_check<'a>(
         others.join(", ")
     };
     anyhow::bail!(
-        "project {} wants a {} PostgreSQL, but the running localforest daemon's is {} (serving {started}); one cluster serves every project, so match dangerouslyDisableDurabilityForSpeed across them or `localforest down` and restart from this project",
+        "project {} wants a {} PostgreSQL, but the running lazy-cow-tree daemon's is {} (serving {started}); one cluster serves every project, so match dangerouslyDisableDurabilityForSpeed across them or `lazy-cow-tree down` and restart from this project",
         project.name,
         kind(project.postgres_durable()),
         kind(daemon),
@@ -2715,7 +2715,7 @@ fn durability_check<'a>(
 }
 
 /// The redis-server a checkout's REDIS_URL reaches: its own, or its project's with
-/// `LOCALFOREST_REDIS_INSTANCE=shared`.
+/// `LAZY_COW_TREE_REDIS_INSTANCE=shared`.
 fn redis_key(project: &Project, c: &Checkout) -> String {
     if project.redis_shared() {
         format!("{}+shared", project.name)
@@ -2730,7 +2730,7 @@ async fn daemon_alive() -> bool {
         .is_ok()
 }
 
-/// `localforest serve`: become the daemon, or register with the running one and take
+/// `lazy-cow-tree serve`: become the daemon, or register with the running one and take
 /// over when it goes away.
 pub async fn serve(global: Global, project: Option<Project>) -> Result<()> {
     std::fs::create_dir_all(config::home())?;
@@ -2741,7 +2741,10 @@ pub async fn serve(global: Global, project: Option<Project>) -> Result<()> {
                 && !registered
             {
                 crate::client::post::<serde_json::Value>("/projects", p).await?;
-                info!("registered {} with the running localforest daemon", p.name);
+                info!(
+                    "registered {} with the running lazy-cow-tree daemon",
+                    p.name
+                );
                 registered = true;
             }
             tokio::select! {
@@ -2834,7 +2837,7 @@ fn start_proxy(
 
 async fn lead(global: Global, project: Option<Project>, listener: UnixListener) -> Result<()> {
     info!(
-        "localforest daemon {} (state in {})",
+        "lazy-cow-tree daemon {} (state in {})",
         std::process::id(),
         config::home().display()
     );
@@ -3002,7 +3005,7 @@ mod tests {
     #[test]
     fn durability_must_match_the_daemons() {
         let fast = named("fast", &[]);
-        let safe = named("safe", &[("LOCALFOREST_POSTGRES_DURABLE", "1")]);
+        let safe = named("safe", &[("LAZY_COW_TREE_POSTGRES_DURABLE", "1")]);
         assert!(durability_check(false, &fast, std::iter::empty()).is_ok());
         assert!(durability_check(true, &safe, std::iter::empty()).is_ok());
         let e = durability_check(false, &safe, [&fast].into_iter())
@@ -3021,7 +3024,7 @@ mod tests {
     #[test]
     fn redis_key_per_checkout_or_shared() {
         let own = named("app", &[]);
-        let shared = named("app", &[("LOCALFOREST_REDIS_INSTANCE", "shared")]);
+        let shared = named("app", &[("LAZY_COW_TREE_REDIS_INSTANCE", "shared")]);
         let (p, w) = (
             own.checkout(None, "/src/app".into()),
             own.checkout_on(Some("wt"), "/src/app/wt".into(), 20000),
@@ -3082,7 +3085,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
         let marker = setup_marker(dir.path()).unwrap();
-        assert_eq!(marker, repo.path().join("localforest-setup"));
+        assert_eq!(marker, repo.path().join("lazy-cow-tree-setup"));
         assert!(marker.parent().unwrap().ends_with(".git"));
         assert!(setup_marker(&dir.path().join("missing")).is_err());
     }

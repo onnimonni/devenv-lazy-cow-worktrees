@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # End to end, on macOS (APFS RAM disk) and Linux: a real daemon with PostgreSQL 18
-# and Redis from PATH, a project with a remote, worktrees made by localforest and by
+# and Redis from PATH, a project with a remote, worktrees made by lazy-cow-tree and by
 # plain git, their databases, Redis, HTTPS services, .env, and removal.
 #
-#   tests/e2e.sh [path to the localforest binary]   (default: target/debug/localforest)
+#   tests/e2e.sh [path to the lazy-cow-tree binary]   (default: target/debug/lazy-cow-tree)
 #
 # Needs in PATH: postgres, initdb, psql, redis-server, redis-cli, git, curl, jq, and
 # python3 (or uv).
 set -euo pipefail
 
-bin=$(realpath "${1:-target/debug/localforest}")
+bin=$(realpath "${1:-target/debug/lazy-cow-tree}")
 for tool in postgres initdb psql redis-server redis-cli git curl jq; do
   command -v "$tool" >/dev/null || { echo "missing $tool in PATH" >&2; exit 1; }
 done
@@ -25,18 +25,18 @@ fi
 # Short: unix socket paths are limited to ~104 bytes.
 home=$(mktemp -d /tmp/lf.XXXXXX)
 work=$(mktemp -d)
-export LOCALFOREST_HOME=$home LOCALFOREST_PROJECT=demo LOCALFOREST_PORT=4100
-export LOCALFOREST_PG_PORT=55499 LOCALFOREST_REDIS_PORT=6399
-export LOCALFOREST_HTTPS_PORT=8443 LOCALFOREST_HTTP_PORT=0 LOCALFOREST_RAMDISK_MB=512
+export LAZY_COW_TREE_HOME=$home LAZY_COW_TREE_PROJECT=demo LAZY_COW_TREE_PORT=4100
+export LAZY_COW_TREE_PG_PORT=55499 LAZY_COW_TREE_REDIS_PORT=6399
+export LAZY_COW_TREE_HTTPS_PORT=8443 LAZY_COW_TREE_HTTP_PORT=0 LAZY_COW_TREE_RAMDISK_MB=512
 # Fails in the worktree named "broken", and in any checkout (the primary included)
 # where setup has not run yet: like `mix ecto.migrate` before `mix deps.get`.
 cat >"$home/migrate.sh" <<'EOF'
-[[ ${LOCALFOREST_WORKTREE:-} == broken ]] && { echo "migration broke" >&2; exit 1; }
-grep -qx "${LOCALFOREST_WORKTREE:-primary}" "$(dirname "$0")/setup.log" || { echo "setup did not run" >&2; exit 1; }
+[[ ${LAZY_COW_TREE_WORKTREE:-} == broken ]] && { echo "migration broke" >&2; exit 1; }
+grep -qx "${LAZY_COW_TREE_WORKTREE:-primary}" "$(dirname "$0")/setup.log" || { echo "setup did not run" >&2; exit 1; }
 exec psql -v ON_ERROR_STOP=1 -c 'CREATE TABLE IF NOT EXISTS seeds(x int); INSERT INTO seeds VALUES (1)'
 EOF
-export LOCALFOREST_MIGRATE="bash $home/migrate.sh"
-export LOCALFOREST_SETUP="sh -c 'echo \"\${LOCALFOREST_WORKTREE:-primary}\" >> $home/setup.log'"
+export LAZY_COW_TREE_MIGRATE="bash $home/migrate.sh"
+export LAZY_COW_TREE_SETUP="sh -c 'echo \"\${LAZY_COW_TREE_WORKTREE:-primary}\" >> $home/setup.log'"
 # Also serves on its named secondary port, like Phoenix's LiveDebugger; never binds `idle`.
 web="sh -c '$python -m http.server \"\$DEBUGGER_PORT\" --bind 127.0.0.1 & exec $python -m http.server \"\$PORT\" --bind 127.0.0.1'"
 # A Mix server: restarted when mix.lock changes. Logs each start.
@@ -47,10 +47,10 @@ echo started >> "$home/mix-starts.log"
 exec $python -m http.server "\$PORT" --bind 127.0.0.1
 EOF
 chmod +x "$home/bin/mix"
-LOCALFOREST_SERVICES=$(jq -nc --arg web "$web" --arg phx "$home/bin/mix phx.server" \
+LAZY_COW_TREE_SERVICES=$(jq -nc --arg web "$web" --arg phx "$home/bin/mix phx.server" \
   '{web: {exec: $web, portOffset: 0, ports: {debugger: {http: true}, test: {env: "TEST_PORT"}, idle: {http: true, offset: 5}}},
     phx: {exec: $phx, portOffset: 3}}')
-export LOCALFOREST_SERVICES
+export LAZY_COW_TREE_SERVICES
 unset GH_TOKEN GITHUB_TOKEN
 
 daemon=
@@ -102,7 +102,7 @@ template_seeded() {
   [[ $(PGUSER=postgres psql -h "$home/pg" -p 55500 -d demo_template -tAc "select count(*) from seeds") == 1 ]]
 }
 eventually 60 template_seeded || fail "template not seeded by the migrate command"
-[[ -f $(git rev-parse --absolute-git-dir)/localforest-setup ]] || fail "primary's setup not marked done"
+[[ -f $(git rev-parse --absolute-git-dir)/lazy-cow-tree-setup ]] || fail "primary's setup not marked done"
 [[ $(grep -cx primary "$home/setup.log") == 1 ]] || fail "setup did not run once in the primary"
 pass "fresh primary: setup ran before migrate; migrated, template refreshed"
 
@@ -116,7 +116,7 @@ eval "$(cd "$wt" && "$bin" env)"
 # Row counts depend on how the template is made; the marker says it was migrated.
 (($(psql -tAc "select count(*) from seeds") >= 1)) || fail "worktree database not cloned from the template"
 wait "$snap" || fail "snapshot failed"
-[[ -f $(git -C "$wt" rev-parse --absolute-git-dir)/localforest-migrated ]] || fail "new worktree not migrated"
+[[ -f $(git -C "$wt" rev-parse --absolute-git-dir)/lazy-cow-tree-migrated ]] || fail "new worktree not migrated"
 template_seeded || fail "template lost by the snapshot"
 [[ -z $(admin_psql "select 1 from pg_database where datname = 'demo_template_next'") ]] || fail "demo_template_next left behind"
 [[ $(psql -tAc "select current_database()") == demo_dev_feat_a ]] || fail "wrong database"
@@ -146,8 +146,8 @@ pass "redis isolated per checkout"
 base=$(cd "$wt" && "$bin" env --json | jq -r .PORT)
 [[ $DEBUGGER_PORT == $((base + 9)) && $TEST_PORT == $((base + 8)) ]] ||
   fail "named ports: DEBUGGER_PORT=$DEBUGGER_PORT TEST_PORT=$TEST_PORT (base $base)"
-[[ $LOCALFOREST_WEB_DEBUGGER_URL == https://feat-a.debugger.demo.localhost:8443 ]] ||
-  fail "LOCALFOREST_WEB_DEBUGGER_URL=$LOCALFOREST_WEB_DEBUGGER_URL"
+[[ $LAZY_COW_TREE_WEB_DEBUGGER_URL == https://feat-a.debugger.demo.localhost:8443 ]] ||
+  fail "LAZY_COW_TREE_WEB_DEBUGGER_URL=$LAZY_COW_TREE_WEB_DEBUGGER_URL"
 pass "named ports in env: DEBUGGER_PORT=$DEBUGGER_PORT TEST_PORT=$TEST_PORT"
 
 web_log=$(cd "$wt" && "$bin" service log -s web)
@@ -174,7 +174,7 @@ pass ".env written and gitignored"
 [[ $("$bin" status) == *"migrations failed"* ]] || fail "failed migration not in status"
 out=$(curl_lf "https://broken.web.demo.localhost:8443/" 2>&1) || true
 [[ $out == *"migrations failed"* ]] || fail "failed migration not on its page: $out"
-[[ ! -f $(git -C .claude/worktrees/broken rev-parse --absolute-git-dir)/localforest-migrated ]] ||
+[[ ! -f $(git -C .claude/worktrees/broken rev-parse --absolute-git-dir)/lazy-cow-tree-migrated ]] ||
   fail "failed migration marked done"
 "$bin" worktree rm --force broken
 pass "failed migration: in status and on the 502 page, services not started"
@@ -183,7 +183,7 @@ git worktree add -q -b manual .claude/worktrees/manual
 eventually 30 test -f .claude/worktrees/manual/.env || fail "plain git worktree not provisioned"
 eventually 30 grep -q manual "$home/setup.log" || fail "setup did not run"
 pass "plain git worktree add provisioned, setup ran"
-eventually 30 test -f "$(git -C .claude/worktrees/manual rev-parse --absolute-git-dir)/localforest-setup" ||
+eventually 30 test -f "$(git -C .claude/worktrees/manual rev-parse --absolute-git-dir)/lazy-cow-tree-setup" ||
   fail "setup not marked done"
 out=$("$bin" worktree rm --force manual 2>&1) || fail "rm of a fresh worktree failed: $out"
 [[ $out != *"deleting gitignored"* ]] || fail "fresh worktree's removal warned: $out"
@@ -229,7 +229,7 @@ g checkout -qb primary-feat
 admin_psql "DROP DATABASE demo_template WITH (FORCE)" >/dev/null
 admin_psql "DROP DATABASE demo_dev WITH (FORCE)" >/dev/null
 git worktree add -q -b fresh .claude/worktrees/fresh
-fresh_marker=$(git -C .claude/worktrees/fresh rev-parse --absolute-git-dir)/localforest-migrated
+fresh_marker=$(git -C .claude/worktrees/fresh rev-parse --absolute-git-dir)/lazy-cow-tree-migrated
 eventually 60 test -f "$fresh_marker" || fail "worktree not migrated after the fresh primary"
 (($(PGUSER=postgres psql -h "$home/pg" -p 55500 -d demo_dev -tAc "select count(*) from seeds") >= 1)) ||
   fail "fresh primary database on a feature branch not migrated"

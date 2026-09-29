@@ -64,7 +64,7 @@ pub fn list(root: &Path) -> Result<Vec<Info>> {
 }
 
 /// The worktree's base port, recorded in its git admin dir (gone with it).
-const PORT_FILE: &str = "localforest-port";
+const PORT_FILE: &str = "lazy-cow-tree-port";
 
 /// Admin dir of the worktree at `path`, from its `.git` file (`gitdir: <dir>`),
 /// without opening the repository.
@@ -98,9 +98,9 @@ fn probe(project: &str, name: &str, used: &HashSet<u16>) -> u16 {
 }
 
 /// Base port of every worktree of `projects` (all registered ones: the daemon's, or
-/// `state.json` for `localforest env`), by path. Recorded ports hold; the others
+/// `state.json` for `lazy-cow-tree env`), by path. Recorded ports hold; the others
 /// get, in order of (project root, name), the first slot from their hashed one that
-/// no primary, recorded or earlier worktree has. Pure: the daemon and `localforest
+/// no primary, recorded or earlier worktree has. Pure: the daemon and `lazy-cow-tree
 /// env` get the same answer from the same projects and admin dirs.
 pub fn plan_ports(projects: &[Project]) -> Result<Vec<(PathBuf, u16, bool)>> {
     let mut used: HashSet<u16> = projects.iter().map(|p| p.settings.port).collect();
@@ -411,7 +411,9 @@ fn copy_caches(root: &Path, path: &Path, name: &str) -> Result<Vec<String>> {
 }
 
 fn populated_marker(path: &Path) -> Result<PathBuf> {
-    Ok(Repository::open(path)?.path().join("localforest-populated"))
+    Ok(Repository::open(path)?
+        .path()
+        .join("lazy-cow-tree-populated"))
 }
 
 /// First path segments named in the primary's `.worktreeinclude` (git-cow carries
@@ -432,11 +434,11 @@ fn worktree_include(root: &Path) -> Option<HashSet<String>> {
     )
 }
 
-const ENV_BEGIN: &str = "# >>> localforest: this worktree's environment (regenerated) >>>";
-const ENV_END: &str = "# <<< localforest <<<";
-const ENV_OVERRIDDEN: &str = "# overridden by localforest: ";
+const ENV_BEGIN: &str = "# >>> lazy-cow-tree: this worktree's environment (regenerated) >>>";
+const ENV_END: &str = "# <<< lazy-cow-tree <<<";
+const ENV_OVERRIDDEN: &str = "# overridden by lazy-cow-tree: ";
 
-/// `.env` text without localforest's block.
+/// `.env` text without lazy-cow-tree's block.
 fn outside_env_block(text: &str) -> String {
     let mut rest = String::new();
     let mut inside = false;
@@ -453,7 +455,7 @@ fn outside_env_block(text: &str) -> String {
     rest
 }
 
-/// The worktree's `.env` is only what localforest made of it: its block plus the
+/// The worktree's `.env` is only what lazy-cow-tree made of it: its block plus the
 /// primary's `.env` (keys the block sets commented out), or the block alone.
 fn env_is_ours(root: &Path, path: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(path.join(".env")) else {
@@ -515,7 +517,7 @@ pub fn write_env(path: &Path, env: &[(String, String)]) -> Result<()> {
     let file = path.join(".env");
     if repo.index()?.get_path(Path::new(".env"), 0).is_some() {
         warn!(
-            "{}: .env is tracked by git; not writing localforest's environment into it",
+            "{}: .env is tracked by git; not writing lazy-cow-tree's environment into it",
             path.display()
         );
         return Ok(());
@@ -527,7 +529,7 @@ pub fn write_env(path: &Path, env: &[(String, String)]) -> Result<()> {
         if !text.is_empty() && !text.ends_with('\n') {
             text.push('\n');
         }
-        text.push_str("# localforest writes each worktree's .env\n.env\n");
+        text.push_str("# lazy-cow-tree writes each worktree's .env\n.env\n");
         std::fs::write(&exclude, text)?;
         info!("added .env to {}", exclude.display());
     }
@@ -630,7 +632,7 @@ pub fn initializing(root: &Path, info: &Info) -> bool {
         })
 }
 
-/// A worktree made by plain `git worktree add` (not localforest or git-cow) has no
+/// A worktree made by plain `git worktree add` (not lazy-cow-tree or git-cow) has no
 /// build caches. While it's still exactly its fresh checkout (clean, nothing
 /// untracked) and the primary has gitignored top-level entries it lacks (`deps/`,
 /// `_build/`, `node_modules/`, …), redo it as a copy-on-write clone of the primary,
@@ -734,7 +736,7 @@ const REBUILDABLE: &[&str] = &[
 ];
 
 /// Written in the worktree's git admin dir once its setup command succeeded.
-pub const SETUP_MARKER: &str = "localforest-setup";
+pub const SETUP_MARKER: &str = "lazy-cow-tree-setup";
 
 /// When provisioning finished: the newest of the populated and setup markers.
 fn provisioned_at(path: &Path) -> Option<SystemTime> {
@@ -784,7 +786,7 @@ fn unchanged_since(p: &Path, t: SystemTime) -> bool {
     true
 }
 
-/// Ignored paths localforest carried into the worktree (listed in its populated
+/// Ignored paths lazy-cow-tree carried into the worktree (listed in its populated
 /// marker) or the primary's `.worktreeinclude` names (what git-cow carries).
 struct Carried {
     paths: Vec<String>,
@@ -824,7 +826,7 @@ impl Carried {
 }
 
 /// Gitignored paths in the worktree at `path` that removal would delete for good:
-/// not build caches or per-checkout indexes, not what localforest carried or wrote
+/// not build caches or per-checkout indexes, not what lazy-cow-tree carried or wrote
 /// (`.env` holding only its block and the primary's), not what was already there
 /// when provisioning (setup) finished, and not copies of the primary checkout at
 /// `root` (same file contents; directories with the same files and sizes).
@@ -958,7 +960,7 @@ pub fn safety(info: &Info, remote: &str, base: &str) -> Result<Safety> {
 }
 
 /// Commits in `head` not in `hidden`, ignoring conflict-free merges of the base
-/// branch that localforest made (they add nothing of the branch's own). One with that
+/// branch that lazy-cow-tree made (they add nothing of the branch's own). One with that
 /// message but a tree other than the clean merge of its parents (edited, conflicts
 /// resolved by hand) counts.
 pub fn ahead(
@@ -1103,7 +1105,7 @@ pub fn unpushed(info: &Info, remote: &str, base: &str) -> Result<usize> {
 /// the files in the background.
 pub fn remove_files(root: &Path, info: &Info, delete_branch: bool) -> Result<Option<String>> {
     let repo = Repository::open(root)?;
-    let trash_dir = repo.commondir().join("localforest-trash");
+    let trash_dir = repo.commondir().join("lazy-cow-tree-trash");
     std::fs::create_dir_all(&trash_dir)?;
     let trash = trash_dir.join(format!("{}.{}", info.name, std::process::id()));
     let mut trash = if trash.exists() {
@@ -1193,7 +1195,7 @@ pub fn remove_files(root: &Path, info: &Info, delete_branch: bool) -> Result<Opt
 }
 
 /// Prefix of a removed worktree moved next to itself (another volume than the git dir).
-const SIBLING_TRASH: &str = ".localforest-trash.";
+const SIBLING_TRASH: &str = ".lazy-cow-tree-trash.";
 
 /// Delete what an interrupted removal left behind: the git dir's trash and hidden
 /// siblings in `worktrees_dir`.
@@ -1201,7 +1203,7 @@ pub fn clean_trash(root: &Path, worktrees_dir: &Path) {
     let Ok(repo) = Repository::open(root) else {
         return;
     };
-    let mut stale: Vec<PathBuf> = std::fs::read_dir(repo.commondir().join("localforest-trash"))
+    let mut stale: Vec<PathBuf> = std::fs::read_dir(repo.commondir().join("lazy-cow-tree-trash"))
         .into_iter()
         .flatten()
         .flatten()
@@ -1506,7 +1508,7 @@ mod tests {
         assert_ne!(a, b);
 
         // Same directory name elsewhere (plain `git worktree add`): git numbers the
-        // admin dir, and list and `localforest env` agree on the name.
+        // admin dir, and list and `lazy-cow-tree env` agree on the name.
         let repo = Repository::open(&project.root).unwrap();
         let head = repo.head().unwrap().peel_to_commit().unwrap();
         for (admin, dir) in [("dup", "x"), ("dup1", "y")] {
@@ -1806,7 +1808,7 @@ mod tests {
     }
 
     #[test]
-    fn env_holding_only_localforests_block_is_not_reported() {
+    fn env_holding_only_lazy_cow_trees_block_is_not_reported() {
         let (_d, project, syncer) = fixture();
         let path = create(&project, &syncer, "feat-x", None).unwrap();
         std::thread::sleep(Duration::from_millis(20));
@@ -1866,7 +1868,7 @@ mod tests {
 
     #[test]
     fn spares_whole_ancestor_chains() {
-        // 1 <- 100 (claude) <- 200 (sh) <- 300 (localforest); 1 <- 400 <- 500
+        // 1 <- 100 (claude) <- 200 (sh) <- 300 (lazy-cow-tree); 1 <- 400 <- 500
         let parent = HashMap::from([(100, 1), (200, 100), (300, 200), (400, 1), (500, 400)]);
         assert_eq!(
             with_ancestors(&parent, &[300, 500]),
@@ -1878,7 +1880,7 @@ mod tests {
 
     #[test]
     fn sweep_does_not_go_through_spared_processes() {
-        // claude 100 (inside) <- sh 200 <- localforest 300; claude <- mcp 110 (outside)
+        // claude 100 (inside) <- sh 200 <- lazy-cow-tree 300; claude <- mcp 110 (outside)
         // <- 111; claude <- server 120 (inside) <- watcher 121; other 400 (outside).
         let procs = [
             (100, 1, true),
@@ -1927,7 +1929,7 @@ mod tests {
     #[test]
     fn cleans_up_trash_of_interrupted_removals() {
         let (_d, project, _) = fixture();
-        let trash = project.root.join(".git/localforest-trash/old.123");
+        let trash = project.root.join(".git/lazy-cow-tree-trash/old.123");
         let sibling = project
             .worktrees_dir()
             .join(format!("{SIBLING_TRASH}old.123"));
@@ -2070,7 +2072,7 @@ mod tests {
             text,
             format!(
                 "{ENV_BEGIN}\nDATABASE_URL='postgres://wt'\nPORT='20000'\n{ENV_END}\n\
-                 # overridden by localforest: DATABASE_URL=postgres://primary\nOTHER=1\n"
+                 # overridden by lazy-cow-tree: DATABASE_URL=postgres://primary\nOTHER=1\n"
             )
         );
         let wt = Repository::open(&info.path).unwrap();

@@ -1,10 +1,10 @@
 [package]
-name = "localforest"
+name = "lazy-cow-tree"
 version = "0.1.0"
 edition = "2024"
 description = "Worktrees, databases, HTTPS hosts, Redis and LSP for parallel coding agents"
 license = "MIT"
-repository = "https://github.com/onnimonni/localforest"
+repository = "https://github.com/onnimonni/devenv-lazy-cow-worktrees"
 readme = "README.md"
 keywords = ["git", "worktree", "devenv", "postgres", "agents"]
 categories = ["development-tools", "command-line-utilities"]

@@ -1,4 +1,4 @@
-//! Worktree-aware LSP proxy: `localforest lsp -- <server> [args]`.
+//! Worktree-aware LSP proxy: `lazy-cow-tree lsp -- <server> [args]`.
 //!
 //! One editor/agent session (Claude Code in the primary checkout) edits files in many
 //! worktrees. A single language server rooted at the primary would index every nested
@@ -272,7 +272,7 @@ impl Router {
             "name": root.file_name().unwrap_or_default().to_string_lossy(),
         }]);
         self.next += 1;
-        let init = json!({"jsonrpc": "2.0", "id": format!("localforest-init:{}", self.next), "method": "initialize", "params": params});
+        let init = json!({"jsonrpc": "2.0", "id": format!("lazy-cow-tree-init:{}", self.next), "method": "initialize", "params": params});
         let _ = self.backends[root].tx.send(init);
         Ok(())
     }
@@ -346,7 +346,7 @@ impl Router {
             "shutdown" => {
                 for (root, b) in &self.backends {
                     if *root != primary && b.ready {
-                        let _ = b.tx.send(json!({"jsonrpc": "2.0", "id": "localforest-shutdown", "method": "shutdown"}));
+                        let _ = b.tx.send(json!({"jsonrpc": "2.0", "id": "lazy-cow-tree-shutdown", "method": "shutdown"}));
                     }
                 }
                 if let Some(id) = id {
@@ -422,7 +422,7 @@ impl Router {
             // Response.
             (None, Some(id)) => {
                 let key = id.as_str().unwrap_or_default();
-                if key.starts_with("localforest-init:") {
+                if key.starts_with("lazy-cow-tree-init:") {
                     if let Some(b) = self.backends.get_mut(&root) {
                         b.ready = true;
                         let _ = b
@@ -437,7 +437,7 @@ impl Router {
                     }
                     return;
                 }
-                if key == "localforest-shutdown" {
+                if key == "lazy-cow-tree-shutdown" {
                     return;
                 }
                 self.pending.remove(&id_key(&id));
@@ -467,7 +467,7 @@ impl Router {
                     return;
                 }
                 self.next += 1;
-                let ours = json!(format!("localforest:{}", self.next));
+                let ours = json!(format!("lazy-cow-tree:{}", self.next));
                 self.server_reqs.insert(id_key(&ours), (root, id));
                 v["id"] = ours;
                 let _ = self.to_client.send(v);
@@ -492,7 +492,7 @@ impl Router {
 
 pub async fn run(cmd: Vec<String>) -> Result<()> {
     if cmd.is_empty() {
-        bail!("usage: localforest lsp -- <language server> [args]");
+        bail!("usage: lazy-cow-tree lsp -- <language server> [args]");
     }
     let cwd = std::env::current_dir()?;
     let primary = crate::config::primary_root(&cwd).unwrap_or(cwd);

@@ -118,7 +118,7 @@ impl Syncer {
             .prune(FetchPrune::On)
             .download_tags(AutotagOption::Auto);
         remote
-            .fetch(refspecs, Some(&mut fo), Some("localforest: fetch"))
+            .fetch(refspecs, Some(&mut fo), Some("lazy-cow-tree: fetch"))
             .with_context(|| format!("fetching {}", self.remote))?;
         debug!("fetched {}", self.remote);
         Ok(())
@@ -182,7 +182,7 @@ impl Syncer {
             .id();
         let ours = local.peel_to_commit()?.id();
         if ours != theirs && repo.graph_descendant_of(theirs, ours)? {
-            local.set_target(theirs, "localforest: fast-forward")?;
+            local.set_target(theirs, "lazy-cow-tree: fast-forward")?;
             info!("{}: fast-forwarded (not checked out)", self.base);
         }
         Ok(())
@@ -267,7 +267,7 @@ pub fn merge_into(repo: &Repository, their_ref: &str) -> Result<Outcome> {
         repo.checkout_tree(theirs.as_object(), Some(&mut checkout))?;
         repo.find_reference(&head_name)?.set_target(
             theirs.id(),
-            &format!("localforest: fast-forward to {their_ref}"),
+            &format!("lazy-cow-tree: fast-forward to {their_ref}"),
         )?;
         return Ok(Outcome::FastForward);
     }

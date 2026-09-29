@@ -187,7 +187,7 @@ impl Routes {
     }
 }
 
-/// Renders the dashboard served at https://localforest.localhost.
+/// Renders the dashboard served at https://lazy-cow-tree.localhost.
 pub type Dashboard = Arc<dyn Fn() -> String + Send + Sync>;
 
 /// Called with the host when nothing listens on its port: starts the worktree's
@@ -250,7 +250,7 @@ async fn bind(port: u16) -> Result<TcpListener> {
 }
 
 /// A devenv route's own certificate (its project's mkcert CA), else a leaf from
-/// localforest's CA.
+/// lazy-cow-tree's CA.
 #[derive(Debug)]
 struct Certificates {
     ca: Arc<crate::tls::Ca>,
@@ -416,7 +416,7 @@ async fn handle(
     slot: Option<ConnSlot>,
 ) -> Result<Response<Body>, Infallible> {
     let host = request_host(&req);
-    if host == "localforest.localhost" || host == "localhost" {
+    if host == "lazy-cow-tree.localhost" || host == "localhost" {
         return Ok(full(
             StatusCode::OK,
             "text/html; charset=utf-8",
@@ -432,7 +432,7 @@ async fn handle(
                     full(
                         StatusCode::BAD_GATEWAY,
                         "text/plain; charset=utf-8",
-                        format!("localforest: nothing answers for {host} on {upstream} ({e}); devenv registered it\n"),
+                        format!("lazy-cow-tree: nothing answers for {host} on {upstream} ({e}); devenv registered it\n"),
                     )
                 }));
         }
@@ -461,7 +461,9 @@ async fn handle(
         return Ok(full(
             StatusCode::NOT_FOUND,
             "text/plain; charset=utf-8",
-            format!("localforest: no worktree serves {host}; see https://localforest.localhost\n"),
+            format!(
+                "lazy-cow-tree: no worktree serves {host}; see https://lazy-cow-tree.localhost\n"
+            ),
         ));
     };
 
@@ -484,7 +486,7 @@ async fn handle(
             StatusCode::BAD_GATEWAY,
             "text/plain; charset=utf-8",
             format!(
-                "localforest: could not start {host}: {e}\nSee `localforest status` and the logs in ~/.local/state/localforest/logs.\n"
+                "lazy-cow-tree: could not start {host}: {e}\nSee `lazy-cow-tree status` and the logs in ~/.local/state/lazy-cow-tree/logs.\n"
             ),
         ));
     }
@@ -496,7 +498,7 @@ async fn handle(
                 StatusCode::BAD_GATEWAY,
                 "text/plain; charset=utf-8",
                 format!(
-                    "localforest: nothing answers for {host} on 127.0.0.1:{port} ({e}).\nSet localforest.server (devenv.nix) to start it on demand, or run it with PORT={port} (see `localforest env`); logs: `localforest server log <name>`.\n"
+                    "lazy-cow-tree: nothing answers for {host} on 127.0.0.1:{port} ({e}).\nSet lazy-cow-tree.server (devenv.nix) to start it on demand, or run it with PORT={port} (see `lazy-cow-tree env`); logs: `lazy-cow-tree server log <name>`.\n"
                 ),
             )
         }))

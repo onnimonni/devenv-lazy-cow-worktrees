@@ -1,6 +1,6 @@
 //! One PostgreSQL cluster for every project and worktree, on the RAM disk. Disposable
 //! dev/test data: fsync and friends are off; a durable cluster
-//! (`LOCALFOREST_POSTGRES_DURABLE`) lives on disk with them on. Every copy of a template runs
+//! (`LAZY_COW_TREE_POSTGRES_DURABLE`) lives on disk with them on. Every copy of a template runs
 //! `SET file_copy_method = clone` + `CREATE DATABASE ... STRATEGY FILE_COPY`
 //! (PostgreSQL 18+), a copy-on-write clone of the files (clonefile on APFS,
 //! copy_file_range reflinks on btrfs/XFS), so a worktree's database is ready in
@@ -22,7 +22,7 @@ pub struct Postgres {
     file_copy_method: String,
 }
 
-/// postgresql.conf settings localforest starts a cluster with (the project's come
+/// postgresql.conf settings lazy-cow-tree starts a cluster with (the project's come
 /// after and win).
 fn cluster_settings(
     dir: &std::path::Path,
@@ -30,7 +30,7 @@ fn cluster_settings(
     durable: bool,
 ) -> Vec<(&'static str, String)> {
     let mut settings = vec![
-        // Unix socket only: clients come through localforest's proxy (pgproxy.rs).
+        // Unix socket only: clients come through lazy-cow-tree's proxy (pgproxy.rs).
         ("listen_addresses", String::new()),
         ("port", port.to_string()),
         ("unix_socket_directories", dir.display().to_string()),
@@ -164,7 +164,7 @@ impl Postgres {
         for (k, v) in &settings {
             cmd.arg("-c").arg(format!("{k}={v}"));
         }
-        // The project's (localforest.postgres.settings) come last and win.
+        // The project's (lazy-cow-tree.postgres.settings) come last and win.
         for (k, v) in &extra {
             cmd.arg("-c").arg(format!("{k}={v}"));
         }

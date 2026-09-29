@@ -16,21 +16,21 @@
     in
     {
       packages = forAllSystems (pkgs: rec {
-        localforest = pkgs.callPackage ./package.nix { };
-        default = localforest;
+        lazy-cow-tree = pkgs.callPackage ./package.nix { };
+        default = lazy-cow-tree;
       });
       overlays.default = final: _prev: {
-        localforest = final.callPackage ./package.nix { };
+        lazy-cow-tree = final.callPackage ./package.nix { };
       };
-      # `imports = [ inputs.localforest.devenvModules.default ];` or, with
-      # `flake: false`, `imports: [ localforest/devenv-module ]` in devenv.yaml. As a
+      # `imports = [ inputs.lazy-cow-tree.devenvModules.default ];` or, with
+      # `flake: false`, `imports: [ lazy-cow-tree/devenv-module ]` in devenv.yaml. As a
       # flake input the package is this flake's (the one CI pushes to Cachix), so the
       # module doesn't evaluate a second nixpkgs.
       devenvModules.default =
         { pkgs, lib, ... }:
         {
           imports = [ ./devenv-module/devenv.nix ];
-          localforest.package = lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+          lazyCowTree.package = lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.default;
         };
     };
 }

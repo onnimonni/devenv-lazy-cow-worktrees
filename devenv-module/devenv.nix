@@ -1,30 +1,30 @@
-# devenv module: runs `localforest serve` for this project and wires every checkout to it.
+# devenv module: runs `lazy-cow-tree serve` for this project and wires every checkout to it.
 #
 #   # devenv.yaml                              # devenv.nix
 #   inputs:                                    { inputs, ... }: {
-#     localforest:                               imports = [ inputs.localforest.devenvModules.default ];
-#       url: github:onnimonni/localforest      }
+#     lazy-cow-tree:                               imports = [ inputs.lazy-cow-tree.devenvModules.default ];
+#       url: github:onnimonni/devenv-lazy-cow-worktrees      }
 #
-#   (or `flake: false` on the input and `imports: [ localforest/devenv-module ]`)
+#   (or `flake: false` on the input and `imports: [ lazy-cow-tree/devenv-module ]`)
 #
-# It derives localforest's services from devenv's own `processes` (exec, cwd, ports,
+# It derives lazy-cow-tree's services from devenv's own `processes` (exec, cwd, ports,
 # proxy.hostname, after, ready, restart, watch, plus the new `start.on` /
 # `start.idleTimeout`), its database from `services.postgres` (plus `instance`,
 # `start`, `copyOnWrite`, `dangerouslyDisableDurabilityForSpeed`), Redis from
 # `services.redis` (plus `instance`, `start`) and the checkout's env files from `dotenv`,
-# and keeps devenv from starting its own copies. `localforest.*` options still work and
+# and keeps devenv from starting its own copies. `lazyCowTree.*` options still work and
 # win over what is derived:
 #
-#   localforest.migrate = "mix ecto.migrate";
-#   localforest.seed = "mix run priv/repo/seeds.exs";
-#   localforest.setup = "mix deps.get";           # once in every new checkout
-#   localforest.services.api = { exec = "bun run dev"; cwd = "api"; };
-#   localforest.lsp.elixir = [ "dexter" "lsp" ];
+#   lazyCowTree.migrate = "mix ecto.migrate";
+#   lazyCowTree.seed = "mix run priv/repo/seeds.exs";
+#   lazyCowTree.setup = "mix deps.get";           # once in every new checkout
+#   lazyCowTree.services.api = { exec = "bun run dev"; cwd = "api"; };
+#   lazyCowTree.lsp.elixir = [ "dexter" "lsp" ];
 #
 # Every checkout (primary and worktrees) gets each service on demand:
 # https://<worktree>.<service>.<project>.localhost (https://<service>.<project>.localhost
 # in the primary) starts it, after what it depends on, with its own PORT and the
-# checkout's DATABASE_URL and REDIS_URL. `localforest env [--service x]` gives every
+# checkout's DATABASE_URL and REDIS_URL. `lazy-cow-tree env [--service x]` gives every
 # shell the same environment. Claude Code's WorktreeCreate/WorktreeRemove
 # hooks go through the daemon, so `claude --worktree` and `isolation: worktree`
 # subagents get provisioned worktrees too, and its NODE_EXTRA_CA_CERTS trusts the
@@ -38,10 +38,10 @@
 }:
 
 let
-  cfg = config.localforest;
+  cfg = config.lazyCowTree;
   exe = lib.getExe cfg.package;
-  # localforest's own nixpkgs (flake.lock), so the default package is the exact
-  # derivation CI pushes to localforest.cachix.org, whatever nixpkgs the consumer uses.
+  # lazy-cow-tree's own nixpkgs (flake.lock), so the default package is the exact
+  # derivation CI pushes to lazy-cow-tree.cachix.org, whatever nixpkgs the consumer uses.
   lock = builtins.fromJSON (builtins.readFile ../flake.lock);
   nixpkgsLock = lock.nodes.${lock.nodes.${lock.root}.inputs.nixpkgs}.locked;
   pinnedPkgs =
@@ -56,7 +56,7 @@ let
         overlays = [ ];
       };
   # devenv evaluates impurely, so the invoking user's environment is readable.
-  envHome = builtins.getEnv "LOCALFOREST_HOME";
+  envHome = builtins.getEnv "LAZY_COW_TREE_HOME";
   userHome = builtins.getEnv "HOME";
   inherit (lib) mkOption types;
   # With its extensions, like devenv's services.postgres.
@@ -72,7 +72,7 @@ let
         type = types.nullOr types.str;
         default = null;
         example = "LIVE_DEBUGGER_PORT";
-        description = "Variable holding the port (default: `<NAME>_PORT`); also always LOCALFOREST_<SERVICE>_<NAME>_PORT (and _URL with http).";
+        description = "Variable holding the port (default: `<NAME>_PORT`); also always LAZY_COW_TREE_<SERVICE>_<NAME>_PORT (and _URL with http).";
       };
       http = mkOption {
         type = types.bool;
@@ -99,7 +99,7 @@ let
         unit = builtins.elemAt m 1;
       in
       if m == null then
-        throw "localforest: duration ${builtins.toJSON d} is not like 30s, 15m or 1h"
+        throw "lazy-cow-tree: duration ${builtins.toJSON d} is not like 30s, 15m or 1h"
       else if unit == "h" then
         n * 3600
       else if unit == "m" then
@@ -117,22 +117,22 @@ let
         n = lib.toInt (builtins.elemAt m 0);
       in
       if m == null then
-        throw "localforest: size ${builtins.toJSON s} is not like 512M or 4G"
+        throw "lazy-cow-tree: size ${builtins.toJSON s} is not like 512M or 4G"
       else if lib.toLower (toString (builtins.elemAt m 1)) == "g" then
         n * 1024
       else
         n;
   duration = types.nullOr (types.either types.ints.unsigned types.str);
 
-  # devenv's processes that localforest runs instead: every one but its own, devenv's
-  # postgres/redis (localforest provides those) and ones opted out.
+  # devenv's processes that lazy-cow-tree runs instead: every one but its own, devenv's
+  # postgres/redis (lazy-cow-tree provides those) and ones opted out.
   own = [
-    "localforest"
+    "lazy-cow-tree"
     "postgres"
     "redis"
   ];
   derivedProcs = lib.filterAttrs (
-    name: p: cfg.enable && !(builtins.elem name own) && p.localforest.enable
+    name: p: cfg.enable && !(builtins.elem name own) && p.lazyCowTree.enable
   ) config.processes;
   root = config.devenv.root;
   # A path under the checkout root as relative to `base` (itself relative to root, or
@@ -172,7 +172,7 @@ let
         else
           "${lib.toUpper (lib.replaceStrings [ "-" ] [ "_" ] port)}_PORT";
       extraPorts = lib.filter (port: port != httpPort) portNames;
-      # localforest sets PORT and each named port's variable per checkout.
+      # lazy-cow-tree sets PORT and each named port's variable per checkout.
       portValues = map value portNames;
       env = lib.filterAttrs (_: v: !(builtins.elem v portValues)) p.env;
       cwd =
@@ -194,9 +194,9 @@ let
       watched = lib.filter (x: x != null) (map (relativeTo cwd) p.watch.paths);
     in
     lib.warnIf (ignored != [ ])
-      "localforest: processes.${name}.after: ${lib.concatStringsSep ", " ignored} ignored (only other processes localforest runs are started first)"
+      "lazy-cow-tree: processes.${name}.after: ${lib.concatStringsSep ", " ignored} ignored (only other processes lazy-cow-tree runs are started first)"
       {
-        exec = toString (pkgs.writeShellScript "localforest-${name}" p.exec);
+        exec = toString (pkgs.writeShellScript "lazy-cow-tree-${name}" p.exec);
         inherit cwd env;
         http = httpPort != null;
         ports = lib.genAttrs extraPorts (port: {
@@ -223,7 +223,7 @@ let
         start = p.start.on;
         idleTimeout = seconds p.start.idleTimeout;
         hostname = p.proxy.hostname;
-        inherit (p.localforest) migrate restartOnPull;
+        inherit (p.lazyCowTree) migrate restartOnPull;
       };
 
   derived = lib.mapAttrs deriveService derivedProcs;
@@ -243,7 +243,7 @@ let
                   "manual"
                 ];
                 default = "demand";
-                description = "When localforest starts it: with its checkout (`up`), on the first request or as a dependency (`demand`), or only by `localforest service start` (`manual`).";
+                description = "When lazy-cow-tree starts it: with its checkout (`up`), on the first request or as a dependency (`demand`), or only by `lazy-cow-tree service start` (`manual`).";
               };
               idleTimeout = mkOption {
                 type = duration;
@@ -254,16 +254,16 @@ let
             };
           };
         };
-        localforest = {
+        lazyCowTree = {
           enable = mkOption {
             type = types.bool;
             default = true;
-            description = "Run this process in every checkout through localforest; false leaves it to devenv (primary checkout only).";
+            description = "Run this process in every checkout through lazy-cow-tree; false leaves it to devenv (primary checkout only).";
           };
           migrate = mkOption {
             type = types.nullOr types.str;
             default = null;
-            description = "Migrate command for the checkout's database, run in the process's cwd after `localforest.migrate`.";
+            description = "Migrate command for the checkout's database, run in the process's cwd after `lazyCowTree.migrate`.";
           };
           restartOnPull = mkOption {
             type = types.bool;
@@ -272,12 +272,12 @@ let
           };
         };
       };
-      # localforest runs it (and provides postgres/redis): `devenv up` doesn't too.
+      # lazy-cow-tree runs it (and provides postgres/redis): `devenv up` doesn't too.
       config.start.enable = lib.mkIf (
         cfg.enable
         && (
-          (builtins.elem name own && name != "localforest")
-          || (!(builtins.elem name own) && config.localforest.enable)
+          (builtins.elem name own && name != "lazy-cow-tree")
+          || (!(builtins.elem name own) && config.lazyCowTree.enable)
         )
       ) (lib.mkForce false);
     }
@@ -300,7 +300,7 @@ let
   };
   pgCfg = config.services.postgres;
   redisCfg = config.services.redis;
-  # devenv's postgres module sets these itself; localforest's cluster decides them.
+  # devenv's postgres module sets these itself; lazy-cow-tree's cluster decides them.
   pgOwnSettings = [
     "listen_addresses"
     "port"
@@ -328,7 +328,7 @@ let
       default = mkOption {
         type = types.bool;
         default = false;
-        description = "The service `localforest env` and `localforest service` pick without a name (default: `web`, else the first http service).";
+        description = "The service `lazy-cow-tree env` and `lazy-cow-tree service` pick without a name (default: `web`, else the first http service).";
       };
       portOffset = mkOption {
         type = types.nullOr (types.ints.between 0 9);
@@ -340,7 +340,7 @@ let
       migrate = mkOption {
         type = types.nullOr types.str;
         default = null;
-        description = "Migrate/seed command for the checkout's database, run in its cwd after `localforest.migrate` when the base branch moves (primary) or was merged in (worktrees).";
+        description = "Migrate/seed command for the checkout's database, run in its cwd after `lazyCowTree.migrate` when the base branch moves (primary) or was merged in (worktrees).";
       };
       dependsOn = mkOption {
         type = types.listOf types.str;
@@ -359,7 +359,7 @@ let
           "always"
         ];
         default = "no";
-        description = "When it exits on its own: leave it down, start it again after a non-zero exit, or after any exit (backing off 1-30 s; `localforest service stop` keeps it down).";
+        description = "When it exits on its own: leave it down, start it again after a non-zero exit, or after any exit (backing off 1-30 s; `lazy-cow-tree service stop` keeps it down).";
       };
       ports = mkOption {
         type = types.attrsOf extraPort;
@@ -385,7 +385,7 @@ let
           "Gemfile.lock"
           "config/*.rb"
         ];
-        description = "Files (relative to cwd, `*` / `?` in the file name) whose content changing restarts it if running (after localforest.setup when a dependency manifest or lockfile such as mix.lock, Gemfile.lock or package.json changed; not while its checkout pulls or migrates). Default: for a command running `mix`, mix.exs, mix.lock and config/*.exs (Phoenix's code reloader refuses to compile after those change); `[ ]` for others and to turn it off.";
+        description = "Files (relative to cwd, `*` / `?` in the file name) whose content changing restarts it if running (after lazyCowTree.setup when a dependency manifest or lockfile such as mix.lock, Gemfile.lock or package.json changed; not while its checkout pulls or migrates). Default: for a command running `mix`, mix.exs, mix.lock and config/*.exs (Phoenix's code reloader refuses to compile after those change); `[ ]` for others and to turn it off.";
       };
       start = mkOption {
         type = types.enum [
@@ -394,7 +394,7 @@ let
           "manual"
         ];
         default = "demand";
-        description = "Start it with its checkout (`up`), on the first request or as a dependency (`demand`), or only with `localforest service start` (`manual`).";
+        description = "Start it with its checkout (`up`), on the first request or as a dependency (`demand`), or only with `lazy-cow-tree service start` (`manual`).";
       };
       idleTimeout = mkOption {
         type = types.nullOr types.ints.unsigned;
@@ -430,8 +430,8 @@ let
 in
 {
   # Merged into devenv's own options: `processes.<name>.start.{on,idleTimeout}`,
-  # `processes.<name>.localforest.*`, and new `services.postgres` / `services.redis`
-  # settings. localforest derives its services and database settings from them.
+  # `processes.<name>.lazyCowTree.*`, and new `services.postgres` / `services.redis`
+  # settings. lazy-cow-tree derives its services and database settings from them.
   options.processes = mkOption { type = types.attrsOf processExtension; };
 
   options.services.postgres = {
@@ -462,7 +462,7 @@ in
           "manual"
         ];
         default = "on-base-change";
-        description = "Refresh the template from the primary when the base branch moves (after migrations), or only with `localforest snapshot`.";
+        description = "Refresh the template from the primary when the base branch moves (after migrations), or only with `lazy-cow-tree snapshot`.";
       };
     };
     dangerouslyDisableDurabilityForSpeed = {
@@ -472,7 +472,7 @@ in
         description = ''
           Run PostgreSQL on a RAM disk with fsync, synchronous_commit and
           full_page_writes off. Every database is lost on reboot, on a crash (which
-          can also corrupt the cluster) and on `localforest down --eject`. For
+          can also corrupt the cluster) and on `lazy-cow-tree down --eject`. For
           disposable development and test data only.
         '';
       };
@@ -497,23 +497,23 @@ in
     start = startOptions "demand";
   };
 
-  options.localforest = {
+  options.lazyCowTree = {
     enable = mkOption {
       type = types.bool;
       default = true;
-      description = "Run and use the localforest daemon.";
+      description = "Run and use the lazy-cow-tree daemon.";
     };
     package = mkOption {
       type = types.package;
       default = pinnedPkgs.callPackage ../package.nix { };
-      defaultText = lib.literalMD "built with localforest's pinned nixpkgs (flake.lock), substituted from localforest.cachix.org";
-      example = lib.literalExpression "pkgs.callPackage (inputs.localforest + \"/package.nix\") { }";
-      description = "The localforest package. The default is the one localforest's CI builds and pushes to localforest.cachix.org; a package built with other nixpkgs is compiled locally.";
+      defaultText = lib.literalMD "built with lazy-cow-tree's pinned nixpkgs (flake.lock), substituted from lazy-cow-tree.cachix.org";
+      example = lib.literalExpression "pkgs.callPackage (inputs.lazy-cow-tree + \"/package.nix\") { }";
+      description = "The lazy-cow-tree package. The default is the one lazy-cow-tree's CI builds and pushes to lazy-cow-tree.cachix.org; a package built with other nixpkgs is compiled locally.";
     };
     cachix.enable = mkOption {
       type = types.bool;
       default = true;
-      description = "Pull the default package from localforest.cachix.org (`cachix.pull`). A multi-user Nix only uses it for trusted users, or when it's in the daemon's own substituters.";
+      description = "Pull the default package from lazy-cow-tree.cachix.org (`cachix.pull`). A multi-user Nix only uses it for trusted users, or when it's in the daemon's own substituters.";
     };
     # Daemon-wide, like the ports: the project whose `devenv up` starts the daemon
     # decides; the others share its PostgreSQL.
@@ -557,7 +557,7 @@ in
       ramdiskMB = mkOption {
         type = types.ints.positive;
         default = 4096;
-        description = "Size of the APFS RAM disk PostgreSQL runs on, in MB (memory is only used as it fills). The daemon that creates the RAM disk sizes it; `localforest down --eject` and a restart apply a new size (and empty every database).";
+        description = "Size of the APFS RAM disk PostgreSQL runs on, in MB (memory is only used as it fills). The daemon that creates the RAM disk sizes it; `lazy-cow-tree down --eject` and a restart apply a new size (and empty every database).";
       };
     };
     redis = mkOption {
@@ -591,7 +591,7 @@ in
       type = types.nullOr types.str;
       default = null;
       example = "mix deps.get";
-      description = "Setup command run once in every new checkout (made by localforest, git, git-cow or Claude Code), with its env, before its services start; again before a restartOnChange restart when dependency files changed, so keep it idempotent (mix deps.get, not an alias that seeds).";
+      description = "Setup command run once in every new checkout (made by lazy-cow-tree, git, git-cow or Claude Code), with its env, before its services start; again before a restartOnChange restart when dependency files changed, so keep it idempotent (mix deps.get, not an alias that seeds).";
     };
     services = mkOption {
       type = types.attrsOf service;
@@ -602,7 +602,7 @@ in
       type = types.nullOr types.str;
       default = null;
       example = "mix phx.server";
-      description = "Shorthand for `localforest.services.web.exec`.";
+      description = "Shorthand for `lazyCowTree.services.web.exec`.";
     };
     previewTtlHours = mkOption {
       type = types.ints.unsigned;
@@ -624,16 +624,16 @@ in
     home = mkOption {
       type = types.nullOr types.str;
       default =
-        config.env.LOCALFOREST_HOME or (
+        config.env.LAZY_COW_TREE_HOME or (
           if envHome != "" then
             envHome
           else if userHome != "" then
-            "${userHome}/.local/state/localforest"
+            "${userHome}/.local/state/lazy-cow-tree"
           else
             null
         );
-      defaultText = lib.literalExpression ''env.LOCALFOREST_HOME, else $LOCALFOREST_HOME, else "$HOME/.local/state/localforest"'';
-      description = "The daemon's state directory (absolute), where its CA lives (`<home>/ca/ca.pem`); only read here, set LOCALFOREST_HOME to move it.";
+      defaultText = lib.literalExpression ''env.LAZY_COW_TREE_HOME, else $LAZY_COW_TREE_HOME, else "$HOME/.local/state/lazy-cow-tree"'';
+      description = "The daemon's state directory (absolute), where its CA lives (`<home>/ca/ca.pem`); only read here, set LAZY_COW_TREE_HOME to move it.";
     };
     claude.trustCa = mkOption {
       type = types.bool;
@@ -655,21 +655,21 @@ in
           "lsp"
         ];
       };
-      description = "Language servers to run behind `localforest lsp` (one per worktree); adds `localforest-lsp-<name>` commands for Claude Code's lspServers.";
+      description = "Language servers to run behind `lazy-cow-tree lsp` (one per worktree); adds `lazy-cow-tree-lsp-<name>` commands for Claude Code's lspServers.";
     };
   };
 
   config = lib.mkIf cfg.enable {
-    localforest.services = lib.mkMerge [
+    lazyCowTree.services = lib.mkMerge [
       (lib.mkIf (cfg.server != null) { web.exec = lib.mkDefault cfg.server; })
-      # Each field a default, so an explicit localforest.services.<name> wins.
+      # Each field a default, so an explicit lazyCowTree.services.<name> wins.
       (lib.mapAttrs (_: lib.mapAttrs (_: lib.mkDefault)) derived)
     ];
 
-    # One proxy, one CA: localforest serves the hostnames.
+    # One proxy, one CA: lazy-cow-tree serves the hostnames.
     process.proxy.enable = lib.mkIf (derivedProcs != { }) (lib.mkForce false);
 
-    localforest.postgres = lib.mkIf pgCfg.enable {
+    lazyCowTree.postgres = lib.mkIf pgCfg.enable {
       package = lib.mkDefault pgCfg.package;
       extensions = lib.mkDefault pgCfg.extensions;
       settings = lib.mkDefault (
@@ -681,7 +681,7 @@ in
         lib.mkDefault (megabytes pgCfg.dangerouslyDisableDurabilityForSpeed.ramdiskSize)
       );
     };
-    localforest.redis = lib.mkIf redisCfg.enable (lib.mkDefault redisCfg.package);
+    lazyCowTree.redis = lib.mkIf redisCfg.enable (lib.mkDefault redisCfg.package);
 
     assertions =
       lib.mapAttrsToList (name: p: {
@@ -707,17 +707,17 @@ in
           # TODO: a PostgreSQL cluster per checkout (shares machinery with a cluster per
           # durability setting).
           assertion = !(pgCfg.enable && pgCfg.instance == "unique");
-          message = ''services.postgres.instance = "unique" isn't supported yet: every checkout shares localforest's cluster (with databases of its own). Remove it or set instance = "shared".'';
+          message = ''services.postgres.instance = "unique" isn't supported yet: every checkout shares lazy-cow-tree's cluster (with databases of its own). Remove it or set instance = "shared".'';
         }
       ];
 
     # Accepted so configs don't need changing later, but the daemon doesn't act on them yet.
     warnings =
-      lib.optional (pgCfg.enable && pgCfg.start.on == "demand") ''services.postgres.start.on = "demand" isn't supported yet: localforest starts its PostgreSQL with the daemon.''
-      ++ lib.optional (pgCfg.enable && pgCfg.start.idleTimeout != null) "services.postgres.start.idleTimeout isn't supported yet: localforest's PostgreSQL runs until the daemon stops."
-      ++ lib.optional (pgCfg.enable && pgCfg.initialDatabases != [ ]) "services.postgres.initialDatabases: localforest gives every checkout <project>_dev and <project>_test (DATABASE_URL, TEST_DATABASE_URL) instead of these names for now.";
+      lib.optional (pgCfg.enable && pgCfg.start.on == "demand") ''services.postgres.start.on = "demand" isn't supported yet: lazy-cow-tree starts its PostgreSQL with the daemon.''
+      ++ lib.optional (pgCfg.enable && pgCfg.start.idleTimeout != null) "services.postgres.start.idleTimeout isn't supported yet: lazy-cow-tree's PostgreSQL runs until the daemon stops."
+      ++ lib.optional (pgCfg.enable && pgCfg.initialDatabases != [ ]) "services.postgres.initialDatabases: lazy-cow-tree gives every checkout <project>_dev and <project>_test (DATABASE_URL, TEST_DATABASE_URL) instead of these names for now.";
 
-    cachix.pull = lib.mkIf cfg.cachix.enable [ "localforest" ];
+    cachix.pull = lib.mkIf cfg.cachix.enable [ "lazy-cow-tree" ];
 
     packages = [
       cfg.package
@@ -726,59 +726,59 @@ in
     ]
     ++ lib.mapAttrsToList (
       name: cmd:
-      pkgs.writeShellScriptBin "localforest-lsp-${name}" ''
+      pkgs.writeShellScriptBin "lazy-cow-tree-lsp-${name}" ''
         exec ${exe} lsp -- ${lib.escapeShellArgs cmd} "$@"
       ''
     ) cfg.lsp;
 
     env = {
-      LOCALFOREST_PORT = toString cfg.port;
-      LOCALFOREST_SERVICES = builtins.toJSON cfg.services;
-      LOCALFOREST_PREVIEW_TTL_HOURS = toString cfg.previewTtlHours;
-      LOCALFOREST_RAMDISK_MB = toString cfg.postgres.ramdiskMB;
-      LOCALFOREST_POSTGRES_BIN = "${postgres}/bin";
-      LOCALFOREST_POSTGRES_SETTINGS = builtins.toJSON cfg.postgres.settings;
-      LOCALFOREST_POSTGRES_EXTENSIONS = lib.concatStringsSep "," cfg.postgres.createExtensions;
-      LOCALFOREST_REDIS_SERVER = lib.getExe' cfg.redis "redis-server";
-      LOCALFOREST_POSTGRES_DURABLE =
+      LAZY_COW_TREE_PORT = toString cfg.port;
+      LAZY_COW_TREE_SERVICES = builtins.toJSON cfg.services;
+      LAZY_COW_TREE_PREVIEW_TTL_HOURS = toString cfg.previewTtlHours;
+      LAZY_COW_TREE_RAMDISK_MB = toString cfg.postgres.ramdiskMB;
+      LAZY_COW_TREE_POSTGRES_BIN = "${postgres}/bin";
+      LAZY_COW_TREE_POSTGRES_SETTINGS = builtins.toJSON cfg.postgres.settings;
+      LAZY_COW_TREE_POSTGRES_EXTENSIONS = lib.concatStringsSep "," cfg.postgres.createExtensions;
+      LAZY_COW_TREE_REDIS_SERVER = lib.getExe' cfg.redis "redis-server";
+      LAZY_COW_TREE_POSTGRES_DURABLE =
         if pgCfg.dangerouslyDisableDurabilityForSpeed.enable then "0" else "1";
-      LOCALFOREST_POSTGRES_INSTANCE = pgCfg.instance;
-      LOCALFOREST_POSTGRES_START = pgCfg.start.on;
-      LOCALFOREST_POSTGRES_COW = if pgCfg.copyOnWrite.enable then "1" else "0";
-      LOCALFOREST_POSTGRES_TEMPLATE_REFRESH = pgCfg.copyOnWrite.refresh;
-      LOCALFOREST_REDIS_INSTANCE = redisCfg.instance;
-      LOCALFOREST_REDIS_START = redisCfg.start.on;
-      LOCALFOREST_ENV_FILES = builtins.toJSON cfg.envFiles;
+      LAZY_COW_TREE_POSTGRES_INSTANCE = pgCfg.instance;
+      LAZY_COW_TREE_POSTGRES_START = pgCfg.start.on;
+      LAZY_COW_TREE_POSTGRES_COW = if pgCfg.copyOnWrite.enable then "1" else "0";
+      LAZY_COW_TREE_POSTGRES_TEMPLATE_REFRESH = pgCfg.copyOnWrite.refresh;
+      LAZY_COW_TREE_REDIS_INSTANCE = redisCfg.instance;
+      LAZY_COW_TREE_REDIS_START = redisCfg.start.on;
+      LAZY_COW_TREE_ENV_FILES = builtins.toJSON cfg.envFiles;
     }
     // lib.optionalAttrs (pgCfg.start.idleTimeout != null) {
-      LOCALFOREST_POSTGRES_IDLE_TIMEOUT = toString (seconds pgCfg.start.idleTimeout);
+      LAZY_COW_TREE_POSTGRES_IDLE_TIMEOUT = toString (seconds pgCfg.start.idleTimeout);
     }
     // lib.optionalAttrs (redisCfg.start.idleTimeout != null) {
-      LOCALFOREST_REDIS_IDLE_TIMEOUT = toString (seconds redisCfg.start.idleTimeout);
+      LAZY_COW_TREE_REDIS_IDLE_TIMEOUT = toString (seconds redisCfg.start.idleTimeout);
     }
     // lib.optionalAttrs (pgCfg.enable && pgCfg.initialDatabases != [ ]) {
-      LOCALFOREST_POSTGRES_INITIAL_DATABASES = builtins.toJSON (map (d: d.name) pgCfg.initialDatabases);
+      LAZY_COW_TREE_POSTGRES_INITIAL_DATABASES = builtins.toJSON (map (d: d.name) pgCfg.initialDatabases);
     }
-    // lib.optionalAttrs config.devenv.isTesting { LOCALFOREST_NO_SYNC = "1"; }
-    // lib.optionalAttrs (cfg.httpsPort != null) { LOCALFOREST_HTTPS_PORT = toString cfg.httpsPort; }
-    // lib.optionalAttrs (cfg.httpPort != null) { LOCALFOREST_HTTP_PORT = toString cfg.httpPort; }
-    // lib.optionalAttrs (cfg.project != null) { LOCALFOREST_PROJECT = cfg.project; }
+    // lib.optionalAttrs config.devenv.isTesting { LAZY_COW_TREE_NO_SYNC = "1"; }
+    // lib.optionalAttrs (cfg.httpsPort != null) { LAZY_COW_TREE_HTTPS_PORT = toString cfg.httpsPort; }
+    // lib.optionalAttrs (cfg.httpPort != null) { LAZY_COW_TREE_HTTP_PORT = toString cfg.httpPort; }
+    // lib.optionalAttrs (cfg.project != null) { LAZY_COW_TREE_PROJECT = cfg.project; }
     # Under `devenv test` the checkout under test migrates itself.
     // lib.optionalAttrs (cfg.migrate != null && !config.devenv.isTesting) {
-      LOCALFOREST_MIGRATE = cfg.migrate;
+      LAZY_COW_TREE_MIGRATE = cfg.migrate;
     }
-    // lib.optionalAttrs (cfg.seed != null && !config.devenv.isTesting) { LOCALFOREST_SEED = cfg.seed; }
+    // lib.optionalAttrs (cfg.seed != null && !config.devenv.isTesting) { LAZY_COW_TREE_SEED = cfg.seed; }
     // lib.optionalAttrs (cfg.setup != null && !config.devenv.isTesting) {
-      LOCALFOREST_SETUP = cfg.setup;
+      LAZY_COW_TREE_SETUP = cfg.setup;
     };
 
-    processes.localforest.exec = "${exe} serve";
+    processes.lazy-cow-tree.exec = "${exe} serve";
 
     enterShell = ''
       eval "$(${exe} env)"
     '';
 
-    # Node (Claude Code) ignores the keychain `localforest trust` writes to.
+    # Node (Claude Code) ignores the keychain `lazy-cow-tree trust` writes to.
     files.".claude/settings.local.json".json.env = lib.mkIf (cfg.claude.trustCa && cfg.home != null) {
       NODE_EXTRA_CA_CERTS = lib.mkDefault "${cfg.home}/ca/ca.pem";
     };
