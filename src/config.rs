@@ -223,6 +223,10 @@ pub fn home() -> PathBuf {
     if let Some(h) = std::env::var_os("LAZY_COW_TREE_HOME") {
         return PathBuf::from(h);
     }
+    // Tests never see (or move) the user's real state.
+    if cfg!(test) {
+        return std::env::temp_dir().join(format!("lazy-cow-tree-test-{}", std::process::id()));
+    }
     static HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     HOME.get_or_init(|| {
         let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
