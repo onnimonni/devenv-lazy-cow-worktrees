@@ -132,6 +132,7 @@ fn dependencies_first() {
                       "worker": {"exec": "c", "http": false}}"#
             .parse::<Services>()
             .unwrap(),
+        extra_dbs: Vec::new(),
     };
     let mut order = Vec::new();
     visit(&c, "web", &mut BTreeSet::new(), &mut order).unwrap();

@@ -361,6 +361,7 @@ FIXME: other language servers. devenv's `languages.*.lsp` has only `enable` and
 | `lazyCowTree.home` | `$LAZY_COW_TREE_HOME`, else `~/.local/state/lazy-cow-tree` | where the module looks for the daemon's CA (read from devenv's environment at evaluation; `env.LAZY_COW_TREE_HOME` too) |
 | `lazyCowTree.postgres.package` | `pkgs.postgresql_18` | PostgreSQL build (18+ for copy-on-write databases) |
 | `lazyCowTree.postgres.extensions` | none | as in devenv: `extensions: [ extensions.postgis extensions.pgvector ]`; trusted ones: enable with `CREATE EXTENSION` |
+| `lazyCowTree.postgres.databases` | `[]` | more databases per checkout next to the main one, e.g. `[ "cms" ]` for a second Ecto repo: `<NAME>_DATABASE_URL`, `<NAME>_TEST_DATABASE_URL`, cloned from their own template like the main one |
 | `lazyCowTree.postgres.createExtensions` | `[]` | created as superuser in `template1` (so every database made afterwards) and the primaries' databases, for untrusted extensions checkout roles can't create, e.g. `[ "postgis" "vector" ]`; migrations' `CREATE EXTENSION IF NOT EXISTS` is then a no-op |
 | `lazyCowTree.postgres.settings` | `{}` | extra postgresql.conf settings, e.g. `shared_preload_libraries` |
 | `lazyCowTree.postgres.ramdiskMB` | `4096` | RAM disk size (used as it fills); resizing needs `lazy-cow-tree down --eject`, which empties every database |
@@ -441,6 +442,7 @@ needed), e.g. for services `web` (default), `api` and `worker`:
 | `LAZY_COW_TREE_URL` | `web.myapp.localhost` | `fix-login.web.myapp.localhost` |
 | `DATABASE_URL`, `PG*` | `myapp_dev` as role `myapp` | `myapp_dev_fix_login` as role `myapp--fix-login` |
 | `TEST_DATABASE_URL` | `myapp_test` | `myapp_test_fix_login` |
+| `<NAME>_DATABASE_URL`, `<NAME>_TEST_DATABASE_URL` (`lazyCowTree.postgres.databases`, e.g. `cms`) | `myapp_cms_dev`, `myapp_cms_test` | `myapp_cms_dev_fix_login` (cloned from `myapp_cms_template`), `myapp_cms_test_fix_login` |
 | `REDIS_URL` | password `myapp` | password `myapp--fix-login` |
 | `LAZY_COW_TREE_<SERVICE>_URL`, `_PORT` | every service's | every service's |
 | named ports' `env`, `LAZY_COW_TREE_<SERVICE>_<NAME>_PORT`, `_URL` | every service's | every service's |

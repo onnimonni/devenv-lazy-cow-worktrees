@@ -720,6 +720,12 @@ in
         example = lib.literalExpression "extensions: [ extensions.postgis extensions.pgvector ]";
         description = "Extensions to install, as in devenv's services.postgres.extensions (`package.withPackages`). Checkout roles aren't superusers: they can CREATE EXTENSION trusted ones (pgcrypto, citext, ...); list the others in createExtensions.";
       };
+      databases = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        example = [ "cms" ];
+        description = "More databases every checkout gets next to its main one, e.g. for a second Ecto repo: `<project>_<name>_dev`, `_test` and test partitions per checkout (worktrees' cloned from `<project>_<name>_template`, refreshed with the main template), in `<NAME>_DATABASE_URL` and `<NAME>_TEST_DATABASE_URL`.";
+      };
       createExtensions = mkOption {
         type = types.listOf types.str;
         default = [ ];
@@ -973,6 +979,9 @@ in
       LAZY_COW_TREE_POSTGRES_INITIAL_DATABASES = builtins.toJSON (map (d: d.name) pgCfg.initialDatabases);
     }
     // lib.optionalAttrs config.devenv.isTesting { LAZY_COW_TREE_NO_SYNC = "1"; }
+    // lib.optionalAttrs (cfg.postgres.databases != [ ]) {
+      LAZY_COW_TREE_DATABASES = lib.concatStringsSep "," cfg.postgres.databases;
+    }
     // lib.optionalAttrs (cfg.httpsPort != null) { LAZY_COW_TREE_HTTPS_PORT = toString cfg.httpsPort; }
     // lib.optionalAttrs (cfg.httpPort != null) { LAZY_COW_TREE_HTTP_PORT = toString cfg.httpPort; }
     // lib.optionalAttrs (cfg.project != null) { LAZY_COW_TREE_PROJECT = cfg.project; }

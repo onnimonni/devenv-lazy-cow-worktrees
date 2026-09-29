@@ -634,13 +634,11 @@ impl Drop for HookGuard {
 /// closed: users that are no registered checkout's role never reach the server.
 fn pg_access(user: &str, c: Option<&Checkout>, db: &str, others: &[Checkout]) -> Result<bool> {
     if user == "postgres" {
-        anyhow::bail!(
-            "connect as your checkout's role (PGUSER in `lazy-cow-tree env`), not postgres"
-        );
+        anyhow::bail!("connect as your checkout's role (PGUSER in the devenv shell), not postgres");
     }
     let Some(c) = c else {
         anyhow::bail!(
-            "{user:?} is not the role of a checkout lazy-cow-tree serves; use PGUSER / DATABASE_URL from `lazy-cow-tree env` in the checkout (and `lazy-cow-tree serve` in its project)"
+            "{user:?} is not the role of a checkout lazy-cow-tree serves; use PGUSER / DATABASE_URL from the devenv shell in the checkout (and `lazy-cow-tree serve` in its project)"
         );
     };
     if db == "postgres" || db == "template1" {
@@ -660,14 +658,19 @@ fn pg_access(user: &str, c: Option<&Checkout>, db: &str, others: &[Checkout]) ->
                 rivals.join(", ")
             );
         }
+        let own: Vec<String> = c
+            .db_kinds()
+            .map(|k| {
+                let test = c.test_db_of(k);
+                format!("{}, {test}, {test}<N>", c.dev_db_of(k))
+            })
+            .collect();
         anyhow::bail!(
-            "{user} may only open its own databases ({}, {}, MIX_TEST_PARTITION's {}<N>), not {db}",
-            c.dev_db(),
-            c.test_db(),
-            c.test_db()
+            "{user} may only open its own databases ({}; <N>: MIX_TEST_PARTITION), not {db}",
+            own.join("; ")
         );
     }
-    Ok(c.worktree.is_some() && db == c.dev_db())
+    Ok(c.worktree.is_some() && c.dev_dbs().iter().any(|d| d == db))
 }
 
 /// One PostgreSQL cluster serves every project, so a project wanting other

@@ -74,9 +74,15 @@ pub(super) fn api(d: Arc<Daemon>) -> Router {
                 let rt = d.project(&r.root)?;
                 let _g = rt.lock.lock().await;
                 let primary = rt.primary();
-                d.pg
-                    .snapshot(&primary.dev_db(), &primary.template_db(), &d.create_lock)
-                    .await?;
+                for kind in primary.db_kinds() {
+                    d.pg
+                        .snapshot(
+                            &primary.dev_db_of(kind),
+                            &primary.template_db_of(kind),
+                            &d.create_lock,
+                        )
+                        .await?;
+                }
                 ApiResult::Ok(Json(serde_json::json!({})))
             }),
         )
