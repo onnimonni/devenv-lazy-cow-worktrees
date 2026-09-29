@@ -11,12 +11,13 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Arc, RwLock},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
 use bytes::{Buf, BytesMut};
+use parking_lot::RwLock;
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -34,21 +35,18 @@ pub struct Redis {
     /// By redis-server key.
     procs: Mutex<HashMap<String, Child>>,
     /// Open client connections per redis-server key, and when the last one ended.
-    conns: std::sync::Mutex<HashMap<String, (usize, Instant)>>,
-    /// A connection counts as its checkout's activity.
-    activity: crate::history::Activity,
+    conns: parking_lot::Mutex<HashMap<String, (usize, Instant)>>,
     /// `redis-server` to run (None: from PATH).
     server: Option<PathBuf>,
 }
 
 impl Redis {
-    pub fn new(dir: PathBuf, activity: crate::history::Activity, server: Option<PathBuf>) -> Self {
+    pub fn new(dir: PathBuf, server: Option<PathBuf>) -> Self {
         Self {
             dir,
             known: RwLock::default(),
             procs: Mutex::default(),
             conns: Default::default(),
-            activity,
             server,
         }
     }
@@ -57,7 +55,6 @@ impl Redis {
     pub fn allow(&self, id: &str, backend: &str) {
         self.known
             .write()
-            .unwrap()
             .insert(id.to_string(), backend.to_string());
     }
 
@@ -71,7 +68,7 @@ impl Redis {
     pub async fn stop_idle(&self, timeout: Duration) {
         let mut procs = self.procs.lock().await;
         let idle: Vec<String> = {
-            let conns = self.conns.lock().unwrap();
+            let conns = self.conns.lock();
             procs
                 .keys()
                 .filter(|k| {
@@ -84,11 +81,8 @@ impl Redis {
         };
         for key in idle {
             // Never connected yet: counts from now.
-            if !self.conns.lock().unwrap().contains_key(&key) {
-                self.conns
-                    .lock()
-                    .unwrap()
-                    .insert(key.clone(), (0, Instant::now()));
+            if !self.conns.lock().contains_key(&key) {
+                self.conns.lock().insert(key.clone(), (0, Instant::now()));
                 continue;
             }
             if let Some(mut c) = procs.remove(&key) {
@@ -100,7 +94,7 @@ impl Redis {
                 for ext in ["sock", "pid"] {
                     let _ = std::fs::remove_file(self.stem(&key).with_extension(ext));
                 }
-                self.conns.lock().unwrap().remove(&key);
+                self.conns.lock().remove(&key);
             }
         }
     }
@@ -208,7 +202,7 @@ impl Redis {
     /// checkouts share it.
     pub async fn remove(&self, id: &str) {
         let backend = {
-            let mut known = self.known.write().unwrap();
+            let mut known = self.known.write();
             let Some(b) = known.remove(id) else { return };
             if known.values().any(|o| *o == b) {
                 return;
@@ -302,7 +296,7 @@ impl Redis {
                 }
             };
             let id = String::from_utf8_lossy(&password).into_owned();
-            let backend = self.known.read().unwrap().get(&id).cloned();
+            let backend = self.known.read().get(&id).cloned();
             let Some(backend) = backend else {
                 client
                     .write_all(
@@ -311,7 +305,6 @@ impl Redis {
                     .await?;
                 continue;
             };
-            self.activity.touch(&id);
             break (backend, forward);
         };
 
@@ -342,13 +335,13 @@ impl Redis {
 
 /// Counts an open client connection of a redis-server while alive.
 struct OpenConn<'a> {
-    conns: &'a std::sync::Mutex<HashMap<String, (usize, Instant)>>,
+    conns: &'a parking_lot::Mutex<HashMap<String, (usize, Instant)>>,
     key: String,
 }
 
 impl<'a> OpenConn<'a> {
-    fn new(conns: &'a std::sync::Mutex<HashMap<String, (usize, Instant)>>, key: &str) -> Self {
-        let mut c = conns.lock().unwrap();
+    fn new(conns: &'a parking_lot::Mutex<HashMap<String, (usize, Instant)>>, key: &str) -> Self {
+        let mut c = conns.lock();
         let e = c.entry(key.to_string()).or_insert((0, Instant::now()));
         e.0 += 1;
         e.1 = Instant::now();
@@ -361,7 +354,7 @@ impl<'a> OpenConn<'a> {
 
 impl Drop for OpenConn<'_> {
     fn drop(&mut self) {
-        if let Some(e) = self.conns.lock().unwrap().get_mut(&self.key) {
+        if let Some(e) = self.conns.lock().get_mut(&self.key) {
             e.0 = e.0.saturating_sub(1);
             e.1 = Instant::now();
         }
@@ -533,7 +526,7 @@ mod tests {
     #[tokio::test]
     async fn shared_redis_outlives_one_checkout() {
         let d = tempfile::tempdir().unwrap();
-        let r = Redis::new(d.path().into(), Default::default(), None);
+        let r = Redis::new(d.path().into(), None);
         r.allow("app", "app+shared");
         r.allow("app--wt", "app+shared");
         r.allow("other", "other");
@@ -542,23 +535,23 @@ mod tests {
         // Still used by the primary: kept.
         assert!(r.stem("app+shared").with_extension("log").exists());
         assert_eq!(
-            r.known.read().unwrap().get("app").map(String::as_str),
+            r.known.read().get("app").map(String::as_str),
             Some("app+shared")
         );
         r.remove("app").await;
         assert!(!r.stem("app+shared").with_extension("log").exists());
-        assert!(r.known.read().unwrap().contains_key("other"));
+        assert!(r.known.read().contains_key("other"));
     }
 
     #[test]
     fn counts_open_connections() {
-        let conns = std::sync::Mutex::new(HashMap::new());
+        let conns = parking_lot::Mutex::new(HashMap::new());
         let a = OpenConn::new(&conns, "k");
         let b = OpenConn::new(&conns, "k");
-        assert_eq!(conns.lock().unwrap()["k"].0, 2);
+        assert_eq!(conns.lock()["k"].0, 2);
         drop(a);
         drop(b);
-        assert_eq!(conns.lock().unwrap()["k"].0, 0);
+        assert_eq!(conns.lock()["k"].0, 0);
     }
 
     #[test]
@@ -632,7 +625,7 @@ mod tests {
     #[tokio::test]
     async fn stale_pidfile_of_another_process_is_left_alone() {
         let dir = tempfile::TempDir::new().unwrap();
-        let r = Redis::new(dir.path().into(), crate::history::Activity::default(), None);
+        let r = Redis::new(dir.path().into(), None);
         let pidfile = dir.path().join("x.pid");
         let socket = dir.path().join("x.sock");
         // This test process: not a redis-server, so it survives.
@@ -649,7 +642,7 @@ mod tests {
             return;
         }
         let dir = tempfile::TempDir::new().unwrap();
-        let crashed = Redis::new(dir.path().into(), crate::history::Activity::default(), None);
+        let crashed = Redis::new(dir.path().into(), None);
         let socket = crashed.ensure("a").await.unwrap();
         let pidfile = crashed.stem("a").with_extension("pid");
         let mut pid = String::new();
@@ -663,7 +656,7 @@ mod tests {
         let pid: i32 = pid.trim().parse().unwrap();
         // The daemon dies without killing its child.
         std::mem::forget(crashed);
-        let next = Redis::new(dir.path().into(), crate::history::Activity::default(), None);
+        let next = Redis::new(dir.path().into(), None);
         next.kill_stale(&pidfile, &socket);
         let mut status = 0;
         assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);

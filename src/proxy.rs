@@ -4,12 +4,7 @@
 //! Hosts that devenv projects register (devenv_proxy.rs) go through the same
 //! listeners, over HTTPS and plain HTTP like devenv's own proxy.
 
-use std::{
-    collections::HashMap,
-    convert::Infallible,
-    net::SocketAddr,
-    sync::{Arc, RwLock},
-};
+use std::{collections::HashMap, convert::Infallible, net::SocketAddr, sync::Arc};
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -25,6 +20,7 @@ use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::{TokioExecutor, TokioIo},
 };
+use parking_lot::RwLock;
 use rustls::{
     server::{ClientHello, ResolvesServerCert},
     sign::CertifiedKey,
@@ -41,8 +37,6 @@ struct Route {
     port: u16,
     /// Also serves its subdomains.
     subdomains: bool,
-    /// Checkout id, whose activity a request touches.
-    id: String,
     /// Service id (`Checkout::service_id`) whose open connections it counts.
     service: Option<String>,
 }
@@ -59,19 +53,18 @@ struct Conns {
 #[derive(Clone, Default)]
 pub struct Routes {
     map: Arc<RwLock<HashMap<String, Route>>>,
-    activity: crate::history::Activity,
-    conns: Arc<std::sync::Mutex<HashMap<String, Conns>>>,
+    conns: Arc<parking_lot::Mutex<HashMap<String, Conns>>>,
 }
 
 /// Counts one open connection of a service while alive (`Routes::guard`).
 pub struct ConnGuard {
-    conns: Arc<std::sync::Mutex<HashMap<String, Conns>>>,
+    conns: Arc<parking_lot::Mutex<HashMap<String, Conns>>>,
     service: String,
 }
 
 impl Drop for ConnGuard {
     fn drop(&mut self) {
-        let mut conns = self.conns.lock().unwrap();
+        let mut conns = self.conns.lock();
         if let Some(c) = conns.get_mut(&self.service) {
             c.open = c.open.saturating_sub(1);
             c.last = std::time::Instant::now();
@@ -80,28 +73,12 @@ impl Drop for ConnGuard {
 }
 
 impl Routes {
-    pub fn new(activity: crate::history::Activity) -> Self {
-        Self {
-            map: Default::default(),
-            activity,
-            conns: Default::default(),
-        }
-    }
-
-    pub fn set(
-        &self,
-        host: String,
-        port: u16,
-        subdomains: bool,
-        id: String,
-        service: Option<String>,
-    ) {
-        self.map.write().unwrap().insert(
+    pub fn set(&self, host: String, port: u16, subdomains: bool, service: Option<String>) {
+        self.map.write().insert(
             host,
             Route {
                 port,
                 subdomains,
-                id,
                 service,
             },
         );
@@ -112,7 +89,6 @@ impl Routes {
         let now = std::time::Instant::now();
         self.conns
             .lock()
-            .unwrap()
             .entry(service.to_string())
             .and_modify(|c| {
                 c.open += 1;
@@ -132,7 +108,7 @@ impl Routes {
         service: &str,
         since: std::time::Instant,
     ) -> Option<std::time::Instant> {
-        match self.conns.lock().unwrap().get(service) {
+        match self.conns.lock().get(service) {
             Some(c) if c.open > 0 => None,
             Some(c) => Some(c.last.max(since)),
             None => Some(since),
@@ -140,13 +116,12 @@ impl Routes {
     }
 
     pub fn remove(&self, host: &str) {
-        self.map.write().unwrap().remove(host);
+        self.map.write().remove(host);
     }
 
-    /// Whether a request for `host` would reach a checkout, without counting as
-    /// activity.
+    /// Whether a request for `host` would reach a checkout.
     pub fn serves(&self, host: &str) -> bool {
-        let routes = self.map.read().unwrap();
+        let routes = self.map.read();
         if routes.contains_key(host) {
             return true;
         }
@@ -162,8 +137,7 @@ impl Routes {
 
     /// Exact host, else the closest parent that serves subdomains (worktree hosts:
     /// debug.wt.web.app.localhost -> wt.web.app.localhost). Primary hosts don't, so a
-    /// removed worktree's host never silently reaches the primary checkout. Counts as
-    /// activity of the checkout.
+    /// removed worktree's host never silently reaches the primary checkout.
     #[cfg(test)]
     pub fn lookup(&self, host: &str) -> Option<u16> {
         self.lookup_service(host).map(|(port, _)| port)
@@ -171,7 +145,7 @@ impl Routes {
 
     /// `lookup`, with the service id its connections count for.
     pub fn lookup_service(&self, host: &str) -> Option<(u16, Option<String>)> {
-        let routes = self.map.read().unwrap();
+        let routes = self.map.read();
         let route = routes.get(host).or_else(|| {
             let mut h = host;
             while let Some((_, parent)) = h.split_once('.') {
@@ -182,7 +156,6 @@ impl Routes {
             }
             None
         })?;
-        self.activity.touch(&route.id);
         Some((route.port, route.service.clone()))
     }
 }
@@ -199,44 +172,20 @@ pub type Ensure = Arc<
         + Sync,
 >;
 
-/// A request to a host without a route (method, host, path, Origin header).
-pub struct Unrouted {
-    pub method: hyper::Method,
-    pub host: String,
-    pub path: String,
-    pub origin: Option<String>,
-}
-
-/// A page the daemon answers an unrouted request with.
-pub struct Page {
-    pub status: StatusCode,
-    pub html: String,
-    /// Redirect (303) instead.
-    pub location: Option<String>,
-}
-
-/// Answers requests to hosts without a route (removed worktrees); None: plain 404.
-pub type Fallback = Arc<
-    dyn Fn(Unrouted) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Page>> + Send>>
-        + Send
-        + Sync,
->;
-
 struct Shared {
     routes: Routes,
     devenv: DevenvRoutes,
     client: Client<HttpConnector, Incoming>,
     dashboard: Dashboard,
     ensure: Ensure,
-    fallback: Fallback,
 }
 
-fn full(status: StatusCode, content_type: &str, body: impl Into<Bytes>) -> Response<Body> {
-    Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, content_type)
-        .body(Full::new(body.into()).map_err(|n| match n {}).boxed())
-        .unwrap()
+fn full(status: StatusCode, content_type: &'static str, body: impl Into<Bytes>) -> Response<Body> {
+    let mut resp = Response::new(Full::new(body.into()).map_err(|n| match n {}).boxed());
+    *resp.status_mut() = status;
+    resp.headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    resp
 }
 
 /// Bind `port`; below 1024 on all interfaces (unprivileged on macOS), else loopback.
@@ -275,7 +224,6 @@ pub async fn serve(
     ca: Arc<crate::tls::Ca>,
     dashboard: Dashboard,
     ensure: Ensure,
-    fallback: Fallback,
 ) -> Result<()> {
     let certificates = Arc::new(Certificates {
         ca,
@@ -288,7 +236,6 @@ pub async fn serve(
         client: Client::builder(TokioExecutor::new()).build_http(),
         dashboard,
         ensure,
-        fallback,
     });
     let https = bind(https_port).await.map_err(|e| {
         anyhow::anyhow!("binding HTTPS port {https_port}: {e} (pick another with --https-port)")
@@ -360,13 +307,17 @@ async fn http_loop(listener: TcpListener, https_port: u16, shared: Arc<Shared>) 
                     };
                     let path = req.uri().path_and_query().map_or("/", |p| p.as_str());
                     let host = if host.is_empty() { "localhost" } else { &host };
-                    Ok::<_, Infallible>(
-                        Response::builder()
-                            .status(StatusCode::PERMANENT_REDIRECT)
-                            .header(header::LOCATION, format!("https://{host}{port}{path}"))
-                            .body(Full::new(Bytes::new()).map_err(|n| match n {}).boxed())
-                            .unwrap(),
-                    )
+                    // The Host header is the client's: one that can't be a header value gets a 400.
+                    let mut resp =
+                        Response::new(Full::new(Bytes::new()).map_err(|n| match n {}).boxed());
+                    match HeaderValue::from_str(&format!("https://{host}{port}{path}")) {
+                        Ok(location) => {
+                            *resp.status_mut() = StatusCode::PERMANENT_REDIRECT;
+                            resp.headers_mut().insert(header::LOCATION, location);
+                        }
+                        Err(_) => *resp.status_mut() = StatusCode::BAD_REQUEST,
+                    }
+                    Ok::<_, Infallible>(resp)
                 }
             });
             let _ = http1::Builder::new()
@@ -406,7 +357,7 @@ fn is_upgrade(req: &Request<Incoming>) -> bool {
 
 /// A connection's open-connection count (`ConnGuard`), set by its first request to a
 /// service and moved to another service by a request there.
-type ConnSlot = Arc<std::sync::Mutex<Option<(String, ConnGuard)>>>;
+type ConnSlot = Arc<parking_lot::Mutex<Option<(String, ConnGuard)>>>;
 
 async fn handle(
     shared: Arc<Shared>,
@@ -436,28 +387,6 @@ async fn handle(
                     )
                 }));
         }
-        let unrouted = Unrouted {
-            method: req.method().clone(),
-            host: host.clone(),
-            path: req.uri().path().to_string(),
-            origin: req
-                .headers()
-                .get(header::ORIGIN)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string),
-        };
-        if let Some(page) = (shared.fallback)(unrouted).await {
-            let mut resp = full(page.status, "text/html; charset=utf-8", page.html);
-            if let Some(loc) = page.location
-                && let Ok(v) = HeaderValue::from_str(&loc)
-            {
-                *resp.status_mut() = StatusCode::SEE_OTHER;
-                resp.headers_mut().insert(header::LOCATION, v);
-            }
-            resp.headers_mut()
-                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-            return Ok(resp);
-        }
         return Ok(full(
             StatusCode::NOT_FOUND,
             "text/plain; charset=utf-8",
@@ -470,7 +399,7 @@ async fn handle(
     // Counted before starting it: an idle stop never races the request it serves.
     let upgrade_guard = service.as_ref().map(|s| {
         if let Some(slot) = &slot {
-            let mut slot = slot.lock().unwrap();
+            let mut slot = slot.lock();
             if slot.as_ref().is_none_or(|(cur, _)| cur != s) {
                 *slot = Some((s.clone(), shared.routes.guard(s)));
             }
@@ -571,7 +500,6 @@ mod tests {
             "web.app.localhost".into(),
             4000,
             false,
-            "app".into(),
             Some("app.web".into()),
         );
         let started = std::time::Instant::now();
@@ -597,19 +525,11 @@ mod tests {
     #[test]
     fn lookup_falls_back_to_parent() {
         let r = Routes::default();
-        r.set("app.localhost".into(), 4000, false, "app".into(), None);
-        r.set("api.app.localhost".into(), 4001, false, "app".into(), None);
-        r.set(
-            "wt.api.app.localhost".into(),
-            20010,
-            true,
-            "app-wt".into(),
-            None,
-        );
+        r.set("app.localhost".into(), 4000, false, None);
+        r.set("api.app.localhost".into(), 4001, false, None);
+        r.set("wt.api.app.localhost".into(), 20010, true, None);
         assert_eq!(r.lookup("wt.api.app.localhost"), Some(20010));
         assert_eq!(r.lookup("debug.wt.api.app.localhost"), Some(20010));
-        assert!(r.activity.get("app-wt").is_some());
-        assert!(r.activity.get("app").is_none());
         // A removed worktree's host doesn't reach the primary's api.
         assert_eq!(r.lookup("gone.api.app.localhost"), None);
         assert_eq!(r.lookup("other.app.localhost"), None);

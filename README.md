@@ -11,7 +11,7 @@ https://fix-login.web.myapp.localhost
 /src/myapp/.claude/worktrees/fix-login
 $ curl https://fix-login.web.myapp.localhost   # starts web (and the worker it depends on)
 $ curl https://fix-login.api.myapp.localhost   # starts api (same DATABASE_URL and REDIS_URL)
-$ cd .claude/worktrees/fix-login && eval "$(lazy-cow-tree env)"
+$ cd .claude/worktrees/fix-login          # in the devenv shell: its environment follows
 $ echo $DATABASE_URL $REDIS_URL
 postgres://myapp--fix-login:4c1f…@127.0.0.1:55432/myapp_dev_fix_login redis://:myapp--fix-login@127.0.0.1:6380/0
 ```
@@ -40,23 +40,23 @@ PostgreSQL, hashed ports, `worktree-new` / `worktree-rm`) and became lazy-cow-tr
 **devenv is evaluated once, in the primary checkout, and worktrees don't run devenv
 at all.** The daemon it starts gives every worktree what devenv would have: a
 database (a copy-on-write clone, in milliseconds), Redis, ports, HTTPS hostnames and
-the project's services, started on demand; the environment comes from
-`lazy-cow-tree env` or the worktree's `.env`.
+the project's services, started on demand; shells started from the devenv shell
+get the environment of the worktree they're in.
 
 ## What it does
 
 | | |
 |---|---|
 | **Worktrees** | `git worktree add` without a checkout, then filled with copy-on-write clones of the primary checkout, build caches included ([git-cow](https://github.com/onnimonni/git-cow)): ~0 disk, nothing to recompile. In `.claude/worktrees/<name>`, where Claude Code puts its own. A worktree's name (hostname, databases, role, Redis, port) is its git admin dir's (`.git/worktrees/<name>`, unique per repository); one that isn't a DNS label of at most 32 characters is shortened and gets a hash suffix, so two names never share a worktree. Database and role names are kept within PostgreSQL's 63 bytes the same way (test partitions included). |
-| **File watcher** | Watches `.git/worktrees`: a worktree made any way (plain `git`, git-cow, Claude Code) is provisioned; one deleted by hand is cleaned up. |
+| **Two binaries** | `lazy-cow-tree-cow` fills new worktrees (run by the devenv module's `git` wrapper, no daemon needed); `lazy-cow-tree` is the daemon (HTTPS, PostgreSQL and Redis proxies, services, migrations, GitHub sync) and its CLI. |
+| **Worktrees, however made** | `lazy-cow-tree worktree new`, `git worktree add` in the devenv shell (the module's `git` wrapper) and Claude Code (its WorktreeCreate hook) all make copy-on-write worktrees. The daemon provisions new worktrees and cleans up removed ones when the wrapper or a hook asks, on start and every minute. |
 | **Services** | Every checkout runs the project's services (`lazyCowTree.services`), each with its own port and `https://<worktree>.<service>.<project>.localhost` (`<service>.<project>.localhost` in the primary). The first request to a service starts it, after the services it depends on; workers without http run as dependencies. |
 | **PostgreSQL** | One PostgreSQL 18 on an APFS RAM disk, `fsync=off`. lazy-cow-tree is a proxy in front of it: the user in the connection picks the checkout, a database is created on first connect as a copy-on-write clone of its template (always `SET file_copy_method = clone` + `STRATEGY FILE_COPY`: 200 MB in ~40 ms instead of ~450 ms), and a checkout can only open its own databases; users that are no checkout's role are refused. Every checkout has its own role and password. |
 | **Redis** | One port; the password picks the checkout's own `redis-server`, on a private unix socket, started on first use and killed with the worktree. Real Redis: pub/sub, Lua, streams, `FLUSHALL` only touch that one. |
 | **HTTPS** | Local CA, websockets included. `https://lazy-cow-tree.localhost` lists everything. |
-| **GitHub** | Webhook websocket (polling without repo admin rights): pushes pull every branch and merge the base branch into worktrees (conflict-free merges only, dirty worktrees skipped). A worktree whose PR merged is removed unless it has newer work or wasn't made at least 5 minutes before the merge (a new task reusing the branch name; `worktree rm` without `--force` refuses it too). |
+| **GitHub** | Webhook websocket (polling without repo admin rights): pushes pull every branch and merge the base branch into worktrees (conflict-free merges only, dirty worktrees skipped). A worktree whose PR merged is removed unless it has newer work or wasn't made at least 5 minutes before the merge (a new task reusing the branch name; `worktree rm` without `--force` refuses it too); `lazyCowTree.autoRemoveMerged = false` keeps them. |
 | **Migrations** | When the base branch moves: the migrate commands run in the primary checkout, then the template is refreshed from its database; they also run in every worktree the base branch was merged into, and once in each new worktree after its database is cloned (its branch may carry migrations the template lacks; done is recorded per database, so one recreated after a reboot is migrated again). A worktree's services start only once its migrations succeeded; a failure shows in `lazy-cow-tree status` and on its 502 page and is retried with a growing backoff. Migrations don't block creating, syncing or removing other worktrees. A freshly created primary database (first start, after a reboot) is migrated and seeded whatever branch the primary is on, but the template is only made from an up-to-date base branch. Until it exists, worktrees clone the primary's database instead, so they do get the primary's feature-branch migrations (then their own on top). |
-| **Gone pages** | A removed worktree's hostnames answer 503 with why it's gone (pull request merged, removed, deleted), links to the PR, branch and commit on GitHub / GitLab / Bitbucket / Gitea, and a button that recreates it as a preview. |
-| **LSP proxy** | `lazy-cow-tree lsp -- <server>` runs one language server per worktree, routes each request by file, and drops results from other worktrees. |
+| **LSP proxy** | `lazy-cow-tree lsp -- <server>` runs one language server per worktree, routes each request by file, and drops results from other worktrees. Wrapped in the devenv shell and given to Claude Code and Codex (dexter, typescript-language-server, pyright and rust-analyzer for now). |
 
 Removing a worktree SIGKILLs everything running in it (each service's process group,
 plus any process whose working directory or executable is inside it, with all
@@ -66,9 +66,8 @@ its databases and role, deletes its branch (even `--force` keeps one with commit
 that aren't on the base branch, pushed, or in its merged PR, renamed to
 `<name>-kept-<sha>`; uncommitted files it deletes are listed) and moves the files away
 for background deletion. Gitignored files it deletes that are neither build caches
-(including whatever it carried in or `.worktreeinclude` names), its own `.env`, copies of
-the primary checkout's, nor unchanged since setup finished are printed as warnings and
-listed on its gone page.
+(including whatever it carried in or `.worktreeinclude` names), copies of the
+primary checkout's, nor unchanged since setup finished are printed as warnings.
 
 ## Install
 
@@ -127,7 +126,7 @@ To build it yourself instead: `lazyCowTree.cachix.enable = false;` and
 (your nixpkgs; compiled locally).
 
 **2. Describe the project** in plain devenv. The module reads `processes`,
-`services.postgres`, `services.redis` and `dotenv`, and lazy-cow-tree runs them in every
+`services.postgres` and `services.redis`, and lazy-cow-tree runs them in every
 checkout: each process gets its own port and `https://[<worktree>.]<hostname>`, PostgreSQL
 and Redis come from the daemon, and devenv doesn't start its own copies (nor its proxy:
 lazy-cow-tree serves the hostnames). It also adds lazy-cow-tree to the shell, runs `lazy-cow-tree
@@ -177,7 +176,6 @@ How devenv's options map:
 | `services.postgres.{package,extensions,settings}` | the daemon's PostgreSQL |
 | `services.postgres.initialDatabases` | databases per checkout |
 | `services.redis.package` | the daemon's Redis |
-| `dotenv.filename` | the checkout's own env files (see below) |
 
 When to start them, per process and for PostgreSQL / Redis:
 
@@ -223,18 +221,12 @@ on `lazy-cow-tree down --eject`, and on a crash, which can also corrupt the clus
 Only for data you can recreate (migrations and seeds). Off by default: the cluster is
 then on disk with PostgreSQL's normal durability.
 
-A checkout's own variables go in `.env.local`, or devenv's `dotenv.filename` when
-`dotenv.enable` is on: the file is read from the checkout on every start of anything
-in it and applied last. A new worktree starts with a copy of the primary's; `.env`
-itself is lazy-cow-tree's output (below).
-
 Escape hatches, all optional:
 
 ```nix
 processes.legacy.lazyCowTree.enable = false;   # leave this process to devenv (primary only)
 processes.web.lazyCowTree = { migrate = "mix ecto.migrate"; restartOnPull = true; };
 lazyCowTree.services.web.portOffset = 0;       # any lazyCowTree.services.<name> field wins
-lazyCowTree.envFiles = [ ".env.local" ".env.secrets" ];
 ```
 
 The `lazyCowTree.services` vocabulary below still works on its own, for processes
@@ -274,25 +266,68 @@ config :myapp, MyApp.Repo, url: System.fetch_env!("TEST_DATABASE_URL"), pool: Ec
 - Claude Code: `claude --worktree`, or subagents with `isolation: worktree` (the
   module's `WorktreeCreate` / `WorktreeRemove` hooks)
 - `lazy-cow-tree worktree new fix-login` (prints the path)
-- plain `git worktree add .claude/worktrees/fix-login` (the build caches are
-  cloned in afterwards)
+- `git worktree add .claude/worktrees/fix-login` in the devenv shell (the module's
+  `git` wrapper makes it copy-on-write)
 
-**7. Work in a worktree without devenv.** Run commands from a shell that has the
-project's tools (the primary's `devenv shell`, or the agent's session started in
-it) and take the worktree's environment from `lazy-cow-tree env`:
+**7. Work in a worktree without devenv.** Start the agent from the primary's
+`devenv shell` (`devenv shell -- claude`, `devenv shell -- codex`). Every bash and zsh
+started from it, including Claude Code's and Codex's tool shells and their subagents',
+gets the environment of the checkout it runs in, and again after `cd`/`pushd`/`popd`,
+with nothing to tell the agent:
 
 ```console
-$ cd .claude/worktrees/fix-login && eval "$(lazy-cow-tree env)"
-$ mix test
-$ open "$LAZY_COW_TREE_URL"      # https://fix-login.web.myapp.localhost, starts web
+$ cd .claude/worktrees/fix-login && mix test   # myapp_test_fix_login
+$ echo $PHX_HOST $DATABASE_URL                 # fix-login.web.myapp.localhost …/myapp_dev_fix_login
+$ open "$LAZY_COW_TREE_URL"                    # https://fix-login.web.myapp.localhost, starts web
 ```
 
-or let the app read the worktree's `.env`. Services started by lazy-cow-tree already
-get the project's `PATH` and the worktree's environment.
+Another project the daemon registered gets its own; outside them, values it
+overrode are restored and the rest unset. How: `BASH_ENV` (every non-interactive
+bash) and `ZDOTDIR` (every zsh; Codex runs commands with `zsh -lc`) source a hook
+that defines the `cd`/`pushd`/`popd` wrappers and runs `lazy-cow-tree shell-hook`
+(hidden command, ~10 ms), which also records in `LAZY_COW_TREE_SHELL` what it set. Your own
+`BASH_ENV` and zsh startup files (from your `ZDOTDIR`, else `$HOME`) still run.
+`codex` is wrapped to run with `--no-daemon`: a shared `codex app-server` started
+elsewhere would run commands with its own environment. Not covered: `builtin cd`,
+fish. Turn it off with `lazyCowTree.shellHook.enable = false` (then `enterShell`
+only exports the environment of the checkout it starts in) and
+`lazyCowTree.codex.noDaemon = false`.
 
-**8. Language servers for agents:** `lazyCowTree.lsp.elixir = [ "dexter" "lsp" ];`
-adds `lazy-cow-tree-lsp-elixir`; use it as the command of Claude Code's `lspServers`,
-so one session gets answers from the worktree each file belongs to.
+Services started by lazy-cow-tree already get the project's `PATH` and the
+worktree's environment.
+
+**8. Language servers for agents.** One agent session edits files in many worktrees; a
+single language server rooted at the primary would answer from the wrong one. For now
+four are supported, taken from the enabled `languages.*` with their LSP on:
+
+```nix
+languages.elixir = { enable = true; lsp.package = pkgs.dexter; };  # dexter lsp
+languages.typescript.enable = true;                                 # typescript-language-server --stdio
+languages.python.enable = true;                                     # pyright-langserver --stdio (pyright)
+languages.rust.enable = true;                                       # the toolchain's rust-analyzer
+```
+
+Like the `git` wrapper, each becomes a same-named wrapper in the devenv shell: started
+as a server, it runs behind `lazy-cow-tree lsp` (one server per worktree, rooted there;
+each request goes to the worktree of its file, results from other worktrees dropped);
+other uses (`--version`) run the real binary. `LAZY_COW_TREE_LSP_DISABLE=1` always
+runs the real one.
+
+- **Claude Code** runs language servers from plugins only: the module adds a local
+  plugin marketplace (in the Nix store) and enables its plugin `lazy-cow-tree-lsp` in
+  `.claude/settings.local.json` (`lazyCowTree.claude.lsp`), whose servers are the
+  wrappers. Claude Code's own plugins that start the same server by name from `PATH`
+  reach the wrapper too.
+- **Codex** has no LSP client: with `lazyCowTree.codex.lsp` each server is also an MCP
+  server `lsp-<binary>` in the project's `.codex/config.toml` (read for trusted
+  projects) through [mcp-language-server](https://github.com/isaacphi/mcp-language-server)
+  (definition, references, diagnostics, hover, rename, edits). The wrapper is given by
+  path: Codex starts MCP servers with only `PATH`, `HOME` and a few more variables. Your
+  own Codex settings go in `files.".codex/config.toml".toml`.
+
+FIXME: other language servers. devenv's `languages.*.lsp` has only `enable` and
+`package`, not the arguments a server starts with nor its file extensions
+(cachix/devenv#3202); Helix's `languages.toml` has both for most servers.
 
 | option | default | |
 |---|---|---|
@@ -303,12 +338,18 @@ so one session gets answers from the worktree each file belongs to.
 | `lazyCowTree.setup` | none | runs once in every new checkout (lazy-cow-tree, `git worktree add`, Claude Code), e.g. `mix deps.get`; in the primary checkout too (a fresh clone has no `deps/`), before its first migrate, seed or service start. Done is a `lazy-cow-tree-setup` marker in the checkout's git dir; a failure in the primary shows in `lazy-cow-tree status` and is retried with the migrations' backoff; again before a `restartOnChange` restart for changed dependency files, so keep it idempotent |
 | `lazyCowTree.services.<name>` | none | see below |
 | `lazyCowTree.server` | none | shorthand for `lazyCowTree.services.web.exec` |
-| `lazyCowTree.previewTtlHours` | `48` | close previews after this many hours without activity; `0` keeps them |
+| `lazyCowTree.autoRemoveMerged` | `true` | remove worktrees whose GitHub PR merged (see GitHub above) |
 | `lazyCowTree.httpsPort` | `null` | HTTPS proxy port; unset: 443 where unprivileged processes may bind it, else 8443 |
 | `lazyCowTree.httpPort` | `null` | HTTP port redirecting to HTTPS, 0 disables; unset: 80 where unprivileged processes may bind it, else off |
-| `lazyCowTree.lsp.<name>` | none | adds `lazy-cow-tree-lsp-<name>` for Claude Code's `lspServers` |
 | `lazyCowTree.package` | built with lazy-cow-tree's pinned nixpkgs | lazy-cow-tree build; the default is on lazy-cow-tree.cachix.org |
 | `lazyCowTree.cachix.enable` | `true` | `cachix.pull = [ "lazy-cow-tree" ]` |
+| `lazyCowTree.shellHook.enable` | `true` | every bash/zsh from the devenv shell (agents' tool shells) gets its checkout's environment, again after `cd` (step 7) |
+| `lazyCowTree.git.enable` | `true` | `git` in the shell is a wrapper: `git worktree add` fills the worktree like `lazy-cow-tree worktree new` (copy-on-write clones of the primary, build caches included; locked as initializing meanwhile); `LAZY_COW_TREE_GIT_DISABLE=1` for plain git. Don't also import git-cow's module |
+| `lazyCowTree.git.package` | `pkgs.git` | the real git it runs |
+| `lazyCowTree.claude.lsp` | `true` | the language servers as Claude Code plugin `lazy-cow-tree-lsp` from a local marketplace in `.claude/settings.local.json` (step 8) |
+| `lazyCowTree.codex.lsp` | `true` | each supported language server as Codex MCP server `lsp-<binary>` (mcp-language-server) in `.codex/config.toml` (step 8) |
+| `lazyCowTree.codex.mcpLanguageServer` | `pkgs.mcp-language-server` | the LSP-to-MCP bridge |
+| `lazyCowTree.codex.noDaemon` | `true` | wraps `codex` with `--no-daemon`, so it runs commands with this shell's environment |
 | `lazyCowTree.claude.trustCa` | `true` | sets `NODE_EXTRA_CA_CERTS` to the local CA in `.claude/settings.local.json` (a value you set there wins) |
 | `lazyCowTree.home` | `$LAZY_COW_TREE_HOME`, else `~/.local/state/lazy-cow-tree` | where the module looks for the daemon's CA (read from devenv's environment at evaluation; `env.LAZY_COW_TREE_HOME` too) |
 | `lazyCowTree.postgres.package` | `pkgs.postgresql_18` | PostgreSQL build (18+ for copy-on-write databases) |
@@ -317,7 +358,6 @@ so one session gets answers from the worktree each file belongs to.
 | `lazyCowTree.postgres.settings` | `{}` | extra postgresql.conf settings, e.g. `shared_preload_libraries` |
 | `lazyCowTree.postgres.ramdiskMB` | `4096` | RAM disk size (used as it fills); resizing needs `lazy-cow-tree down --eject`, which empties every database |
 | `lazyCowTree.redis` | `pkgs.redis` | Redis build |
-| `lazyCowTree.envFiles` | `dotenv.filename` if `dotenv.enable`, else `[ ".env.local" ]` | the checkout's own env files, relative to it |
 
 Service options:
 
@@ -326,7 +366,7 @@ Service options:
 | `exec` | | command |
 | `cwd` | checkout root | working directory, relative to the checkout |
 | `http` | `true` | listens on `$PORT`, gets a hostname, started by its first request; `false`: only started as a dependency |
-| `default` | `web`, else first http service | what `lazy-cow-tree env` / `lazy-cow-tree service` pick without a name |
+| `default` | `web`, else first http service | what the shell hook and `lazy-cow-tree service` pick without a name |
 | `portOffset` | position by name | `PORT` = checkout base port + offset (0–9) |
 | `migrate` | none | migrate/seed command for the checkout's database, run in its `cwd` after `lazyCowTree.migrate` |
 | `dependsOn` | `[]` | started first |
@@ -385,9 +425,8 @@ main port listens, then answers 502.
 
 ## Environment
 
-`lazy-cow-tree env [-s <service>]` prints (all derived from the checkout's path, no daemon
-needed), e.g. for services `web` (default), `api` and
-`worker`:
+The shell hook (step 7) exports (all derived from the checkout's path, no daemon
+needed), e.g. for services `web` (default), `api` and `worker`:
 
 | | primary | worktree `fix-login` |
 |---|---|---|
@@ -404,7 +443,7 @@ needed), e.g. for services `web` (default), `api` and
 Worktree roles were `<project>-<worktree>` before; the daemon renames an old role to
 the new name on its next start (or, if that name was shared by two checkouts, makes
 the new role a member of it). The Redis password and the role changed, so restart
-anything a worktree runs by hand with an old `.env` / `lazy-cow-tree env`.
+anything a worktree runs by hand with the old environment.
 
 Detected from the manifests in the service's `cwd`, set to its hostname so the dev
 server accepts it (the service's `env` overrides them):
@@ -435,41 +474,30 @@ All services of a checkout share its `DATABASE_URL` and `REDIS_URL` for now
 
 ## New worktrees, however they're made
 
-A worktree made by plain `git worktree add` (or any tool) is seen by the file
-watcher. While it's still its fresh checkout (clean, nothing untracked, made in
-the last 10 minutes) and lacks the primary's gitignored caches (`deps/`, `_build/`,
-`node_modules/`, …), it's redone as a copy-on-write clone of the primary, caches
-included and a carried Mix build relocated ([git-cow](https://github.com/onnimonni/git-cow)).
-Language server indexes (`.dexter/`, `.elixir_ls/`, …) are never carried: they name
-the primary's paths.
+In the devenv shell `git` is the module's wrapper (`lazyCowTree.git.enable`):
+`git worktree add` (any options; `--no-checkout` and `--orphan` pass through) makes
+the worktree with git, locked as `initializing`, and `lazy-cow-tree-cow populate`
+fills it like `lazy-cow-tree worktree new`: copy-on-write clones of the primary,
+gitignored caches (`deps/`, `_build/`, `node_modules/`, …) included and a carried Mix
+build relocated ([git-cow](https://github.com/onnimonni/git-cow)); where the filesystem
+can't clone, the caches are copied. Language server indexes (`.dexter/`,
+`.elixir_ls/`, …) are never carried: they name the primary's paths. Then it asks the
+daemon to provision it (`lazy-cow-tree reconcile`, in the background), which runs
+`lazyCowTree.setup` once in it. `git worktree remove`, `prune` and `move` ask it to
+reconcile too, which drops a removed worktree's databases, role and redis-server.
+With a GitHub `origin`, `git worktree remove` refuses while the worktree's branch has an
+open pull request (checked with `gh`; one error line naming the PR); a merged, closed
+or missing PR removes it as usual, and if `gh` can't tell (not logged in, offline) it
+removes it too. `FORCE_ALLOW_OPEN_PR=1` skips the check.
 
-Every worktree gets its environment in `.env` too (a marked block at the top,
-rewritten on each start; keys of a `.env` cloned from the primary are commented
-out). Values are single-quoted, which dotenvy, Ruby/Node dotenv, docker compose, direnv and `set -a; . .env` read literally; a value holding `'` or a line break is double-quoted instead, with `\\ \" \$ \n` escaped and backticks as single-quoted pieces so sourcing it runs nothing (loaders differ there: Node dotenv keeps the backslashes, Ruby dotenv and docker compose don't join quoted pieces, sh reads `\n` literally). Bun expands `$VAR` even in single quotes, so a value containing `$` is logged as a warning. If `.env` isn't gitignored it's added to `.git/info/exclude`; a tracked `.env`
-is left alone. Then `lazyCowTree.setup` runs once in it.
-
-## Removed worktrees and previews
-
-lazy-cow-tree remembers removed worktrees in the main checkout's git dir
-(`.git/lazy-cow-tree/worktrees.json`): branch, commit, when, and why. A request to one of
-their hostnames gets a 503 page saying so (e.g. "Its pull request #42 was merged"),
-with links to the pull request, branch and commit on the remote's forge.
-
-Its **Recreate worktree to preview** button (a POST from the page itself) brings the
-worktree back at the commit it was at (fetched from the remote or the pull request's
-head if it's no longer local), with a fresh copy of the template database, and sends
-you back to the page, whose service then starts on demand. A preview isn't
-auto-removed for its merged pull request; it closes after `lazyCowTree.previewTtlHours`
-(48) without requests or database / Redis connections, unless it has uncommitted
-changes or commits that are neither pushed nor in its merged pull request (a pushed
-branch loses nothing, merged or not), and the page shows the
-original reason again.
+Nothing watches the filesystem: a worktree made or deleted outside the wrapper (plain
+git elsewhere, `rm -rf`) is picked up by the daemon within a minute, and one made by
+plain git has no caches.
 
 ## Commands
 
 ```sh
 lazy-cow-tree serve                        # daemon (devenv process)
-lazy-cow-tree env [-s <service>] [--json]  # this checkout's environment
 lazy-cow-tree worktree new <name> [--base <ref>]
 lazy-cow-tree worktree rm <name> [--force] # without --force only when nothing would be lost
 lazy-cow-tree worktree list

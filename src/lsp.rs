@@ -210,8 +210,14 @@ impl Router {
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("starting {prog}"))?;
-        let mut stdin = child.stdin.take().unwrap();
-        let stdout = child.stdout.take().unwrap();
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("language server without stdin")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("language server without stdout")?;
         let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
         tokio::spawn(async move {
             while let Some(v) = rx.recv().await {
@@ -251,7 +257,9 @@ impl Router {
             warn!("{e:#}");
             return;
         }
-        let b = self.backends.get_mut(root).unwrap();
+        let Some(b) = self.backends.get_mut(root) else {
+            return;
+        };
         if b.ready {
             let _ = b.tx.send(v);
         } else {
@@ -335,7 +343,10 @@ impl Router {
                 self.init_params = Some(params);
                 let primary = self.layout.primary.clone();
                 self.spawn(&primary)?;
-                let b = self.backends.get_mut(&primary).unwrap();
+                let b = self
+                    .backends
+                    .get_mut(&primary)
+                    .context("primary language server not started")?;
                 b.ready = true;
                 if let Some(id) = id {
                     self.pending.insert(id_key(&id), primary);

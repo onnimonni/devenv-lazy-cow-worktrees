@@ -14,10 +14,10 @@
 
 mod client;
 mod config;
+mod cow;
 mod daemon;
 mod devenv_proxy;
 mod github;
-mod history;
 mod lsp;
 mod pgproxy;
 mod postgres;
@@ -30,12 +30,14 @@ mod tls;
 mod worktree;
 
 use std::{
+    collections::BTreeMap,
     io::Read,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::{Global, Project, ProjectSettings};
@@ -74,9 +76,12 @@ enum Cmd {
         #[arg(long)]
         control_socket: PathBuf,
     },
-    /// Print this checkout's environment (PORT, DATABASE_URL, REDIS_URL, ...) as
-    /// shell exports: `eval "$(lazy-cow-tree env)"`.
-    Env {
+    /// For the devenv module's shell hook: prints what takes the calling shell to the
+    /// environment of this directory's checkout (PORT, DATABASE_URL, REDIS_URL, ...),
+    /// restoring or unsetting what an earlier call set and this one doesn't (outside
+    /// the project's checkouts: everything).
+    #[command(hide = true)]
+    ShellHook {
         #[command(flatten)]
         project: ProjectSettings,
         #[arg(long, default_value = ".")]
@@ -84,9 +89,13 @@ enum Cmd {
         /// This service's environment [default: the default service's].
         #[arg(short, long)]
         service: Option<String>,
-        /// Print JSON instead.
-        #[arg(long)]
-        json: bool,
+    },
+    /// For the devenv module's `git` wrapper: provision new worktrees of this
+    /// directory's project and clean up removed ones now.
+    #[command(hide = true)]
+    Reconcile {
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
     },
     /// Manage worktrees.
     #[command(subcommand)]
@@ -177,6 +186,136 @@ enum HookCmd {
 
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// What `shell-hook` set in the calling shell, kept there as JSON in `SHELL_STATE`.
+#[derive(Serialize, Deserialize, Default, Debug, PartialEq)]
+struct ShellState {
+    /// Variables it set.
+    set: Vec<String>,
+    /// Their values from before it first set them (none: they were unset).
+    was: BTreeMap<String, String>,
+}
+
+const SHELL_STATE: &str = "LAZY_COW_TREE_SHELL";
+
+impl ShellState {
+    fn from_env() -> Self {
+        std::env::var(SHELL_STATE)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    /// `name`'s value before any hook set it.
+    fn original(&self, name: &str) -> Option<String> {
+        if self.set.iter().any(|n| n == name) {
+            self.was.get(name).cloned()
+        } else {
+            std::env::var(name).ok()
+        }
+    }
+
+    /// Shell code taking the shell from this state to `env`; `current` reads its variables.
+    fn script(&self, env: &[(String, String)], current: impl Fn(&str) -> Option<String>) -> String {
+        let mut next = ShellState::default();
+        for (k, _) in env {
+            if next.set.contains(k) {
+                continue;
+            }
+            let was = if self.set.contains(k) {
+                self.was.get(k).cloned()
+            } else {
+                current(k)
+            };
+            if let Some(v) = was {
+                next.was.insert(k.clone(), v);
+            }
+            next.set.push(k.clone());
+        }
+        let mut out = String::new();
+        for k in self.set.iter().filter(|k| !next.set.contains(k)) {
+            match self.was.get(k) {
+                Some(v) => out.push_str(&format!("export {k}={}\n", shell_quote(v))),
+                None => out.push_str(&format!("unset {k}\n")),
+            }
+        }
+        for (k, v) in env {
+            out.push_str(&format!("export {k}={}\n", shell_quote(v)));
+        }
+        if next.set.is_empty() {
+            out.push_str(&format!("unset {SHELL_STATE}\n"));
+        } else {
+            let json = serde_json::to_string(&next).unwrap_or_default();
+            out.push_str(&format!("export {SHELL_STATE}={}\n", shell_quote(&json)));
+        }
+        out
+    }
+}
+
+/// The environment of `path`'s checkout (`service`'s, else the default service's).
+fn checkout_env(
+    g: &Global,
+    p: Project,
+    wt: Option<&str>,
+    co_path: PathBuf,
+    service: Option<&str>,
+) -> Result<Vec<(String, String)>> {
+    // The port the daemon records (or will): same plan over the same projects.
+    let port = if wt.is_some() && worktree::recorded_port(&co_path).is_none() {
+        let mut all = daemon::registered_projects();
+        all.retain(|o| o.root != p.root);
+        all.push(p.clone());
+        worktree::plan_ports(&all)
+            .ok()
+            .and_then(|plan| plan.into_iter().find(|(path, ..)| *path == co_path))
+            .map(|(_, port, _)| port)
+    } else {
+        None
+    };
+    let c = match port {
+        Some(port) => p.checkout_on(wt, co_path, port),
+        None => p.checkout(wt, co_path),
+    };
+    Ok(match service {
+        Some(s) if c.service(s).is_none() => anyhow::bail!("no service {s}"),
+        Some(s) => c.service_env(g, Some(s)),
+        None => c.env(g),
+    })
+}
+
+/// `shell-hook`: the environment of `path`'s checkout, if it's in this devenv's project
+/// (`DEVENV_ROOT`; `settings` are its) or another one the daemon registered (with its
+/// settings); else none.
+fn hook_env(
+    g: &Global,
+    mut settings: ProjectSettings,
+    path: &Path,
+    service: Option<&str>,
+    state: &ShellState,
+) -> Vec<(String, String)> {
+    let Ok((root, wt, co_path)) = config::locate(path) else {
+        return Vec::new();
+    };
+    let ours = std::env::var_os("DEVENV_ROOT")
+        .and_then(|d| config::primary_root(Path::new(&d)).ok())
+        .is_some_and(|r| r == root);
+    let p = if ours {
+        // The setting, not the name an earlier hook exported (maybe another project's).
+        settings.name = state.original("LAZY_COW_TREE_PROJECT");
+        let mut p = Project::new(root, settings);
+        p.env = std::env::vars().collect();
+        p
+    } else {
+        match daemon::registered_projects()
+            .into_iter()
+            .find(|p| p.root == root)
+        {
+            Some(p) => p,
+            None => return Vec::new(),
+        }
+    };
+    checkout_env(g, p, wt.as_deref(), co_path, service).unwrap_or_default()
 }
 
 fn project_for(path: &Path, settings: ProjectSettings) -> Result<Project> {
@@ -312,55 +451,19 @@ async fn main() -> Result<()> {
             };
             daemon::serve(global, None).await
         }
-        Cmd::Env {
+        Cmd::ShellHook {
             project,
             path,
             service,
-            json,
         } => {
-            let (root, wt, co_path) = config::locate(&path)?;
-            let mut p = Project::new(root, project);
-            p.env = std::env::vars().collect();
-            // The port the daemon records (or will): same plan over the same projects.
-            let port = if wt.is_some() && worktree::recorded_port(&co_path).is_none() {
-                let mut all = daemon::registered_projects();
-                all.retain(|o| o.root != p.root);
-                all.push(p.clone());
-                worktree::plan_ports(&all)
-                    .ok()
-                    .and_then(|plan| plan.into_iter().find(|(path, ..)| *path == co_path))
-                    .map(|(_, port, _)| port)
-            } else {
-                None
-            };
-            let c = match port {
-                Some(port) => p.checkout_on(wt.as_deref(), co_path, port),
-                None => p.checkout(wt.as_deref(), co_path),
-            };
-            let mut env = match service.as_deref() {
-                Some(s) if c.service(s).is_none() => anyhow::bail!("no service {s}"),
-                Some(s) => c.service_env(&cli.global, Some(s)),
-                None => c.env(&cli.global),
-            };
-            // The checkout's env files (LAZY_COW_TREE_ENV_FILES) win, as for everything
-            // the daemon runs there.
-            let (files, primary_only) = config::env_file_vars(&p.root, &c.path, &p.env_files());
-            env.retain(|(k, _)| !files.iter().any(|(f, _)| f == k));
-            env.extend(files);
-            if json {
-                let map: serde_json::Map<String, Value> = env
-                    .into_iter()
-                    .map(|(k, v)| (k, Value::String(v)))
-                    .collect();
-                println!("{}", serde_json::to_string_pretty(&map)?);
-            } else {
-                for k in primary_only {
-                    println!("unset {k}");
-                }
-                for (k, v) in env {
-                    println!("export {k}={}", shell_quote(&v));
-                }
-            }
+            let state = ShellState::from_env();
+            let env = hook_env(&cli.global, project, &path, service.as_deref(), &state);
+            print!("{}", state.script(&env, |k| std::env::var(k).ok()));
+            Ok(())
+        }
+        Cmd::Reconcile { path } => {
+            let root = root_of(&path)?;
+            client::post::<Value>("/reconcile", &daemon::RootReq { root }).await?;
             Ok(())
         }
         Cmd::Worktree(WorktreeCmd::New { name, base }) => {
@@ -562,5 +665,42 @@ mod tests {
         // Under its own name the arguments are left alone.
         let plain = devenv_proxy_args(["lazy-cow-tree", "status"].map(Into::into).into_iter());
         assert_eq!(plain, ["lazy-cow-tree", "status"]);
+    }
+
+    fn kv(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn state_of(script: &str) -> ShellState {
+        let line = script
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("export {SHELL_STATE}='")))
+            .unwrap();
+        serde_json::from_str(line.strip_suffix('\'').unwrap()).unwrap()
+    }
+
+    #[test]
+    fn shell_hook_restores_what_it_overrode() {
+        // First checkout: PORT was the user's, DATABASE_URL unset.
+        let user = |k: &str| (k == "PORT").then(|| "3000".to_string());
+        let s1 =
+            ShellState::default().script(&kv(&[("PORT", "4000"), ("DATABASE_URL", "a")]), user);
+        assert!(s1.contains("export PORT='4000'\nexport DATABASE_URL='a'\n"));
+        let st1 = state_of(&s1);
+        assert_eq!(st1.set, ["PORT", "DATABASE_URL"]);
+        assert_eq!(st1.was, BTreeMap::from([("PORT".into(), "3000".into())]));
+
+        // Another checkout without DATABASE_URL: the original PORT is still remembered.
+        let s2 = st1.script(&kv(&[("PORT", "20001")]), |_| Some("4000".into()));
+        assert!(s2.starts_with("unset DATABASE_URL\nexport PORT='20001'\n"));
+        let st2 = state_of(&s2);
+        assert_eq!(st2.was["PORT"], "3000");
+
+        // Outside the project: back to the user's.
+        let s3 = st2.script(&[], |_| None);
+        assert_eq!(s3, format!("export PORT='3000'\nunset {SHELL_STATE}\n"));
     }
 }

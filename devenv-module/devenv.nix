@@ -11,21 +11,21 @@
 # proxy.hostname, after, ready, restart, watch, plus the new `start.on` /
 # `start.idleTimeout`), its database from `services.postgres` (plus `instance`,
 # `start`, `copyOnWrite`, `dangerouslyDisableDurabilityForSpeed`), Redis from
-# `services.redis` (plus `instance`, `start`) and the checkout's env files from `dotenv`,
-# and keeps devenv from starting its own copies. `lazyCowTree.*` options still work and
+# `services.redis` (plus `instance`, `start`), and keeps devenv from starting its own copies. `lazyCowTree.*` options still work and
 # win over what is derived:
 #
 #   lazyCowTree.migrate = "mix ecto.migrate";
 #   lazyCowTree.seed = "mix run priv/repo/seeds.exs";
 #   lazyCowTree.setup = "mix deps.get";           # once in every new checkout
 #   lazyCowTree.services.api = { exec = "bun run dev"; cwd = "api"; };
-#   lazyCowTree.lsp.elixir = [ "dexter" "lsp" ];
+#   languages.elixir.lsp.package = pkgs.dexter;  # per-worktree LSP for Claude Code and Codex
 #
 # Every checkout (primary and worktrees) gets each service on demand:
 # https://<worktree>.<service>.<project>.localhost (https://<service>.<project>.localhost
 # in the primary) starts it, after what it depends on, with its own PORT and the
-# checkout's DATABASE_URL and REDIS_URL. `lazy-cow-tree env [--service x]` gives every
-# shell the same environment. Claude Code's WorktreeCreate/WorktreeRemove
+# checkout's DATABASE_URL and REDIS_URL. Every bash/zsh started from the devenv shell
+# (agents' tool shells) gets the same environment for the checkout it runs in, again
+# after cd. Claude Code's WorktreeCreate/WorktreeRemove
 # hooks go through the daemon, so `claude --worktree` and `isolation: worktree`
 # subagents get provisioned worktrees too, and its NODE_EXTRA_CA_CERTS trusts the
 # local CA (MCP servers on https://*.localhost).
@@ -59,6 +59,163 @@ let
   envHome = builtins.getEnv "LAZY_COW_TREE_HOME";
   userHome = builtins.getEnv "HOME";
   inherit (lib) mkOption types;
+  # Sourced by every bash (BASH_ENV) and zsh (ZDOTDIR) started from the devenv shell, so
+  # agents' tool shells (Claude Code: bash -c, Codex: zsh -lc) get the checkout they run
+  # in: its env again after each cd/pushd/popd (`cd .claude/worktrees/x && cmd`).
+  # Shell functions aren't inherited, env vars are.
+  shellHook = pkgs.writeText "lazy-cow-tree-shell-hook.sh" ''
+    if [ -n "''${BASH_VERSION:-}" ] && [ -n "''${LAZY_COW_TREE_BASH_ENV:-}" ]; then
+      . "$LAZY_COW_TREE_BASH_ENV"
+    fi
+    __lazy_cow_tree_env() { eval "$(command ${exe} shell-hook 2>/dev/null)"; }
+    cd() { builtin cd "$@" && __lazy_cow_tree_env; }
+    pushd() { builtin pushd "$@" && __lazy_cow_tree_env; }
+    popd() { builtin popd "$@" && __lazy_cow_tree_env; }
+    __lazy_cow_tree_env
+  '';
+  # Every zsh reads $ZDOTDIR/.zshenv. Codex's shell snapshot replays the ZDOTDIR it
+  # captured, so it stays this dir: each startup file runs the user's own one (from
+  # their ZDOTDIR, or $HOME) and notes where a file of theirs moved ZDOTDIR to.
+  zdotdir = pkgs.runCommand "lazy-cow-tree-zdotdir" { } ''
+    mkdir $out
+    echo ". ${shellHook}" > $out/.zshenv
+    for f in .zshenv .zprofile .zshrc .zlogin .zlogout; do
+      cat >> $out/$f <<EOF
+    ZDOTDIR=\''${LAZY_COW_TREE_ZDOTDIR:-\$HOME}
+    [ -f "\$ZDOTDIR/$f" ] && . "\$ZDOTDIR/$f"
+    LAZY_COW_TREE_ZDOTDIR=\$ZDOTDIR ZDOTDIR=$out
+    EOF
+    done
+  '';
+  # hiPrio in packages: wins over bin/git of git itself (still there for git-upload-pack etc.).
+  gitWrapper = pkgs.writeShellScriptBin "git" (
+    builtins.replaceStrings
+      [ "@git@" "@cow@" "@gh@" "@lazyCowTree@" ]
+      [
+        (lib.getExe cfg.git.package)
+        "${cfg.package}/bin/lazy-cow-tree-cow"
+        (lib.getExe pkgs.gh)
+        exe
+      ]
+      (builtins.readFile ./git.sh)
+  );
+  # `<binary>` of a supported language server (`lspServers`): starts as a language server behind
+  # `lazy-cow-tree lsp`; hiPrio in packages, over a real one in the shell.
+  lspWrapper =
+    cmd:
+    let
+      bin = lib.head cmd;
+      name = baseNameOf bin;
+    in
+    pkgs.writeShellScriptBin name (
+      builtins.replaceStrings
+        [ "@name@" "@real@" "@lazyCowTree@" "@lspArgs@" ]
+        [
+          name
+          (if lib.hasPrefix "/" bin then lib.escapeShellArg bin else "")
+          exe
+          (lib.escapeShellArgs (lib.tail cmd))
+        ]
+        (builtins.readFile ./lsp.sh)
+    );
+  # Language servers of the enabled `languages.*` whose LSP is on, by binary (the
+  # `lsp.package`'s main program; javascript and typescript share one).
+  # FIXME: only dexter (`languages.elixir.lsp.package = pkgs.dexter`),
+  # typescript-language-server, pyright and rust-analyzer for now. devenv's `languages.*.lsp` has only `enable`
+  # and `package`, not the arguments a server starts with nor its file extensions
+  # (cachix/devenv#3202); Helix's languages.toml has both for most servers.
+  supportedLsp = {
+    dexter = {
+      args = [ "lsp" ];
+      extensions = {
+        ".ex" = "elixir";
+        ".exs" = "elixir";
+        ".heex" = "phoenix-heex";
+      };
+    };
+    typescript-language-server = {
+      args = [ "--stdio" ];
+      extensions = {
+        ".js" = "javascript";
+        ".mjs" = "javascript";
+        ".cjs" = "javascript";
+        ".jsx" = "javascriptreact";
+        ".ts" = "typescript";
+        ".mts" = "typescript";
+        ".cts" = "typescript";
+        ".tsx" = "typescriptreact";
+      };
+    };
+    pyright-langserver = {
+      args = [ "--stdio" ];
+      extensions = {
+        ".py" = "python";
+        ".pyi" = "python";
+      };
+    };
+    rust-analyzer = {
+      args = [ ];
+      extensions.".rs" = "rust";
+    };
+  };
+  # The server where a package's main program isn't it: pyright's is its CLI, and
+  # languages.rust.lsp.package is often a whole toolchain (rust-overlay, fenix).
+  lspBinary = {
+    main = { pyright = "pyright-langserver"; };
+    language = { rust = "rust-analyzer"; };
+  };
+  lspServers = lib.concatMapAttrs (
+    lang: l:
+    let
+      pkg =
+        if (l.enable or false) && l ? lsp && (l.lsp.enable or false) then l.lsp.package or null else null;
+      # A name, not a path: attribute names can't refer to the store.
+      main = builtins.unsafeDiscardStringContext (baseNameOf (lib.getExe pkg));
+      bin =
+        if pkg == null then null else lspBinary.language.${lang} or lspBinary.main.${main} or main;
+    in
+    lib.optionalAttrs (bin != null && supportedLsp ? ${bin}) {
+      ${bin} = supportedLsp.${bin} // {
+        cmd = [ "${pkg}/bin/${bin}" ] ++ supportedLsp.${bin}.args;
+      };
+    }
+  ) config.languages;
+  lspWrapperPath = s: "${lspWrapper s.cmd}/bin/${baseNameOf (lib.head s.cmd)}";
+  # Claude Code runs language servers from plugins only: a local marketplace with one
+  # plugin holding them, each through its wrapper.
+  claudeLsp = cfg.claude.lsp && lspServers != { };
+  claudeMarketplace = pkgs.linkFarm "lazy-cow-tree-claude-marketplace" [
+    {
+      name = ".claude-plugin/marketplace.json";
+      path = pkgs.writeText "marketplace.json" (
+        builtins.toJSON {
+          name = "lazy-cow-tree";
+          owner.name = "lazy-cow-tree";
+          plugins = [
+            {
+              name = "lazy-cow-tree-lsp";
+              source = "./lsp";
+              description = "The devenv shell's language servers, one per worktree";
+            }
+          ];
+        }
+      );
+    }
+    {
+      name = "lsp/.claude-plugin/plugin.json";
+      path = pkgs.writeText "plugin.json" (
+        builtins.toJSON {
+          name = "lazy-cow-tree-lsp";
+          description = "The devenv shell's language servers behind `lazy-cow-tree lsp` (one per worktree)";
+          lspServers = lib.mapAttrs (_: s: {
+            command = lspWrapperPath s;
+            inherit (s) args;
+            extensionToLanguage = s.extensions;
+          }) lspServers;
+        }
+      );
+    }
+  ];
   # With its extensions, like devenv's services.postgres.
   postgres =
     if cfg.postgres.extensions != null then
@@ -620,10 +777,10 @@ in
       example = "mix phx.server";
       description = "Shorthand for `lazyCowTree.services.web.exec`.";
     };
-    previewTtlHours = mkOption {
-      type = types.ints.unsigned;
-      default = 48;
-      description = "Close a preview (a removed worktree recreated from its \"gone\" page) after this many hours without requests or database / Redis connections; 0 keeps previews until removed.";
+    autoRemoveMerged = mkOption {
+      type = types.bool;
+      default = true;
+      description = "Remove a worktree (under the worktrees dir, unlocked, clean) once its branch's GitHub pull request merged with nothing newer in it.";
     };
     httpsPort = mkOption {
       type = types.nullOr types.port;
@@ -651,27 +808,47 @@ in
       defaultText = lib.literalExpression ''env.LAZY_COW_TREE_HOME, else $LAZY_COW_TREE_HOME, else "$HOME/.local/state/lazy-cow-tree"'';
       description = "The daemon's state directory (absolute), where its CA lives (`<home>/ca/ca.pem`); only read here, set LAZY_COW_TREE_HOME to move it.";
     };
+    shellHook.enable = mkOption {
+      type = types.bool;
+      default = true;
+      description = "Give every bash and zsh started from the devenv shell (Claude Code's and Codex's tool shells, their subagents') the environment of the checkout it runs in (DATABASE_URL, REDIS_URL, PORT, PHX_HOST, ...), again after cd/pushd/popd; restored or unset outside the project. Sets BASH_ENV and ZDOTDIR (your own files still run).";
+    };
+    git.enable = mkOption {
+      type = types.bool;
+      default = true;
+      description = "Replace `git` in the shell with a wrapper whose `git worktree add` (by you, scripts or agents) fills the worktree like `lazy-cow-tree worktree new`: copy-on-write clones of the primary checkout, build caches included. Everything else is the real git. Replaces git-cow's devenv module (don't import both).";
+    };
+    git.package = mkOption {
+      type = types.package;
+      default = pkgs.git;
+      defaultText = lib.literalExpression "pkgs.git";
+      description = "The real git the wrapper runs.";
+    };
+    codex.lsp = mkOption {
+      type = types.bool;
+      default = true;
+      description = "Give Codex (which has no LSP client) each supported language server of the enabled `languages.*` (dexter, typescript-language-server, pyright, rust-analyzer) as an MCP server `lsp-<name>` in the project's `.codex/config.toml` (read for trusted projects): mcp-language-server (definition, references, diagnostics, hover, rename, edit tools) on the server's wrapper, so it runs behind `lazy-cow-tree lsp` too. Add your own Codex settings through `files.\".codex/config.toml\".toml`.";
+    };
+    codex.mcpLanguageServer = mkOption {
+      type = types.package;
+      default = pkgs.mcp-language-server;
+      defaultText = lib.literalExpression "pkgs.mcp-language-server";
+      description = "The LSP-to-MCP bridge `codex.lsp` uses (isaacphi/mcp-language-server).";
+    };
+    codex.noDaemon = mkOption {
+      type = types.bool;
+      default = true;
+      description = "Wrap `codex` to run with --no-daemon: a shared `codex app-server` started elsewhere runs commands with its own environment, not this shell's.";
+    };
+    claude.lsp = mkOption {
+      type = types.bool;
+      default = true;
+      description = "Give Claude Code the supported language servers of the enabled `languages.*` (dexter, typescript-language-server, pyright, rust-analyzer) as plugin `lazy-cow-tree-lsp`, from a local marketplace set up in `.claude/settings.local.json`, each behind `lazy-cow-tree lsp`.";
+    };
     claude.trustCa = mkOption {
       type = types.bool;
       default = true;
       description = "Set NODE_EXTRA_CA_CERTS to the local CA in `.claude/settings.local.json`, so Claude Code reaches MCP servers on https://*.localhost. Node reads one file only: to trust other CAs too, set `files.\".claude/settings.local.json\".json.env.NODE_EXTRA_CA_CERTS` to a bundle yourself.";
-    };
-    envFiles = mkOption {
-      type = types.listOf types.str;
-      default = if config.dotenv.enable then lib.toList config.dotenv.filename else [ ".env.local" ];
-      defaultText = lib.literalExpression ''if dotenv.enable then dotenv.filename else [ ".env.local" ]'';
-      description = "Files, relative to each checkout, with the checkout's own variables: read on every start of anything in it and applied last (later files win). A new worktree starts with a copy of the primary's.";
-    };
-    lsp = mkOption {
-      type = types.attrsOf (types.listOf types.str);
-      default = { };
-      example = {
-        elixir = [
-          "dexter"
-          "lsp"
-        ];
-      };
-      description = "Language servers to run behind `lazy-cow-tree lsp` (one per worktree); adds `lazy-cow-tree-lsp-<name>` commands for Claude Code's lspServers.";
     };
   };
 
@@ -740,17 +917,16 @@ in
       postgres
       cfg.redis
     ]
-    ++ lib.mapAttrsToList (
-      name: cmd:
-      pkgs.writeShellScriptBin "lazy-cow-tree-lsp-${name}" ''
-        exec ${exe} lsp -- ${lib.escapeShellArgs cmd} "$@"
-      ''
-    ) cfg.lsp;
+    ++ lib.optionals cfg.git.enable [
+      (lib.hiPrio gitWrapper)
+      cfg.git.package
+    ]
+    ++ lib.mapAttrsToList (_: s: lib.hiPrio (lspWrapper s.cmd)) lspServers;
 
     env = {
       LAZY_COW_TREE_PORT = toString cfg.port;
       LAZY_COW_TREE_SERVICES = builtins.toJSON cfg.services;
-      LAZY_COW_TREE_PREVIEW_TTL_HOURS = toString cfg.previewTtlHours;
+      LAZY_COW_TREE_NO_AUTO_REMOVE = lib.boolToString (!cfg.autoRemoveMerged);
       LAZY_COW_TREE_RAMDISK_MB = toString cfg.postgres.ramdiskMB;
       LAZY_COW_TREE_POSTGRES_BIN = "${postgres}/bin";
       LAZY_COW_TREE_POSTGRES_SETTINGS = builtins.toJSON cfg.postgres.settings;
@@ -764,7 +940,6 @@ in
       LAZY_COW_TREE_POSTGRES_TEMPLATE_REFRESH = pgCfg.copyOnWrite.refresh;
       LAZY_COW_TREE_REDIS_INSTANCE = redisCfg.instance;
       LAZY_COW_TREE_REDIS_START = redisCfg.start.on;
-      LAZY_COW_TREE_ENV_FILES = builtins.toJSON cfg.envFiles;
     }
     // lib.optionalAttrs (pgCfg.start.idleTimeout != null) {
       LAZY_COW_TREE_POSTGRES_IDLE_TIMEOUT = toString (seconds pgCfg.start.idleTimeout);
@@ -790,9 +965,67 @@ in
 
     processes.lazy-cow-tree.exec = "${exe} serve";
 
-    enterShell = ''
-      eval "$(${exe} env)"
-    '';
+    enterShell =
+      if cfg.shellHook.enable then
+        ''
+          # env.BASH_ENV is filtered out by devenv, so exported here. Keeps the user's own
+          # BASH_ENV / ZDOTDIR (the hook and zdotdir run them), unless already ours.
+          if [ "''${BASH_ENV:-}" != ${shellHook} ]; then
+            export LAZY_COW_TREE_BASH_ENV=''${BASH_ENV:-}
+            export BASH_ENV=${shellHook}
+          fi
+          if [ "''${ZDOTDIR:-}" != ${zdotdir} ]; then
+            export LAZY_COW_TREE_ZDOTDIR=''${ZDOTDIR:-$HOME}
+            export ZDOTDIR=${zdotdir}
+          fi
+          . ${shellHook}
+        ''
+      else
+        ''
+          eval "$(${exe} shell-hook)"
+        '';
+
+    # First codex in PATH that isn't this wrapper (its `$0` is the inner script).
+    scripts.codex = lib.mkIf cfg.codex.noDaemon {
+      exec = ''
+        for c in $(type -ap codex); do
+          grep -qs codex-script "$c" || exec "$c" --no-daemon "$@"
+        done
+        echo "codex not found in PATH" >&2
+        exit 127
+      '';
+      description = "codex --no-daemon (lazy-cow-tree.codex.noDaemon)";
+    };
+
+    # Codex has no LSP client: each language server as an MCP server, through its
+    # wrapper by path (Codex gives MCP servers only PATH, HOME and a few more).
+    files.".codex/config.toml".toml.mcp_servers = lib.mkIf (cfg.codex.lsp && lspServers != { }) (
+      lib.mapAttrs' (
+        name: s:
+        lib.nameValuePair "lsp-${name}" {
+          command = lib.getExe cfg.codex.mcpLanguageServer;
+          args = [
+            "--workspace"
+            config.devenv.root
+            "--lsp"
+            (lspWrapperPath s)
+            "--"
+          ]
+          ++ s.args;
+        }
+      ) lspServers
+    );
+
+    # Claude Code runs language servers from plugins only: ours, from a local marketplace.
+    files.".claude/settings.local.json".json.extraKnownMarketplaces = lib.mkIf claudeLsp {
+      lazy-cow-tree.source = {
+        source = "directory";
+        path = "${claudeMarketplace}";
+      };
+    };
+    files.".claude/settings.local.json".json.enabledPlugins = lib.mkIf claudeLsp {
+      "lazy-cow-tree-lsp@lazy-cow-tree" = true;
+    };
 
     # Node (Claude Code) ignores the keychain `lazy-cow-tree trust` writes to.
     files.".claude/settings.local.json".json.env = lib.mkIf (cfg.claude.trustCa && cfg.home != null) {
