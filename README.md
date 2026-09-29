@@ -284,7 +284,9 @@ $ open "$LAZY_COW_TREE_URL"                    # https://fix-login.web.myapp.loc
 ```
 
 Another project the daemon registered gets its own; outside them, values it
-overrode are restored and the rest unset. How: `BASH_ENV` (every non-interactive
+overrode are restored and the rest unset. In a worktree, DEVENV_ROOT, DEVENV_STATE and every other variable
+of the devenv shell that names a path in the primary point into the worktree instead, as
+for the services run there, so scripts using `$DEVENV_ROOT` act on the checkout you're in. How: `BASH_ENV` (every non-interactive
 bash) and `ZDOTDIR` (every zsh; Codex runs commands with `zsh -lc`) source a hook
 that defines the `cd`/`pushd`/`popd` wrappers and runs `lazy-cow-tree shell-hook`
 (hidden command, ~10 ms), which also records in `LAZY_COW_TREE_SHELL` what it set. Your own

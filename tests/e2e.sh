@@ -166,6 +166,9 @@ base=$(env_of "$wt" PORT)
 [[ $LAZY_COW_TREE_WEB_DEBUGGER_URL == https://feat-a.debugger.demo.localhost:8443 ]] ||
   fail "LAZY_COW_TREE_WEB_DEBUGGER_URL=$LAZY_COW_TREE_WEB_DEBUGGER_URL"
 pass "named ports in env: DEBUGGER_PORT=$DEBUGGER_PORT TEST_PORT=$TEST_PORT"
+wt_root=$(DEVENV_ROOT=$(pwd -P) env_of "$wt" DEVENV_ROOT)
+[[ $wt_root == "$(cd "$wt" && pwd -P)" ]] || fail "shell hook in a worktree: DEVENV_ROOT=$wt_root"
+pass "shell hook in a worktree of the devenv project: its own DEVENV_ROOT"
 
 web_log=$(cd "$wt" && "$bin" service log -s web)
 out=$(curl_lf "https://feat-a.debugger.demo.localhost:8443/" 2>&1) || true

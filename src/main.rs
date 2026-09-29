@@ -297,13 +297,14 @@ fn hook_env(
     let Ok((root, wt, co_path)) = config::locate(path) else {
         return Vec::new();
     };
-    let ours = std::env::var_os("DEVENV_ROOT")
+    let ours = state
+        .original("DEVENV_ROOT")
         .and_then(|d| config::primary_root(Path::new(&d)).ok())
         .is_some_and(|r| r == root);
     let p = if ours {
         // The setting, not the name an earlier hook exported (maybe another project's).
         settings.name = state.original("LAZY_COW_TREE_PROJECT");
-        let mut p = Project::new(root, settings);
+        let mut p = Project::new(root.clone(), settings);
         p.env = std::env::vars().collect();
         p
     } else {
@@ -315,7 +316,39 @@ fn hook_env(
             None => return Vec::new(),
         }
     };
-    checkout_env(g, p, wt.as_deref(), co_path, service).unwrap_or_default()
+    let mut env = checkout_env(g, p, wt.as_deref(), co_path.clone(), service).unwrap_or_default();
+    if ours && wt.is_some() {
+        env.extend(worktree_devenv_env(&root, &co_path, state, &env));
+    }
+    env
+}
+
+/// In a worktree of this devenv's project: its own DEVENV_ROOT, _DOTFILE, _STATE and
+/// _RUNTIME, and every other variable of the (primary's) devenv shell naming a path in
+/// the primary checkout moved to the worktree (UV_CONSTRAINT, ...), as services run
+/// there get them (`server::command`); `set` (the checkout's own) wins.
+fn worktree_devenv_env(
+    root: &Path,
+    worktree: &Path,
+    state: &ShellState,
+    set: &[(String, String)],
+) -> Vec<(String, String)> {
+    let skip = |k: &str| {
+        matches!(k, "PWD" | "OLDPWD" | "_" | SHELL_STATE) || set.iter().any(|(s, _)| s == k)
+    };
+    let devenv = server::devenv_vars(worktree);
+    let mut out: Vec<(String, String)> = std::env::vars()
+        .map(|(k, _)| k)
+        .filter(|k| !skip(k) && !devenv.iter().any(|(d, _)| d == k))
+        .filter_map(|k| {
+            let original = state.original(&k)?;
+            let moved = config::rewrite_root(&original, root, worktree);
+            (moved != original).then_some((k, moved))
+        })
+        .collect();
+    out.sort();
+    out.extend(devenv);
+    out
 }
 
 fn project_for(path: &Path, settings: ProjectSettings) -> Result<Project> {
