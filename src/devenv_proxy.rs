@@ -1,7 +1,7 @@
 //! Stands in for devenv's shared `devenv-proxy`: the same control socket and wire
 //! protocol, so `devenv up` in a project with `process.proxy.enable` registers its
 //! routes here instead of starting a second proxy that can't bind ports 80/443.
-//! Requests for those hosts go through localforest's own listeners (proxy.rs).
+//! Requests for those hosts go through lazy-cow-tree's own listeners (proxy.rs).
 
 use std::{
     collections::BTreeMap,
@@ -93,7 +93,7 @@ impl Registered {
     }
 }
 
-/// Whether localforest itself serves a hostname; devenv can't take those.
+/// Whether lazy-cow-tree itself serves a hostname; devenv can't take those.
 pub type Reserved = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// Routes registered by devenv projects: hostname -> loopback upstream, per owner.
@@ -132,7 +132,7 @@ impl DevenvRoutes {
         owner: &str,
     ) -> Result<()> {
         if (self.reserved)(hostname) {
-            bail!("hostname {hostname} is served by localforest");
+            bail!("hostname {hostname} is served by lazy-cow-tree");
         }
         if map
             .get(hostname)
@@ -259,7 +259,7 @@ pub fn normalize_hostname(hostname: &str) -> Result<String> {
     Ok(hostname)
 }
 
-/// The project's mkcert certificate for `hostname`, served instead of localforest's
+/// The project's mkcert certificate for `hostname`, served instead of lazy-cow-tree's
 /// CA: the browser trusts that project's CA for it.
 fn load_certificate(tls: &TlsConfig, hostname: &str) -> Result<CertifiedKey> {
     let chain = CertificateDer::pem_file_iter(&tls.certificate)
@@ -347,7 +347,7 @@ async fn prepare_socket(socket: &Path) -> Result<()> {
     }
     if UnixStream::connect(socket).await.is_ok() {
         bail!(
-            "a proxy is already listening on {}; stop devenv's own proxy so localforest can serve its routes",
+            "a proxy is already listening on {}; stop devenv's own proxy so lazy-cow-tree can serve its routes",
             socket.display()
         );
     }
@@ -469,12 +469,12 @@ mod tests {
     }
 
     #[test]
-    fn localforest_hosts_and_non_local_routes_are_refused() {
+    fn lazy_cow_tree_hosts_and_non_local_routes_are_refused() {
         let t = DevenvRoutes::new(Arc::new(|h| h == "web.app.localhost"), None);
         let e = t
             .register(route("web.app.localhost", 3000, "x"))
             .unwrap_err();
-        assert!(e.to_string().contains("served by localforest"), "{e}");
+        assert!(e.to_string().contains("served by lazy-cow-tree"), "{e}");
         assert!(t.register(route("example.com", 3000, "x")).is_err());
         let mut public = route("web.x.localhost", 3000, "x");
         public.upstream = SocketAddr::from(([192, 0, 2, 1], 3000));

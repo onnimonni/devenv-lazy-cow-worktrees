@@ -1,5 +1,5 @@
 //! Removed worktrees, remembered in the main checkout's git dir
-//! (`.git/localforest/worktrees.json`, shared by every worktree, never committed), so a
+//! (`.git/lazy-cow-tree/worktrees.json`, shared by every worktree, never committed), so a
 //! request to a removed worktree's hostname can explain why it's gone and bring it
 //! back as a preview. Also links to the forge (GitHub, GitLab, …) the remote is on.
 
@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 pub enum Reason {
     /// Its pull request merged (auto-removed, or `worktree rm` proved it).
     Merged,
-    /// `localforest worktree rm` (or Claude Code's WorktreeRemove hook).
+    /// `lazy-cow-tree worktree rm` (or Claude Code's WorktreeRemove hook).
     Removed,
     /// Its directory was deleted by hand.
     Deleted,
@@ -64,7 +64,7 @@ pub struct History {
 fn path(root: &Path) -> Result<PathBuf> {
     Ok(Repository::open(root)?
         .commondir()
-        .join("localforest/worktrees.json"))
+        .join("lazy-cow-tree/worktrees.json"))
 }
 
 /// Last activity per checkout id (unix seconds), in memory: HTTPS requests to its

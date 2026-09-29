@@ -6,7 +6,7 @@
 }:
 
 rustPlatform.buildRustPackage {
-  pname = "localforest";
+  pname = "lazy-cow-tree";
   version = (lib.importTOML ./Cargo.toml).package.version;
 
   src = lib.fileset.toSource {
@@ -28,14 +28,14 @@ rustPlatform.buildRustPackage {
   # Tests create git repositories and worktrees; `cargo test` in devenv runs them.
   doCheck = false;
 
-  # DEVENV_PROXY_BINARY takes one path: this name runs `localforest devenv-proxy`.
+  # DEVENV_PROXY_BINARY takes one path: this name runs `lazy-cow-tree devenv-proxy`.
   postInstall = ''
-    ln -s localforest $out/bin/localforest-devenv-proxy
+    ln -s lazy-cow-tree $out/bin/lazy-cow-tree-devenv-proxy
   '';
 
   meta = {
     description = "Worktrees, databases, HTTPS hosts, Redis and LSP for parallel coding agents";
-    mainProgram = "localforest";
+    mainProgram = "lazy-cow-tree";
     platforms = lib.platforms.unix;
   };
 }

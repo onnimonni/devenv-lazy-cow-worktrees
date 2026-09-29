@@ -1,5 +1,6 @@
 //! One PostgreSQL cluster for every project and worktree, on the RAM disk. Disposable
-//! dev/test data: fsync and friends are off. Every copy of a template runs
+//! dev/test data: fsync and friends are off; a durable cluster
+//! (`LAZY_COW_TREE_POSTGRES_DURABLE`) lives on disk with them on. Every copy of a template runs
 //! `SET file_copy_method = clone` + `CREATE DATABASE ... STRATEGY FILE_COPY`
 //! (PostgreSQL 18+), a copy-on-write clone of the files (clonefile on APFS,
 //! copy_file_range reflinks on btrfs/XFS), so a worktree's database is ready in
@@ -19,6 +20,33 @@ pub struct Postgres {
     /// Set in the session of every CREATE DATABASE from a template: `clone` unless
     /// `file_copy_method` is in the project's postgres settings.
     file_copy_method: String,
+}
+
+/// postgresql.conf settings lazy-cow-tree starts a cluster with (the project's come
+/// after and win).
+fn cluster_settings(
+    dir: &std::path::Path,
+    port: u16,
+    durable: bool,
+) -> Vec<(&'static str, String)> {
+    let mut settings = vec![
+        // Unix socket only: clients come through lazy-cow-tree's proxy (pgproxy.rs).
+        ("listen_addresses", String::new()),
+        ("port", port.to_string()),
+        ("unix_socket_directories", dir.display().to_string()),
+        ("max_connections", "500".into()),
+    ];
+    if !durable {
+        settings.extend([
+            ("fsync", "off".into()),
+            ("synchronous_commit", "off".into()),
+            ("full_page_writes", "off".into()),
+            // The default max_wal_size (1 GB) would crowd the RAM disk.
+            ("min_wal_size", "32MB".into()),
+            ("max_wal_size", "256MB".into()),
+        ]);
+    }
+    settings
 }
 
 /// `name` in PATH, like a shell would find it (but without one).
@@ -49,16 +77,23 @@ impl Postgres {
         self.dir.join(format!(".s.PGSQL.{}", self.port))
     }
 
-    /// Start the cluster listening on `dir/.s.PGSQL.<port>` only.
+    /// Start the cluster listening on `dir/.s.PGSQL.<port>` only: on the RAM disk
+    /// with fsync, synchronous_commit and full_page_writes off, or `durable` in a
+    /// plain directory with PostgreSQL's defaults.
     pub async fn start(
         dir: PathBuf,
         port: u16,
         ramdisk_mb: u64,
+        durable: bool,
         bin: Option<PathBuf>,
         extra: Vec<(String, String)>,
     ) -> Result<Self> {
         let d = dir.clone();
-        tokio::task::spawn_blocking(move || crate::ramdisk::ensure(&d, ramdisk_mb)).await??;
+        if durable {
+            std::fs::create_dir_all(&d)?;
+        } else {
+            tokio::task::spawn_blocking(move || crate::ramdisk::ensure(&d, ramdisk_mb)).await??;
+        }
         let file_copy_method = match extra.iter().find(|(k, _)| k == "file_copy_method") {
             None => "clone".to_string(),
             Some((_, v)) if v == "clone" || v == "copy" => v.clone(),
@@ -98,11 +133,11 @@ impl Postgres {
                 .args([
                     "--username=postgres",
                     "--auth=trust",
-                    "--no-sync",
                     "--no-instructions",
                     "--encoding=UTF8",
                     "--locale=C",
                 ])
+                .args((!durable).then_some("--no-sync"))
                 .output()
                 .await
                 .context("running initdb")?;
@@ -116,19 +151,7 @@ impl Postgres {
             .parse()
             .unwrap_or(0);
 
-        let mut settings = vec![
-            // Unix socket only: clients come through localforest's proxy (pgproxy.rs).
-            ("listen_addresses", String::new()),
-            ("port", port.to_string()),
-            ("unix_socket_directories", pg.dir.display().to_string()),
-            ("fsync", "off".into()),
-            ("synchronous_commit", "off".into()),
-            ("full_page_writes", "off".into()),
-            ("max_connections", "500".into()),
-            // The default max_wal_size (1 GB) would crowd the RAM disk.
-            ("min_wal_size", "32MB".into()),
-            ("max_wal_size", "256MB".into()),
-        ];
+        let mut settings = cluster_settings(&pg.dir, port, durable);
         if version >= 18 {
             // Also the server default, for CREATE DATABASE run by apps and tools.
             settings.push(("file_copy_method", pg.file_copy_method.clone()));
@@ -141,7 +164,7 @@ impl Postgres {
         for (k, v) in &settings {
             cmd.arg("-c").arg(format!("{k}={v}"));
         }
-        // The project's (localforest.postgres.settings) come last and win.
+        // The project's (lazy-cow-tree.postgres.settings) come last and win.
         for (k, v) in &extra {
             cmd.arg("-c").arg(format!("{k}={v}"));
         }

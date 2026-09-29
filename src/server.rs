@@ -1,7 +1,7 @@
-//! Checkout services (`localforest.services`): each runs its command with the service's
+//! Checkout services (`lazy-cow-tree.services`): each runs its command with the service's
 //! env (PORT, hostname, database, Redis) in its own process group. An http service is
 //! started by the first request to its https://…localhost hostname that finds nothing
-//! listening (or `localforest service start`), after the services it depends on; all of
+//! listening (or `lazy-cow-tree service start`), after the services it depends on; all of
 //! them are killed (whole group, SIGKILL) with the checkout. `restart` restarts one
 //! that exits on its own; `restartOnPull` one whose checkout pulled the base branch.
 //! `restartOnChange` restarts a running one when the content of files in its `cwd`
@@ -23,37 +23,140 @@ use notify::{RecursiveMode, Watcher};
 use tokio::{net::TcpStream, process::Child, sync::Mutex};
 use tracing::{info, warn};
 
+use sha2::Digest;
+
 use crate::config::{self, Checkout, Global, Project, Restart, Service};
 
-/// `cmdline` split like a shell would, run directly (no shell) in `cwd` with the
-/// registering project's environment (its PATH finds the program) plus `env`.
+/// `cmdline` split like a shell would, run directly (no shell) in `cwd` of the
+/// checkout at `checkout` with the registering project's environment (its PATH finds
+/// the program), then `env`, then the checkout's env files (`Project::env_files`).
+/// In a worktree the project environment was captured in the primary checkout, so
+/// its paths into the primary move to the worktree (`config::rewrite_root`: env values,
+/// arguments, `cwd`, and a script whose text names the primary runs as a rewritten
+/// copy), and DEVENV_ROOT / _DOTFILE / _STATE / _RUNTIME are the worktree's.
+/// devenv's own postgres/redis state, exported into the captured project env even
+/// though lazy-cow-tree serves them (the module keeps `services.*.enable` readable): a
+/// process pointing at the primary's data directory would bypass lazy-cow-tree.
+const DEVENV_SERVICE_STATE: &[&str] = &["PGDATA", "REDISDATA"];
+
 pub fn command(
     project: &Project,
+    checkout: &Path,
     cmdline: &str,
     cwd: &Path,
     env: Vec<(String, String)>,
 ) -> Result<tokio::process::Command> {
+    let root = project.root.as_path();
+    let worktree = checkout != root;
+    let rw = |s: &str| {
+        if worktree {
+            config::rewrite_root(s, root, checkout)
+        } else {
+            s.to_string()
+        }
+    };
+    let (file_vars, primary_only) = config::env_file_vars(root, checkout, &project.env_files());
+    let base: Vec<(String, String)> = project
+        .env
+        .iter()
+        .filter(|(k, _)| !primary_only.contains(k) && !DEVENV_SERVICE_STATE.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), rw(v)))
+        .collect();
     let argv = shell_words::split(cmdline)?;
     let (prog, args) = argv.split_first().context("empty command")?;
-    let program = project
-        .env
+    let prog = rw(prog);
+    let program = base
         .iter()
         .find(|(k, _)| k == "PATH")
         .filter(|_| !prog.contains('/'))
         .and_then(|(_, path)| {
             std::env::split_paths(path)
-                .map(|d| d.join(prog))
+                .map(|d| d.join(&prog))
                 .find(|p| p.is_file())
         })
-        .unwrap_or_else(|| PathBuf::from(prog));
+        .unwrap_or_else(|| PathBuf::from(&prog));
+    let program = if worktree {
+        rewritten_script(&program, root, checkout, &config::home().join("scripts"))
+            .unwrap_or(program)
+    } else {
+        program
+    };
     let mut c = tokio::process::Command::new(program);
-    c.args(args)
-        .current_dir(cwd)
+    c.args(args.iter().map(|a| rw(a)))
+        .current_dir(rw(&cwd.to_string_lossy()))
         .env_clear()
-        .envs(project.env.iter().cloned())
-        .envs(env)
+        .envs(base)
+        .envs(env.into_iter().map(|(k, v)| {
+            let v = rw(&v);
+            (k, v)
+        }))
         .stdin(Stdio::null());
+    if worktree {
+        c.envs(devenv_vars(checkout));
+    }
+    for (k, _) in &file_vars {
+        if config::RESERVED_ENV.contains(&k.as_str()) || k.starts_with("LAZY_COW_TREE_") {
+            warn_once(checkout, k);
+        }
+    }
+    c.envs(file_vars);
     Ok(c)
+}
+
+/// DEVENV_* of a worktree: its own root, state and a short runtime dir (unix
+/// sockets must fit 104 bytes).
+pub fn devenv_vars(checkout: &Path) -> Vec<(String, String)> {
+    let h = hex::encode(&sha2::Sha256::digest(checkout.to_string_lossy().as_bytes())[..4]);
+    let runtime = PathBuf::from("/tmp").join(format!("lazy-cow-tree-{h}"));
+    let _ = std::fs::create_dir_all(&runtime);
+    let dotfile = checkout.join(".devenv");
+    vec![
+        ("DEVENV_ROOT".into(), checkout.display().to_string()),
+        ("DEVENV_DOTFILE".into(), dotfile.display().to_string()),
+        (
+            "DEVENV_STATE".into(),
+            dotfile.join("state").display().to_string(),
+        ),
+        ("DEVENV_RUNTIME".into(), runtime.display().to_string()),
+    ]
+}
+
+/// A script (devenv's `exec` compiled to a store file) whose text names the primary
+/// checkout: a copy for `checkout` in `dir` (`<home>/scripts`), content-addressed.
+fn rewritten_script(program: &Path, root: &Path, checkout: &Path, dir: &Path) -> Option<PathBuf> {
+    let meta = std::fs::metadata(program).ok()?;
+    if !meta.is_file() || meta.len() > 1 << 20 {
+        return None;
+    }
+    let text = String::from_utf8(std::fs::read(program).ok()?).ok()?;
+    let new = config::rewrite_root(&text, root, checkout);
+    if new == text {
+        return None;
+    }
+    let h = hex::encode(&sha2::Sha256::digest(new.as_bytes())[..8]);
+    let name = program.file_name()?.to_string_lossy();
+    let path = dir.join(format!("{h}-{name}"));
+    if !path.exists() {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path.parent()?).ok()?;
+        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+        std::fs::write(&tmp, &new).ok()?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).ok()?;
+        std::fs::rename(&tmp, &path).ok()?;
+    }
+    Some(path)
+}
+
+/// Warn once per checkout and key that an env file overrides a lazy-cow-tree variable.
+fn warn_once(checkout: &Path, key: &str) {
+    static SEEN: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
+    let k = format!("{}\0{key}", checkout.display());
+    if SEEN.lock().unwrap().insert(k) {
+        warn!(
+            "{}: an env file overrides {key}, which lazy-cow-tree sets",
+            checkout.display()
+        );
+    }
 }
 
 /// Log of a service (`Checkout::service_id`) or a migrate run.
@@ -63,6 +166,37 @@ pub fn log_path(id: &str) -> PathBuf {
 
 async fn listening(port: u16) -> bool {
     TcpStream::connect(("127.0.0.1", port)).await.is_ok()
+}
+
+/// GET `path` on 127.0.0.1:`port` answers 2xx or 3xx (2 s at most).
+pub async fn http_ready(port: u16, path: &str) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let probe = async {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).await.ok()?;
+        s.write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .ok()?;
+        let mut buf = [0u8; 16];
+        let mut n = 0;
+        while n < 12 {
+            let r = s.read(&mut buf[n..]).await.ok()?;
+            if r == 0 {
+                break;
+            }
+            n += r;
+        }
+        let head = std::str::from_utf8(&buf[..n]).ok()?;
+        let code: u16 = head.strip_prefix("HTTP/1.")?.get(2..5)?.parse().ok()?;
+        Some((200..400).contains(&code))
+    };
+    tokio::time::timeout(Duration::from_secs(2), probe)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false)
 }
 
 /// A running service and what it takes to start it again.
@@ -301,13 +435,19 @@ fn spawn(project: &Project, c: &Checkout, name: &str, g: &Global, append: bool) 
         .cwd
         .as_ref()
         .map_or_else(|| c.path.clone(), |d| c.path.join(d));
-    let child = command(project, &svc.exec, &cwd, c.service_env(g, Some(name)))?
-        .stdout(log.try_clone()?)
-        .stderr(log)
-        // Own group: removal kills it and every watcher it started.
-        .process_group(0)
-        .spawn()
-        .with_context(|| format!("starting {id}: `{}`", svc.exec))?;
+    let child = command(
+        project,
+        &c.path,
+        &svc.exec,
+        &cwd,
+        c.service_env(g, Some(name)),
+    )?
+    .stdout(log.try_clone()?)
+    .stderr(log)
+    // Own group: removal kills it and every watcher it started.
+    .process_group(0)
+    .spawn()
+    .with_context(|| format!("starting {id}: `{}`", svc.exec))?;
     info!(
         "{id}: started `{}` (port {})",
         svc.exec,
@@ -326,6 +466,7 @@ fn kill_group(child: &Child) {
 /// (appended to with `append`); 15 minutes at most.
 pub async fn run_logged(
     project: &Project,
+    checkout: &Path,
     id: &str,
     cmd: &str,
     cwd: &Path,
@@ -342,7 +483,7 @@ pub async fn run_logged(
         .open(&log_path)?;
     info!("{id}: running `{cmd}`");
     let t = Instant::now();
-    let status = command(project, cmd, cwd, env)?
+    let status = command(project, checkout, cmd, cwd, env)?
         .stdout(log.try_clone()?)
         .stderr(log)
         .kill_on_drop(true)
@@ -368,7 +509,7 @@ async fn run_setup(project: &Project, c: &Checkout, g: &Global) {
         return;
     };
     let id = c.run_id("setup");
-    if let Err(e) = run_logged(project, &id, cmd, &c.path, c.env(g), true).await {
+    if let Err(e) = run_logged(project, &c.path, &id, cmd, &c.path, c.env(g), true).await {
         warn!("{e:#}");
     }
 }
@@ -691,8 +832,18 @@ impl Servers {
         if !svc.http {
             return Ok(());
         }
-        for _ in 0..1800 {
-            if listening(port).await {
+        // Its `ready` probe, else listening; 3 minutes (first compiles are slow).
+        let limit = svc
+            .ready
+            .as_ref()
+            .map_or(Duration::from_secs(180), |r| Duration::from_secs(r.timeout));
+        let t = Instant::now();
+        while t.elapsed() < limit {
+            let up = match &svc.ready {
+                Some(r) => http_ready(port, &r.path).await,
+                None => listening(port).await,
+            };
+            if up {
                 return Ok(());
             }
             if let Some(p) = self.procs.lock().await.get_mut(&id)
@@ -703,7 +854,34 @@ impl Servers {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        bail!("{id} did not listen on port {port} within 3 minutes")
+        match &svc.ready {
+            Some(r) => bail!(
+                "{id} was not ready (GET {} on port {port}) within {} s",
+                r.path,
+                r.timeout
+            ),
+            None => bail!("{id} did not listen on port {port} within 3 minutes"),
+        }
+    }
+
+    /// Running services with an `idleTimeout`: (id, checkout, name, started, timeout).
+    pub async fn idle_candidates(&self) -> Vec<(String, Checkout, String, Instant, Duration)> {
+        let mut procs = self.procs.lock().await;
+        procs
+            .iter_mut()
+            .filter_map(|(id, p)| {
+                let t = p.checkout.service(&p.name)?.idle_timeout?;
+                p.alive().then(|| {
+                    (
+                        id.clone(),
+                        p.checkout.clone(),
+                        p.name.clone(),
+                        p.started,
+                        Duration::from_secs(t),
+                    )
+                })
+            })
+            .collect()
     }
 
     /// Apply `restart` policies: called every second. An exited service with
@@ -840,6 +1018,136 @@ fn visit(
 mod tests {
     use super::*;
     use crate::config::Services;
+
+    /// A one-shot HTTP server answering every connection with `status`.
+    async fn answer(status: u16) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                let mut buf = [0u8; 256];
+                let _ = s.read(&mut buf).await;
+                let _ = s
+                    .write_all(
+                        format!("HTTP/1.1 {status} X\r\ncontent-length: 0\r\n\r\n").as_bytes(),
+                    )
+                    .await;
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn ready_probe() {
+        assert!(http_ready(answer(200).await, "/readyz").await);
+        assert!(http_ready(answer(302).await, "/").await);
+        assert!(!http_ready(answer(503).await, "/").await);
+        // Nothing listening.
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        assert!(!http_ready(port, "/").await);
+    }
+
+    #[test]
+    fn scripts_naming_the_primary_run_as_rewritten_copies() {
+        let d = tempfile::tempdir().unwrap();
+        let (root, wt) = (
+            Path::new("/src/app"),
+            Path::new("/src/app/.claude/worktrees/wt"),
+        );
+        let script = d.path().join("lazy-cow-tree-web");
+        std::fs::write(&script, "#!/bin/sh\ncd /src/app/api\nexec mix phx.server\n").unwrap();
+        let out = d.path().join("scripts");
+        let copy = rewritten_script(&script, root, wt, &out).unwrap();
+        assert!(copy.starts_with(&out));
+        assert_eq!(
+            std::fs::read_to_string(&copy).unwrap(),
+            "#!/bin/sh\ncd /src/app/.claude/worktrees/wt/api\nexec mix phx.server\n"
+        );
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&copy).unwrap().permissions().mode() & 0o111,
+            0o111
+        );
+        // Same content: same copy.
+        assert_eq!(rewritten_script(&script, root, wt, &out), Some(copy));
+        // Nothing to rewrite: runs as is.
+        std::fs::write(&script, "#!/bin/sh\nexec true\n").unwrap();
+        assert_eq!(rewritten_script(&script, root, wt, &out), None);
+    }
+
+    #[test]
+    fn worktree_commands_get_its_paths_devenv_vars_and_env_files() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("app");
+        let wt = root.join(".claude/worktrees/wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(root.join(".env.local"), "FROM_PRIMARY=1\nSHARED=primary\n").unwrap();
+        std::fs::write(wt.join(".env.local"), "SHARED=wt\nPORT=1\n").unwrap();
+        let mut project = Project::new(
+            root.clone(),
+            serde_json::from_value(serde_json::json!({
+                "name": "app", "port": 4000, "remote": "origin", "base": null,
+                "worktrees_dir": ".claude/worktrees",
+                "migrate": null, "seed": null, "setup": null, "services": {},
+                "preview_ttl_hours": 48, "no_sync": false, "no_auto_remove": false
+            }))
+            .unwrap(),
+        );
+        let r = root.display().to_string();
+        project.env = vec![
+            ("PATH".into(), format!("{r}/bin:/usr/bin:/bin")),
+            ("DEVENV_ROOT".into(), r.clone()),
+            ("FROM_PRIMARY".into(), "1".into()),
+            ("LAZY_COW_TREE_ENV_FILES".into(), r#"[".env.local"]"#.into()),
+            ("PGDATA".into(), format!("{r}/.devenv/state/postgres")),
+            ("REDISDATA".into(), format!("{r}/.devenv/state/redis")),
+        ];
+        let cmd = command(
+            &project,
+            &wt,
+            "echo hi",
+            &root.join("api"),
+            vec![
+                ("PORT".into(), "20000".into()),
+                ("CFG".into(), format!("{r}/config")),
+            ],
+        )
+        .unwrap();
+        let std = cmd.as_std();
+        let env: BTreeMap<String, String> = std
+            .get_envs()
+            .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v?.to_str()?.to_string())))
+            .collect();
+        let w = wt.display().to_string();
+        assert_eq!(std.get_current_dir(), Some(wt.join("api").as_path()));
+        assert_eq!(env["PATH"], format!("{w}/bin:/usr/bin:/bin"));
+        assert_eq!(env["DEVENV_ROOT"], w);
+        assert_eq!(env["DEVENV_STATE"], format!("{w}/.devenv/state"));
+        assert!(env["DEVENV_RUNTIME"].starts_with("/tmp/lazy-cow-tree-"));
+        assert_eq!(env["CFG"], format!("{w}/config"));
+        // Env files come last: over the derived PORT too.
+        assert_eq!(env["SHARED"], "wt");
+        assert_eq!(env["PORT"], "1");
+        // Only the primary's file set it: gone in the worktree.
+        assert!(!env.contains_key("FROM_PRIMARY"));
+        // devenv's own postgres/redis state never reaches what lazy-cow-tree runs.
+        assert!(!env.contains_key("PGDATA") && !env.contains_key("REDISDATA"));
+
+        // The primary keeps its paths and its own file's values.
+        let cmd = command(&project, &root, "echo hi", &root, vec![]).unwrap();
+        let env: BTreeMap<String, String> = cmd
+            .as_std()
+            .get_envs()
+            .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v?.to_str()?.to_string())))
+            .collect();
+        assert_eq!(env["DEVENV_ROOT"], r);
+        assert_eq!(env["SHARED"], "primary");
+        assert_eq!(env["FROM_PRIMARY"], "1");
+        let _ = std::fs::remove_dir(&devenv_vars(&wt)[3].1);
+    }
 
     #[test]
     fn dependencies_first() {

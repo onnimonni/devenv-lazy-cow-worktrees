@@ -28,14 +28,14 @@ jobs:
       - run: cargo build --release --locked --features vendored-openssl --target ${{ matrix.target }}
       - name: Package
         run: |
-          name=localforest-${GITHUB_REF_NAME}-${{ matrix.target }}
+          name=lazy-cow-tree-${GITHUB_REF_NAME}-${{ matrix.target }}
           mkdir "$name"
-          cp target/${{ matrix.target }}/release/localforest README.md LICENSE "$name/"
+          cp target/${{ matrix.target }}/release/lazy-cow-tree README.md LICENSE "$name/"
           tar czf "$name.tar.gz" "$name"
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            localforest-*.tar.gz
-            localforest-*.tar.gz.sha256
+            lazy-cow-tree-*.tar.gz
+            lazy-cow-tree-*.tar.gz.sha256
           generate_release_notes: true

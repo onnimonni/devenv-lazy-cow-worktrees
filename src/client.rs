@@ -16,7 +16,7 @@ pub async fn request<T: DeserializeOwned>(
     let socket = crate::config::socket_path();
     let stream = UnixStream::connect(&socket).await.with_context(|| {
         format!(
-            "localforest is not running ({}); start it with `localforest serve` (devenv up)",
+            "lazy-cow-tree is not running ({}); start it with `lazy-cow-tree serve` (devenv up)",
             socket.display()
         )
     })?;
@@ -31,7 +31,7 @@ pub async fn request<T: DeserializeOwned>(
     let req = Request::builder()
         .method(method)
         .uri(path)
-        .header("host", "localforest")
+        .header("host", "lazy-cow-tree")
         .header("content-type", "application/json")
         .body(Full::new(body))?;
     let resp = sender.send_request(req).await?;

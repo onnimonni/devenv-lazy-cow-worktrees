@@ -13,7 +13,7 @@
 //!   primary checkout and the template is refreshed from its database; worktrees whose PR merged are removed (their
 //!   processes killed)
 //!
-//! `localforest serve` in any project either becomes the daemon or registers its project
+//! `lazy-cow-tree serve` in any project either becomes the daemon or registers its project
 //! with the running one, then takes over if that one goes away.
 
 use std::{
@@ -41,7 +41,7 @@ use tokio::{net::UnixListener, sync::Notify, task::JoinHandle};
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    config::{self, Checkout, Global, Project},
+    config::{self, Checkout, Global, Project, StartMode},
     github, history,
     postgres::Postgres,
     proxy::{self, Routes},
@@ -66,6 +66,9 @@ pub struct Daemon {
     activity: history::Activity,
     projects: Mutex<BTreeMap<PathBuf, Arc<ProjectRt>>>,
     shutdown: Notify,
+    /// Checkouts (by project root) whose `start = "up"` services to start, drained
+    /// every second.
+    up_queue: Mutex<Vec<(PathBuf, Checkout)>>,
 }
 
 #[derive(Default)]
@@ -140,6 +143,8 @@ struct ProjectRt {
     ws_ok: AtomicBool,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     watcher: Mutex<Option<notify::RecommendedWatcher>>,
+    /// The primary's `start = "up"` services were queued.
+    up_queued: AtomicBool,
 }
 
 impl ProjectRt {
@@ -274,7 +279,7 @@ pub struct ServiceStatus {
     pub name: String,
     pub url: Option<String>,
     pub port: u16,
-    /// Started by localforest and running.
+    /// Started by lazy-cow-tree and running.
     pub running: bool,
 }
 
@@ -355,7 +360,7 @@ impl Daemon {
             .cloned()
             .ok_or_else(|| {
                 anyhow!(
-                    "{} is not registered; run `localforest serve` in it",
+                    "{} is not registered; run `lazy-cow-tree serve` in it",
                     root.display()
                 )
             })
@@ -388,6 +393,11 @@ impl Daemon {
         }
         Repository::open(&root)
             .with_context(|| format!("{} is not a git checkout", root.display()))?;
+        durability_check(
+            self.global.postgres_durable,
+            &project,
+            self.projects.lock().unwrap().values().map(|rt| &rt.project),
+        )?;
         if let Some(other) = self
             .projects
             .lock()
@@ -396,7 +406,7 @@ impl Daemon {
             .find(|p| p.project.name == project.name && p.project.root != root)
         {
             anyhow::bail!(
-                "project name {} is taken by {}; set localforest.project (LOCALFOREST_PROJECT) to another name",
+                "project name {} is taken by {}; set lazy-cow-tree.project (LAZY_COW_TREE_PROJECT) to another name",
                 project.name,
                 other.project.root.display()
             );
@@ -440,6 +450,7 @@ impl Daemon {
             ws_ok: AtomicBool::new(false),
             tasks: Mutex::new(Vec::new()),
             watcher: Mutex::new(None),
+            up_queued: AtomicBool::new(false),
         });
         // Replaces (and so stops) an older registration of the same checkout.
         self.projects
@@ -527,10 +538,12 @@ impl Daemon {
         self.adopt_databases(c)
             .await
             .with_context(|| format!("{}: handing its databases to its role", c.id()))?;
-        for (_, host, port) in c.routes() {
-            self.routes.set(host, port, c.worktree.is_some(), c.id());
+        for (svc, host, port) in c.routes() {
+            let service = svc.map(|s| c.service_id(&s));
+            self.routes
+                .set(host, port, c.worktree.is_some(), c.id(), service);
         }
-        self.redis.allow(&c.id());
+        self.redis.allow(&c.id(), &self.redis_key_of(c));
         if c.worktree.is_some() {
             let (path, env) = (c.path.clone(), c.env(&self.global));
             if let Err(e) =
@@ -668,7 +681,7 @@ impl Daemon {
             return Ok(());
         }
         let id = c.run_id("setup");
-        self.run_command(rt, &id, &cmd, &c.path, c.env(&self.global))
+        self.run_command(rt, &c.path, &id, &cmd, &c.path, c.env(&self.global))
             .await
             .context("setup failed")?;
         if let Err(e) = std::fs::write(&marker, history::now().to_string()) {
@@ -677,7 +690,7 @@ impl Daemon {
         Ok(())
     }
 
-    /// Setup in the primary checkout, which may predate localforest or its `deps/`
+    /// Setup in the primary checkout, which may predate lazy-cow-tree or its `deps/`
     /// (a fresh clone): run before its first migrate, seed or service start. Needs
     /// its migrate lock. A failure is recorded like a failed migration (status, 502
     /// page) and retried after the same backoff.
@@ -708,7 +721,11 @@ impl Daemon {
         let create = self.create_lock.lock().await;
         let template = c.template_db();
         let primary = rt.primary().dev_db();
-        let source = if self.pg.exists(&template).await? {
+        // LAZY_COW_TREE_POSTGRES_COW=0: empty, then migrated and seeded like a new
+        // primary database.
+        let source = if !rt.project.copy_on_write() {
+            None
+        } else if self.pg.exists(&template).await? {
             Some(template)
         } else if self.pg.exists(&primary).await? && self.pg.connections(&primary).await? == 0 {
             Some(primary)
@@ -727,6 +744,9 @@ impl Daemon {
         }
         match &source {
             Some(s) => info!("{dev}: cloned from {s} in {:?}", t.elapsed()),
+            None if !rt.project.copy_on_write() => {
+                info!("{dev}: created empty (copy-on-write off)")
+            }
             None => info!("{dev}: created empty (no template yet)"),
         }
         Ok(true)
@@ -758,7 +778,7 @@ impl Daemon {
             .ok_or_else(|| anyhow!("{} vanished", c.dev_db()))?
             .to_string();
         let marker = Repository::open(&c.path)
-            .map(|r| r.path().join("localforest-migrated"))
+            .map(|r| r.path().join("lazy-cow-tree-migrated"))
             .ok();
         if !force
             && marker
@@ -768,7 +788,26 @@ impl Daemon {
         {
             return Ok(());
         }
-        let result = self.run_migrations(rt, c).await;
+        let mut result = self.run_migrations(rt, c).await;
+        // Without copy-on-write a worktree's database starts empty, like a new
+        // primary one: seeded after its first migrations (its marker names another
+        // database, or none).
+        if result.is_ok()
+            && !force
+            && !rt.project.copy_on_write()
+            && let Some(cmd) = rt.project.settings.seed.clone()
+        {
+            result = self
+                .run_command(
+                    rt,
+                    &c.path,
+                    &c.run_id("seed"),
+                    &cmd,
+                    &c.path,
+                    c.env(&self.global),
+                )
+                .await;
+        }
         if result.is_ok()
             && let Some(m) = &marker
             && let Err(e) = std::fs::write(m, &oid)
@@ -935,6 +974,9 @@ impl Daemon {
             rt.seed_pending.store(true, Ordering::SeqCst);
             rt.trigger(&rt.pending.migrate);
         }
+        if !rt.up_queued.swap(true, Ordering::SeqCst) {
+            self.queue_up(rt, rt.primary());
+        }
         // `git worktree add` still checking out: look again shortly.
         let (root, list) = (rt.project.root.clone(), infos.clone());
         let initializing: Vec<String> = tokio::task::spawn_blocking(move || {
@@ -986,6 +1028,7 @@ impl Daemon {
                     );
                     rt.known.lock().unwrap().insert(name.clone(), c.clone());
                     rt.trigger(&rt.pending.migrate_worktrees);
+                    self.queue_up(rt, c.clone());
                     if fresh && info.is_some() {
                         self.run_setup(rt, c).await;
                     }
@@ -1163,7 +1206,7 @@ impl Daemon {
                     refspecs.push(format!("+refs/heads/{b}:refs/remotes/{remote}/{b}"));
                 }
                 if let (Some(pr), true) = (rec.pr, gh) {
-                    refspecs.push(format!("+refs/pull/{pr}/head:refs/localforest/pull/{pr}"));
+                    refspecs.push(format!("+refs/pull/{pr}/head:refs/lazy-cow-tree/pull/{pr}"));
                 }
                 if let Err(e) = syncer.fetch_refspecs(&repo, &refspecs) {
                     warn!("fetching {n}'s commit: {e:#}");
@@ -1689,6 +1732,7 @@ impl Daemon {
             // Into the template with the rest, so worktrees get seeded data.
             self.run_command(
                 rt,
+                &primary.path,
                 &primary.run_id("seed"),
                 cmd,
                 &primary.path,
@@ -1698,7 +1742,8 @@ impl Daemon {
         }
         if let Some(head) = head {
             let dev = primary.dev_db();
-            if self.pg.exists(&dev).await? {
+            // LAZY_COW_TREE_POSTGRES_TEMPLATE_REFRESH=manual: `lazy-cow-tree snapshot` only.
+            if !rt.project.template_refresh_manual() && self.pg.exists(&dev).await? {
                 let t = std::time::Instant::now();
                 self.pg
                     .snapshot(&dev, &primary.template_db(), &self.create_lock)
@@ -1742,7 +1787,7 @@ impl Daemon {
         let mut failed = Vec::new();
         for (id, cmd, cwd, env) in runs {
             if let Err(e) = self
-                .run_command(rt, &format!("{id}+migrate"), &cmd, &cwd, env)
+                .run_command(rt, &c.path, &format!("{id}+migrate"), &cmd, &cwd, env)
                 .await
             {
                 warn!("{e:#}");
@@ -1760,12 +1805,13 @@ impl Daemon {
     async fn run_command(
         &self,
         rt: &ProjectRt,
+        checkout: &Path,
         id: &str,
         cmd: &str,
         cwd: &Path,
         env: Vec<(String, String)>,
     ) -> Result<()> {
-        crate::server::run_logged(&rt.project, id, cmd, cwd, env, false).await
+        crate::server::run_logged(&rt.project, checkout, id, cmd, cwd, env, false).await
     }
 
     /// Pull branches and merge the base branch into worktrees, then migrate the
@@ -1857,8 +1903,86 @@ impl Daemon {
             }
         }
         match best {
-            Some((_, rt, c, svc, port)) => self.ensure_service(&rt, &c, &svc, Some(port)).await,
+            Some((_, rt, c, svc, port)) => {
+                if c.service(&svc)
+                    .is_some_and(|s| s.start == StartMode::Manual)
+                {
+                    anyhow::bail!(
+                        "{svc} starts manually: `lazy-cow-tree service start {svc}` in {}",
+                        c.path.display()
+                    );
+                }
+                self.ensure_service(&rt, &c, &svc, Some(port)).await
+            }
             None => Ok(()),
+        }
+    }
+
+    /// The redis-server key of a checkout of a registered project (its own id when
+    /// the project is gone).
+    fn redis_key_of(&self, c: &Checkout) -> String {
+        self.projects
+            .lock()
+            .unwrap()
+            .values()
+            .find(|rt| rt.project.name == c.project)
+            .map_or_else(|| c.id(), |rt| redis_key(&rt.project, c))
+    }
+
+    /// Queue a checkout's `start = "up"` services (if any).
+    fn queue_up(&self, rt: &ProjectRt, c: Checkout) {
+        if rt.project.redis_start_up() {
+            let redis = self.redis.clone();
+            let id = redis_key(&rt.project, &c);
+            tokio::spawn(async move {
+                if let Err(e) = redis.start(&id).await {
+                    warn!("{e:#}");
+                }
+            });
+        }
+        if c.services.0.values().any(|s| s.start == StartMode::Up) {
+            self.up_queue
+                .lock()
+                .unwrap()
+                .push((rt.project.root.clone(), c));
+        }
+    }
+
+    /// Start the queued checkouts' `start = "up"` services, each in the background
+    /// (a worktree's migrate first, as for a request).
+    fn start_up_queued(self: &Arc<Self>) {
+        let queued: Vec<(PathBuf, Checkout)> = std::mem::take(&mut *self.up_queue.lock().unwrap());
+        for (root, c) in queued {
+            let Some(rt) = self.projects.lock().unwrap().get(&root).cloned() else {
+                continue;
+            };
+            for (name, s) in &c.services.0 {
+                if s.start != StartMode::Up {
+                    continue;
+                }
+                let (d, rt, c, name) = (self.clone(), rt.clone(), c.clone(), name.clone());
+                tokio::spawn(async move {
+                    if let Err(e) = d.ensure_service(&rt, &c, &name, None).await {
+                        warn!("{}: {e:#}", c.service_id(&name));
+                    }
+                });
+            }
+        }
+    }
+
+    /// Stop services idle past their `idleTimeout`: no open connections through the
+    /// proxy since then. Not a failure: no restart policy applies, and the next
+    /// request starts them again.
+    async fn stop_idle(&self) {
+        for (id, _, _, started, timeout) in self.servers.idle_candidates().await {
+            if self
+                .routes
+                .idle_since(&id, started)
+                .is_some_and(|t| t.elapsed() >= timeout)
+            {
+                info!("{id}: idle for {} s; stopping", timeout.as_secs());
+                self.servers.stop(&id).await;
+            }
         }
     }
 
@@ -1926,7 +2050,7 @@ impl Daemon {
                 .services
                 .default_name()
                 .ok_or_else(|| {
-                    anyhow!("no services configured (localforest.services in devenv.nix)")
+                    anyhow!("no services configured (lazy-cow-tree.services in devenv.nix)")
                 })?
                 .to_string(),
         };
@@ -1971,7 +2095,7 @@ impl Daemon {
                     url: format!("https://{}", c.main_host()),
                     databases: dbs.iter().filter(|d| c.owns_db(d)).cloned().collect(),
                     services,
-                    redis: self.redis.running(&c.id()),
+                    redis: self.redis.running(&redis_key(&rt.project, &c)),
                     branch,
                     migrate_error: rt.migrate_failure(&c).map(|f| f.error),
                     checkout: c,
@@ -2276,7 +2400,7 @@ fn api(d: Arc<Daemon>) -> Router {
 }
 
 /// POSTed by the gone page's button.
-const RECREATE_PATH: &str = "/.localforest/recreate";
+const RECREATE_PATH: &str = "/.lazy-cow-tree/recreate";
 
 impl Daemon {
     /// The project and removed worktree a hostname belonged to:
@@ -2413,7 +2537,7 @@ fn gone_page(
         format!(
             r#"<form method="post" action="{RECREATE_PATH}" onsubmit="this.querySelector('button').disabled=true;this.querySelector('button').textContent='Recreating…'">
 <button type="submit">Recreate worktree to preview {}</button></form>
-<p class="note">Checks out the commit it was at, with a fresh copy of the database; its services start on the first request. A preview isn't removed for its merged pull request: remove it with <code>localforest worktree rm {}</code>.</p>"#,
+<p class="note">Checks out the commit it was at, with a fresh copy of the database; its services start on the first request. A preview isn't removed for its merged pull request: remove it with <code>lazy-cow-tree worktree rm {}</code>.</p>"#,
             e(name),
             e(name)
         )
@@ -2502,10 +2626,10 @@ fn dashboard(d: &Daemon) -> String {
         }
     }
     format!(
-        r#"<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>localforest</title>
+        r#"<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>lazy-cow-tree</title>
 <style>body{{font:14px system-ui;margin:2em;color:#222;background:#fff}}table{{border-collapse:collapse}}td,th{{padding:.3em .8em;border-bottom:1px solid #ddd;text-align:left}}
 @media(prefers-color-scheme:dark){{body{{color:#ddd;background:#111}}a{{color:#8af}}td,th{{border-color:#333}}}}</style></head>
-<body><h1>localforest</h1><p>PostgreSQL 127.0.0.1:{} · Redis 127.0.0.1:{} (password = checkout)</p>
+<body><h1>lazy-cow-tree</h1><p>PostgreSQL 127.0.0.1:{} · Redis 127.0.0.1:{} (password = checkout)</p>
 <table><tr><th>project</th><th>worktree</th><th>services</th><th>databases</th><th>path</th></tr>{rows}</table></body></html>"#,
         d.global.pg_port, d.global.redis_port
     )
@@ -2520,12 +2644,12 @@ fn dashboard(d: &Daemon) -> String {
 fn pg_access(user: &str, c: Option<&Checkout>, db: &str, others: &[Checkout]) -> Result<bool> {
     if user == "postgres" {
         anyhow::bail!(
-            "connect as your checkout's role (PGUSER in `localforest env`), not postgres"
+            "connect as your checkout's role (PGUSER in `lazy-cow-tree env`), not postgres"
         );
     }
     let Some(c) = c else {
         anyhow::bail!(
-            "{user:?} is not the role of a checkout localforest serves; use PGUSER / DATABASE_URL from `localforest env` in the checkout (and `localforest serve` in its project)"
+            "{user:?} is not the role of a checkout lazy-cow-tree serves; use PGUSER / DATABASE_URL from `lazy-cow-tree env` in the checkout (and `lazy-cow-tree serve` in its project)"
         );
     };
     if db == "postgres" || db == "template1" {
@@ -2555,13 +2679,58 @@ fn pg_access(user: &str, c: Option<&Checkout>, db: &str, others: &[Checkout]) ->
     Ok(c.worktree.is_some() && db == c.dev_db())
 }
 
+/// One PostgreSQL cluster serves every project, so a project wanting other
+/// durability (`LAZY_COW_TREE_POSTGRES_DURABLE`) than the daemon's is refused, naming
+/// the projects the cluster already serves.
+fn durability_check<'a>(
+    daemon: bool,
+    project: &Project,
+    others: impl Iterator<Item = &'a Project>,
+) -> Result<()> {
+    if project.postgres_durable() == daemon {
+        return Ok(());
+    }
+    let kind = |d: bool| {
+        if d {
+            "durable"
+        } else {
+            "non-durable (RAM disk, fsync off)"
+        }
+    };
+    let others: Vec<&str> = others
+        .filter(|p| p.root != project.root)
+        .map(|p| p.name.as_str())
+        .collect();
+    let started = if others.is_empty() {
+        "the project that started the daemon".to_string()
+    } else {
+        others.join(", ")
+    };
+    anyhow::bail!(
+        "project {} wants a {} PostgreSQL, but the running lazy-cow-tree daemon's is {} (serving {started}); one cluster serves every project, so match dangerouslyDisableDurabilityForSpeed across them or `lazy-cow-tree down` and restart from this project",
+        project.name,
+        kind(project.postgres_durable()),
+        kind(daemon),
+    )
+}
+
+/// The redis-server a checkout's REDIS_URL reaches: its own, or its project's with
+/// `LAZY_COW_TREE_REDIS_INSTANCE=shared`.
+fn redis_key(project: &Project, c: &Checkout) -> String {
+    if project.redis_shared() {
+        format!("{}+shared", project.name)
+    } else {
+        c.id()
+    }
+}
+
 async fn daemon_alive() -> bool {
     crate::client::get::<serde_json::Value>("/status")
         .await
         .is_ok()
 }
 
-/// `localforest serve`: become the daemon, or register with the running one and take
+/// `lazy-cow-tree serve`: become the daemon, or register with the running one and take
 /// over when it goes away.
 pub async fn serve(global: Global, project: Option<Project>) -> Result<()> {
     std::fs::create_dir_all(config::home())?;
@@ -2572,7 +2741,10 @@ pub async fn serve(global: Global, project: Option<Project>) -> Result<()> {
                 && !registered
             {
                 crate::client::post::<serde_json::Value>("/projects", p).await?;
-                info!("registered {} with the running localforest daemon", p.name);
+                info!(
+                    "registered {} with the running lazy-cow-tree daemon",
+                    p.name
+                );
                 registered = true;
             }
             tokio::select! {
@@ -2665,7 +2837,7 @@ fn start_proxy(
 
 async fn lead(global: Global, project: Option<Project>, listener: UnixListener) -> Result<()> {
     info!(
-        "localforest daemon {} (state in {})",
+        "lazy-cow-tree daemon {} (state in {})",
         std::process::id(),
         config::home().display()
     );
@@ -2678,9 +2850,14 @@ async fn lead(global: Global, project: Option<Project>, listener: UnixListener) 
     start_proxy(&global, routes.clone(), ca, daemon.clone());
     // The real server: unix socket only, one port above the proxy's.
     let pg = Postgres::start(
-        config::pg_dir(),
+        if global.postgres_durable {
+            config::pg_durable_dir()
+        } else {
+            config::pg_dir()
+        },
         global.pg_port + 1,
         global.ramdisk_mb,
+        global.postgres_durable,
         global.postgres_bin.clone(),
         global.postgres_settings()?,
     )
@@ -2704,6 +2881,7 @@ async fn lead(global: Global, project: Option<Project>, listener: UnixListener) 
         activity,
         projects: Mutex::new(BTreeMap::new()),
         shutdown: Notify::new(),
+        up_queue: Mutex::new(Vec::new()),
     });
 
     let weak = Arc::downgrade(&d);
@@ -2738,6 +2916,11 @@ async fn lead(global: Global, project: Option<Project>, listener: UnixListener) 
             tokio::time::sleep(Duration::from_secs(1)).await;
             let Some(d) = weak.upgrade() else { break };
             d.servers.supervise().await;
+            d.start_up_queued();
+            d.stop_idle().await;
+            if let Some(t) = d.global.redis_idle_timeout {
+                d.redis.stop_idle(Duration::from_secs(t)).await;
+            }
         }
     });
     // Idle previews.
@@ -2801,6 +2984,57 @@ async fn lead(global: Global, project: Option<Project>, listener: UnixListener) 
 mod tests {
     use super::*;
 
+    fn named(name: &str, env: &[(&str, &str)]) -> Project {
+        let mut p = Project::new(
+            format!("/src/{name}").into(),
+            serde_json::from_value(serde_json::json!({
+                "name": name, "port": 4000, "remote": "origin", "base": null,
+                "worktrees_dir": ".claude/worktrees", "migrate": null, "seed": null,
+                "setup": null, "services": {}, "preview_ttl_hours": 48,
+                "no_sync": false, "no_auto_remove": false
+            }))
+            .unwrap(),
+        );
+        p.env = env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        p
+    }
+
+    #[test]
+    fn durability_must_match_the_daemons() {
+        let fast = named("fast", &[]);
+        let safe = named("safe", &[("LAZY_COW_TREE_POSTGRES_DURABLE", "1")]);
+        assert!(durability_check(false, &fast, std::iter::empty()).is_ok());
+        assert!(durability_check(true, &safe, std::iter::empty()).is_ok());
+        let e = durability_check(false, &safe, [&fast].into_iter())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("project safe wants a durable PostgreSQL"), "{e}");
+        assert!(e.contains("serving fast"), "{e}");
+        assert!(durability_check(true, &fast, std::iter::empty()).is_err());
+        // Its own earlier registration doesn't count as another project.
+        let e = durability_check(false, &safe, [&safe].into_iter())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("the project that started the daemon"), "{e}");
+    }
+
+    #[test]
+    fn redis_key_per_checkout_or_shared() {
+        let own = named("app", &[]);
+        let shared = named("app", &[("LAZY_COW_TREE_REDIS_INSTANCE", "shared")]);
+        let (p, w) = (
+            own.checkout(None, "/src/app".into()),
+            own.checkout_on(Some("wt"), "/src/app/wt".into(), 20000),
+        );
+        assert_eq!(redis_key(&own, &p), p.id());
+        assert_eq!(redis_key(&own, &w), w.id());
+        assert_ne!(redis_key(&own, &p), redis_key(&own, &w));
+        assert_eq!(redis_key(&shared, &p), redis_key(&shared, &w));
+    }
+
     fn failed(attempts: u32, ago: Duration) -> MigrateFailure {
         MigrateFailure {
             error: String::new(),
@@ -2851,7 +3085,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
         let marker = setup_marker(dir.path()).unwrap();
-        assert_eq!(marker, repo.path().join("localforest-setup"));
+        assert_eq!(marker, repo.path().join("lazy-cow-tree-setup"));
         assert!(marker.parent().unwrap().ends_with(".git"));
         assert!(setup_marker(&dir.path().join("missing")).is_err());
     }

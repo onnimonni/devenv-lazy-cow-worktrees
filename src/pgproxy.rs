@@ -1,4 +1,4 @@
-//! PostgreSQL front: localforest owns the PostgreSQL port; the real server only listens
+//! PostgreSQL front: lazy-cow-tree owns the PostgreSQL port; the real server only listens
 //! on a private unix socket on the RAM disk.
 //!
 //! `DATABASE_URL=postgres://<checkout id>:<password>@127.0.0.1:55432/<db>`. Every
@@ -125,7 +125,7 @@ async fn connection(mut client: TcpStream, backend: &PathBuf, resolve: &Resolve)
     let database = get("database").unwrap_or_else(|| user.clone());
     if let Err(e) = resolve(user, database).await {
         client
-            .write_all(&error("3D000", &format!("localforest: {e:#}")))
+            .write_all(&error("3D000", &format!("lazy-cow-tree: {e:#}")))
             .await?;
         return Ok(());
     }

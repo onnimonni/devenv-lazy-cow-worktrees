@@ -18,7 +18,7 @@ pub fn ensure(mount: &Path, size_mb: u64) -> Result<()> {
         // APFS keeps a little for itself: only a real mismatch is worth a word.
         if mb.abs_diff(size_mb) > size_mb / 10 {
             tracing::warn!(
-                "the RAM disk at {} has {mb} MB, not the configured {size_mb} MB; `localforest down --eject` and a restart resize it (emptying every database)",
+                "the RAM disk at {} has {mb} MB, not the configured {size_mb} MB; `lazy-cow-tree down --eject` and a restart resize it (emptying every database)",
                 mount.display()
             );
         }
@@ -71,7 +71,7 @@ pub fn ensure(mount: &Path, size_mb: u64) -> Result<()> {
                 "addVolume",
                 &container,
                 "APFS",
-                "localforest-pg",
+                "lazy-cow-tree-pg",
                 "-nomount",
             ],
         )?)?;

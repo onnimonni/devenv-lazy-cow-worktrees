@@ -4,14 +4,15 @@
 //! HELLO ... AUTH) picks the checkout by its password; the connection is then piped
 //! to that checkout's redis-server on a private unix socket, started on first use.
 //! So every worktree has its own keys, pub/sub and FLUSHALL, with real Redis
-//! semantics (Lua, streams, ...), and apps need nothing but the URL.
+//! semantics (Lua, streams, ...), and apps need nothing but the URL. A project with
+//! `LAZY_COW_TREE_REDIS_INSTANCE=shared` maps all its checkouts to one redis-server.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, RwLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -27,9 +28,13 @@ use tracing::{debug, info, warn};
 
 pub struct Redis {
     dir: PathBuf,
-    /// Checkout ids (passwords) that may connect.
-    known: RwLock<HashSet<String>>,
+    /// Checkout ids (passwords) that may connect -> the redis-server they reach (the
+    /// checkout's own, or its project's shared one).
+    known: RwLock<HashMap<String, String>>,
+    /// By redis-server key.
     procs: Mutex<HashMap<String, Child>>,
+    /// Open client connections per redis-server key, and when the last one ended.
+    conns: std::sync::Mutex<HashMap<String, (usize, Instant)>>,
     /// A connection counts as its checkout's activity.
     activity: crate::history::Activity,
     /// `redis-server` to run (None: from PATH).
@@ -42,13 +47,62 @@ impl Redis {
             dir,
             known: RwLock::default(),
             procs: Mutex::default(),
+            conns: Default::default(),
             activity,
             server,
         }
     }
 
-    pub fn allow(&self, id: &str) {
-        self.known.write().unwrap().insert(id.to_string());
+    /// Let checkout `id` connect, to redis-server `backend` (`id` for its own).
+    pub fn allow(&self, id: &str, backend: &str) {
+        self.known
+            .write()
+            .unwrap()
+            .insert(id.to_string(), backend.to_string());
+    }
+
+    /// Start redis-server `backend` now (`start = "up"`).
+    pub async fn start(&self, backend: &str) -> Result<()> {
+        self.ensure(backend).await.map(|_| ())
+    }
+
+    /// Stop redis-servers without connections for `timeout` (started again on the
+    /// next one). Data isn't saved, as ever.
+    pub async fn stop_idle(&self, timeout: Duration) {
+        let mut procs = self.procs.lock().await;
+        let idle: Vec<String> = {
+            let conns = self.conns.lock().unwrap();
+            procs
+                .keys()
+                .filter(|k| {
+                    conns
+                        .get(*k)
+                        .is_none_or(|(open, last)| *open == 0 && last.elapsed() >= timeout)
+                })
+                .cloned()
+                .collect()
+        };
+        for key in idle {
+            // Never connected yet: counts from now.
+            if !self.conns.lock().unwrap().contains_key(&key) {
+                self.conns
+                    .lock()
+                    .unwrap()
+                    .insert(key.clone(), (0, Instant::now()));
+                continue;
+            }
+            if let Some(mut c) = procs.remove(&key) {
+                info!(
+                    "redis-server {key}: idle for {} s; stopping",
+                    timeout.as_secs()
+                );
+                let _ = c.kill().await;
+                for ext in ["sock", "pid"] {
+                    let _ = std::fs::remove_file(self.stem(&key).with_extension(ext));
+                }
+                self.conns.lock().unwrap().remove(&key);
+            }
+        }
     }
 
     /// Short file stem: sockets must fit in 104 bytes.
@@ -150,14 +204,22 @@ impl Redis {
         names
     }
 
-    /// Stop and forget a checkout's redis-server (its data is gone).
+    /// Forget a checkout; stop its redis-server (its data is gone) unless other
+    /// checkouts share it.
     pub async fn remove(&self, id: &str) {
-        self.known.write().unwrap().remove(id);
-        if let Some(mut c) = self.procs.lock().await.remove(id) {
+        let backend = {
+            let mut known = self.known.write().unwrap();
+            let Some(b) = known.remove(id) else { return };
+            if known.values().any(|o| *o == b) {
+                return;
+            }
+            b
+        };
+        if let Some(mut c) = self.procs.lock().await.remove(&backend) {
             let _ = c.kill().await;
         }
         for ext in ["sock", "pid", "log"] {
-            let _ = std::fs::remove_file(self.stem(id).with_extension(ext));
+            let _ = std::fs::remove_file(self.stem(&backend).with_extension(ext));
         }
     }
 
@@ -240,16 +302,17 @@ impl Redis {
                 }
             };
             let id = String::from_utf8_lossy(&password).into_owned();
-            if !self.known.read().unwrap().contains(&id) {
+            let backend = self.known.read().unwrap().get(&id).cloned();
+            let Some(backend) = backend else {
                 client
                     .write_all(
                         b"-WRONGPASS invalid username-password pair or user is disabled.\r\n",
                     )
                     .await?;
                 continue;
-            }
+            };
             self.activity.touch(&id);
-            break (id, forward);
+            break (backend, forward);
         };
 
         let socket = match self.ensure(&id).await {
@@ -257,11 +320,12 @@ impl Redis {
             Err(e) => {
                 warn!("{e:#}");
                 client
-                    .write_all(format!("-ERR localforest: {e}\r\n").as_bytes())
+                    .write_all(format!("-ERR lazy-cow-tree: {e}\r\n").as_bytes())
                     .await?;
                 return Ok(());
             }
         };
+        let _open = OpenConn::new(&self.conns, &id);
         let mut backend = UnixStream::connect(&socket).await?;
         match first {
             // HELLO: the backend answers it.
@@ -273,6 +337,34 @@ impl Redis {
         }
         tokio::io::copy_bidirectional(&mut client, &mut backend).await?;
         Ok(())
+    }
+}
+
+/// Counts an open client connection of a redis-server while alive.
+struct OpenConn<'a> {
+    conns: &'a std::sync::Mutex<HashMap<String, (usize, Instant)>>,
+    key: String,
+}
+
+impl<'a> OpenConn<'a> {
+    fn new(conns: &'a std::sync::Mutex<HashMap<String, (usize, Instant)>>, key: &str) -> Self {
+        let mut c = conns.lock().unwrap();
+        let e = c.entry(key.to_string()).or_insert((0, Instant::now()));
+        e.0 += 1;
+        e.1 = Instant::now();
+        Self {
+            conns,
+            key: key.to_string(),
+        }
+    }
+}
+
+impl Drop for OpenConn<'_> {
+    fn drop(&mut self) {
+        if let Some(e) = self.conns.lock().unwrap().get_mut(&self.key) {
+            e.0 = e.0.saturating_sub(1);
+            e.1 = Instant::now();
+        }
     }
 }
 
@@ -437,6 +529,37 @@ pub fn dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shared_redis_outlives_one_checkout() {
+        let d = tempfile::tempdir().unwrap();
+        let r = Redis::new(d.path().into(), Default::default(), None);
+        r.allow("app", "app+shared");
+        r.allow("app--wt", "app+shared");
+        r.allow("other", "other");
+        std::fs::write(r.stem("app+shared").with_extension("log"), "").unwrap();
+        r.remove("app--wt").await;
+        // Still used by the primary: kept.
+        assert!(r.stem("app+shared").with_extension("log").exists());
+        assert_eq!(
+            r.known.read().unwrap().get("app").map(String::as_str),
+            Some("app+shared")
+        );
+        r.remove("app").await;
+        assert!(!r.stem("app+shared").with_extension("log").exists());
+        assert!(r.known.read().unwrap().contains_key("other"));
+    }
+
+    #[test]
+    fn counts_open_connections() {
+        let conns = std::sync::Mutex::new(HashMap::new());
+        let a = OpenConn::new(&conns, "k");
+        let b = OpenConn::new(&conns, "k");
+        assert_eq!(conns.lock().unwrap()["k"].0, 2);
+        drop(a);
+        drop(b);
+        assert_eq!(conns.lock().unwrap()["k"].0, 0);
+    }
 
     #[test]
     fn recognises_our_redis_server() {

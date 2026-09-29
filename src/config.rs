@@ -1,5 +1,5 @@
 //! Paths, settings and the naming scheme every part of the service shares. Names and
-//! ports are derived from a checkout's path alone, so `localforest env` in a worktree
+//! ports are derived from a checkout's path alone, so `lazy-cow-tree env` in a worktree
 //! computes the same values as the daemon without asking it.
 
 use std::{
@@ -46,20 +46,20 @@ fn default_http_port() -> u16 {
 /// Daemon-wide settings, shared by every project.
 #[derive(clap::Args, Debug, Clone, Serialize, Deserialize)]
 pub struct Global {
-    /// PostgreSQL port on 127.0.0.1 (localforest's proxy; the user picks the checkout).
+    /// PostgreSQL port on 127.0.0.1 (lazy-cow-tree's proxy; the user picks the checkout).
     /// The real server listens on <state>/pg/.s.PGSQL.<port + 1> only.
     #[arg(
         long,
-        env = "LOCALFOREST_PG_PORT",
+        env = "LAZY_COW_TREE_PG_PORT",
         default_value_t = 55432,
         global = true
     )]
     pub pg_port: u16,
     /// Redis port on 127.0.0.1. The password picks the checkout: each has its own
-    /// redis-server behind it (REDIS_URL in `localforest env`).
+    /// redis-server behind it (REDIS_URL in `lazy-cow-tree env`).
     #[arg(
         long,
-        env = "LOCALFOREST_REDIS_PORT",
+        env = "LAZY_COW_TREE_REDIS_PORT",
         default_value_t = 6380,
         global = true
     )]
@@ -69,7 +69,7 @@ pub struct Global {
     /// it binds all interfaces and refuses non-loopback peers.
     #[arg(
         long,
-        env = "LOCALFOREST_HTTPS_PORT",
+        env = "LAZY_COW_TREE_HTTPS_PORT",
         default_value_t = default_https_port(),
         global = true
     )]
@@ -78,7 +78,7 @@ pub struct Global {
     /// unprivileged processes may bind it, else off].
     #[arg(
         long,
-        env = "LOCALFOREST_HTTP_PORT",
+        env = "LAZY_COW_TREE_HTTP_PORT",
         default_value_t = default_http_port(),
         global = true
     )]
@@ -86,32 +86,43 @@ pub struct Global {
     /// PostgreSQL RAM disk size in MB (memory is only used as it fills).
     #[arg(
         long,
-        env = "LOCALFOREST_RAMDISK_MB",
+        env = "LAZY_COW_TREE_RAMDISK_MB",
         default_value_t = 4096,
         global = true
     )]
     pub ramdisk_mb: u64,
     /// Directory with PostgreSQL's `postgres` and `initdb` [default: from PATH].
-    #[arg(long, env = "LOCALFOREST_POSTGRES_BIN", global = true)]
+    #[arg(long, env = "LAZY_COW_TREE_POSTGRES_BIN", global = true)]
     pub postgres_bin: Option<PathBuf>,
     /// Extra postgresql.conf settings as a JSON object, e.g.
     /// {"shared_preload_libraries": "pg_stat_statements"}.
-    #[arg(long, env = "LOCALFOREST_POSTGRES_SETTINGS", global = true)]
+    #[arg(long, env = "LAZY_COW_TREE_POSTGRES_SETTINGS", global = true)]
     pub postgres_settings: Option<String>,
     /// Extensions to create in template1 (so in every database made afterwards) and
     /// the primaries' databases, as superuser: for extensions that aren't trusted
     /// (postgis, vector), which checkout roles can't create. Comma or space separated.
-    #[arg(long, env = "LOCALFOREST_POSTGRES_EXTENSIONS", global = true)]
+    #[arg(long, env = "LAZY_COW_TREE_POSTGRES_EXTENSIONS", global = true)]
     pub postgres_extensions: Option<String>,
     /// The `redis-server` to run [default: from PATH].
-    #[arg(long, env = "LOCALFOREST_REDIS_SERVER", global = true)]
+    #[arg(long, env = "LAZY_COW_TREE_REDIS_SERVER", global = true)]
     pub redis_server: Option<PathBuf>,
     /// Control socket where devenv projects (`process.proxy.enable`) register their
     /// hostnames, as with devenv's own proxy; "off" disables [default: devenv's path,
     /// $DEVENV_PROXY_SOCKET or $TMPDIR/devenv-proxy-<user>.sock].
-    #[arg(long, env = "LOCALFOREST_DEVENV_PROXY_SOCKET", global = true)]
+    #[arg(long, env = "LAZY_COW_TREE_DEVENV_PROXY_SOCKET", global = true)]
     #[serde(default)]
     pub devenv_proxy_socket: Option<PathBuf>,
+    /// PostgreSQL keeps its data safe (on disk, fsync on) instead of the RAM disk with
+    /// fsync, synchronous_commit and full_page_writes off. Daemon-wide: projects with
+    /// another value are refused.
+    #[arg(long, env = "LAZY_COW_TREE_POSTGRES_DURABLE", global = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new())]
+    #[serde(default)]
+    pub postgres_durable: bool,
+    /// Stop a per-checkout redis-server after this many seconds without connections
+    /// (it starts again on the next one).
+    #[arg(long, env = "LAZY_COW_TREE_REDIS_IDLE_TIMEOUT", global = true)]
+    #[serde(default)]
+    pub redis_idle_timeout: Option<u64>,
 }
 
 impl Global {
@@ -136,7 +147,7 @@ impl Global {
             return Ok(Vec::new());
         };
         let map: BTreeMap<String, serde_json::Value> =
-            serde_json::from_str(json).context("LOCALFOREST_POSTGRES_SETTINGS")?;
+            serde_json::from_str(json).context("LAZY_COW_TREE_POSTGRES_SETTINGS")?;
         Ok(map
             .into_iter()
             .map(|(k, v)| {
@@ -151,26 +162,26 @@ impl Global {
     }
 }
 
-/// Per-project settings, sent by `localforest serve` when it registers a project.
+/// Per-project settings, sent by `lazy-cow-tree serve` when it registers a project.
 #[derive(clap::Args, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectSettings {
     /// Project name: <name>.localhost, <worktree>.<name>.localhost, database prefix
     /// [default: primary checkout's directory name].
-    #[arg(long = "project", env = "LOCALFOREST_PROJECT")]
+    #[arg(long = "project", env = "LAZY_COW_TREE_PROJECT")]
     pub name: Option<String>,
     /// Port the primary checkout's app listens on (worktrees get their own).
-    #[arg(long, env = "LOCALFOREST_PORT", default_value_t = 4000)]
+    #[arg(long, env = "LAZY_COW_TREE_PORT", default_value_t = 4000)]
     pub port: u16,
     /// Git remote to fetch from and watch on GitHub.
-    #[arg(long, env = "LOCALFOREST_REMOTE", default_value = "origin")]
+    #[arg(long, env = "LAZY_COW_TREE_REMOTE", default_value = "origin")]
     pub remote: String,
     /// Base branch [default: remote HEAD, else main].
-    #[arg(long, env = "LOCALFOREST_BASE")]
+    #[arg(long, env = "LAZY_COW_TREE_BASE")]
     pub base: Option<String>,
     /// Where new worktrees go, relative to the primary checkout.
     #[arg(
         long,
-        env = "LOCALFOREST_WORKTREES_DIR",
+        env = "LAZY_COW_TREE_WORKTREES_DIR",
         default_value = ".claude/worktrees"
     )]
     pub worktrees_dir: PathBuf,
@@ -178,46 +189,71 @@ pub struct ProjectSettings {
     /// the base branch moves (then the template database is refreshed from it), and in
     /// every worktree the base branch was merged into. Split like a shell would, but
     /// run directly, e.g. "mix do ecto.migrate + run priv/repo/seeds.exs".
-    #[arg(long, env = "LOCALFOREST_MIGRATE")]
+    #[arg(long, env = "LAZY_COW_TREE_MIGRATE")]
     pub migrate: Option<String>,
     /// Seed command, run in the primary checkout after `migrate` when its database
     /// was just created (empty); worktrees get the seeded data through the template.
     /// E.g. "mix run priv/repo/seeds.exs".
-    #[arg(long, env = "LOCALFOREST_SEED")]
+    #[arg(long, env = "LAZY_COW_TREE_SEED")]
     pub seed: Option<String>,
-    /// Setup command, run once in every new checkout (made by localforest, git,
+    /// Setup command, run once in every new checkout (made by lazy-cow-tree, git,
     /// git-cow or Claude Code) with its env, before its services start, e.g.
     /// "mix deps.get". Checkouts it ran in are marked in their git admin dir.
-    #[arg(long, env = "LOCALFOREST_SETUP")]
+    #[arg(long, env = "LAZY_COW_TREE_SETUP")]
     pub setup: Option<String>,
     /// Services of every checkout as JSON ({"web": {"exec": "mix phx.server"}, ...};
-    /// see `Service`), written by the devenv module's `localforest.services`. Each is
+    /// see `Service`), written by the devenv module's `lazy-cow-tree.services`. Each is
     /// started on demand (its first request, or as a dependency) with its own port and
     /// hostname, sharing the checkout's database and Redis.
-    #[arg(long, env = "LOCALFOREST_SERVICES", default_value = "{}")]
+    #[arg(long, env = "LAZY_COW_TREE_SERVICES", default_value = "{}")]
     pub services: Services,
     /// Close a preview (a removed worktree recreated from its "gone" page) after this
     /// many hours without requests or database / Redis connections; 0 keeps them.
-    #[arg(long, env = "LOCALFOREST_PREVIEW_TTL_HOURS", default_value_t = 48)]
+    #[arg(long, env = "LAZY_COW_TREE_PREVIEW_TTL_HOURS", default_value_t = 48)]
     pub preview_ttl_hours: u64,
     /// Don't pull branches / merge the base branch into worktrees on pushes.
-    #[arg(long, env = "LOCALFOREST_NO_SYNC", value_parser = clap::builder::BoolishValueParser::new())]
+    #[arg(long, env = "LAZY_COW_TREE_NO_SYNC", value_parser = clap::builder::BoolishValueParser::new())]
     pub no_sync: bool,
     /// Don't remove worktrees whose PR merged.
-    #[arg(long, env = "LOCALFOREST_NO_AUTO_REMOVE", value_parser = clap::builder::BoolishValueParser::new())]
+    #[arg(long, env = "LAZY_COW_TREE_NO_AUTO_REMOVE", value_parser = clap::builder::BoolishValueParser::new())]
     pub no_auto_remove: bool,
 }
 
 pub fn home() -> PathBuf {
-    if let Some(h) = std::env::var_os("LOCALFOREST_HOME") {
+    if let Some(h) = std::env::var_os("LAZY_COW_TREE_HOME") {
         return PathBuf::from(h);
     }
-    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
-    home.join(".local/state/localforest")
+    static HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
+        state_dir(&home.join(".local/state"))
+    })
+    .clone()
+}
+
+/// `<state>/lazy-cow-tree`, moved there from the former `<state>/localforest` (CA,
+/// secret, databases) the first time; where moving fails (a RAM disk mounted inside,
+/// say) the old one stays in use.
+fn state_dir(state: &Path) -> PathBuf {
+    let new = state.join("lazy-cow-tree");
+    let old = state.join("localforest");
+    if new.exists() || !old.exists() {
+        return new;
+    }
+    match std::fs::rename(&old, &new) {
+        Ok(()) => {
+            tracing::info!("moved {} to {}", old.display(), new.display());
+            new
+        }
+        Err(e) => {
+            tracing::warn!("keeping state in {} (moving it failed: {e})", old.display());
+            old
+        }
+    }
 }
 
 pub fn socket_path() -> PathBuf {
-    home().join("localforest.sock")
+    home().join("lazy-cow-tree.sock")
 }
 
 /// RAM disk mount point; also PostgreSQL's unix socket directory.
@@ -225,12 +261,17 @@ pub fn pg_dir() -> PathBuf {
     home().join("pg")
 }
 
+/// Data and socket directory of a durable cluster (`Global::postgres_durable`).
+pub fn pg_durable_dir() -> PathBuf {
+    home().join("pg-durable")
+}
+
 pub fn ca_cert_path() -> PathBuf {
     home().join("ca/ca.pem")
 }
 
 /// Per-machine random secret that checkout passwords derive from, created on first
-/// use (0600), so `localforest env` and the daemon agree without talking.
+/// use (0600), so `lazy-cow-tree env` and the daemon agree without talking.
 pub fn secret() -> Result<Vec<u8>> {
     secret_in(&home())
 }
@@ -312,7 +353,7 @@ pub struct Project {
     pub root: PathBuf,
     pub name: String,
     pub settings: ProjectSettings,
-    /// Environment of the `localforest serve` that registered it (PATH for the migrate
+    /// Environment of the `lazy-cow-tree serve` that registered it (PATH for the migrate
     /// and service commands, the project's toolchain).
     #[serde(default)]
     pub env: Vec<(String, String)>,
@@ -336,12 +377,63 @@ impl Project {
         self.name.replace('-', "_")
     }
 
+    /// A variable of the registering `lazy-cow-tree serve`'s environment.
+    pub fn env_var(&self, name: &str) -> Option<&str> {
+        self.env
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+            .filter(|v| !v.is_empty())
+    }
+
+    fn env_flag(&self, name: &str, default: bool) -> bool {
+        match self.env_var(name) {
+            Some(v) => matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+            None => default,
+        }
+    }
+
+    /// `LAZY_COW_TREE_POSTGRES_DURABLE` of this project (unset: not durable).
+    pub fn postgres_durable(&self) -> bool {
+        self.env_flag("LAZY_COW_TREE_POSTGRES_DURABLE", false)
+    }
+
+    /// `LAZY_COW_TREE_POSTGRES_COW`: worktree databases are clones of the template
+    /// (default), else created empty and migrated.
+    pub fn copy_on_write(&self) -> bool {
+        self.env_flag("LAZY_COW_TREE_POSTGRES_COW", true)
+    }
+
+    /// `LAZY_COW_TREE_POSTGRES_TEMPLATE_REFRESH=manual`: base-branch moves don't
+    /// refresh the template; `lazy-cow-tree snapshot` does.
+    pub fn template_refresh_manual(&self) -> bool {
+        self.env_var("LAZY_COW_TREE_POSTGRES_TEMPLATE_REFRESH") == Some("manual")
+    }
+
+    /// `LAZY_COW_TREE_REDIS_START=up`: a checkout's redis-server starts with it.
+    pub fn redis_start_up(&self) -> bool {
+        self.env_var("LAZY_COW_TREE_REDIS_START") == Some("up")
+    }
+
+    /// `LAZY_COW_TREE_REDIS_INSTANCE=shared`: one redis-server for all its checkouts.
+    pub fn redis_shared(&self) -> bool {
+        self.env_var("LAZY_COW_TREE_REDIS_INSTANCE") == Some("shared")
+    }
+
+    /// `LAZY_COW_TREE_ENV_FILES`: checkout-relative files applied last to everything
+    /// run in a checkout (unset: none).
+    pub fn env_files(&self) -> Vec<String> {
+        self.env_var("LAZY_COW_TREE_ENV_FILES")
+            .and_then(|j| serde_json::from_str::<Vec<String>>(j).ok())
+            .unwrap_or_default()
+    }
+
     pub fn worktrees_dir(&self) -> PathBuf {
         self.root.join(&self.settings.worktrees_dir)
     }
 
     /// A worktree's port is the one recorded in its git admin dir (the daemon records
-    /// them, `worktree::assign_ports`), else its hashed slot. Reads only: `localforest
+    /// them, `worktree::assign_ports`), else its hashed slot. Reads only: `lazy-cow-tree
     /// env` computes an unrecorded one with `worktree::plan_ports` first.
     pub fn checkout(&self, worktree: Option<&str>, path: PathBuf) -> Checkout {
         let port = match worktree {
@@ -382,7 +474,7 @@ fn yes() -> bool {
     true
 }
 
-/// One process of every checkout (`localforest.services.<name>` in devenv.nix), started
+/// One process of every checkout (`lazy-cow-tree.services.<name>` in devenv.nix), started
 /// on demand with the checkout's environment.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -396,7 +488,7 @@ pub struct Service {
     /// without http run only as dependencies of others (workers).
     #[serde(default = "yes")]
     pub http: bool,
-    /// The service `localforest env` and `localforest service` pick without a name [default:
+    /// The service `lazy-cow-tree env` and `lazy-cow-tree service` pick without a name [default:
     /// `web`, else the first http service]. Every http service is served at
     /// <worktree>.<service>.<project>.localhost (<service>.<project>.localhost in the
     /// primary checkout).
@@ -438,9 +530,53 @@ pub struct Service {
     /// block, exported to every environment of the checkout.
     #[serde(default)]
     pub ports: BTreeMap<String, ExtraPort>,
+    /// When it starts: with its checkout (`up`), on its first request or as a
+    /// dependency (`demand`), or only by `lazy-cow-tree service start` (`manual`).
+    #[serde(default)]
+    pub start: StartMode,
+    /// Stop it after this many seconds without open connections through the proxy;
+    /// its next request starts it again. None: never.
+    #[serde(default)]
+    pub idle_timeout: Option<u64>,
+    /// HTTP probe its first request waits for, instead of its port listening.
+    #[serde(default)]
+    pub ready: Option<Ready>,
+    /// Its hostname in the primary checkout instead of `<service>.<project>.localhost`;
+    /// worktrees prefix theirs (`<worktree>.<hostname>`).
+    #[serde(default)]
+    pub hostname: Option<String>,
 }
 
-/// A service's secondary port (`localforest.services.<svc>.ports.<name>`).
+/// `Service::start`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum StartMode {
+    Up,
+    #[default]
+    Demand,
+    Manual,
+}
+
+/// `Service::ready`: GET 127.0.0.1:<port><path>, ready on a 2xx or 3xx answer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Ready {
+    #[serde(default = "root_path")]
+    pub path: String,
+    /// Seconds.
+    #[serde(default = "sixty")]
+    pub timeout: u64,
+}
+
+fn root_path() -> String {
+    "/".into()
+}
+
+fn sixty() -> u64 {
+    60
+}
+
+/// A service's secondary port (`lazy-cow-tree.services.<svc>.ports.<name>`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ExtraPort {
@@ -477,7 +613,7 @@ fn env_var_name(name: &str) -> String {
     name.to_ascii_uppercase().replace('-', "_")
 }
 
-/// Variables `Checkout::service_env` sets besides `LOCALFOREST_*`; a named port's
+/// Variables `Checkout::service_env` sets besides `LAZY_COW_TREE_*`; a named port's
 /// `env` may not replace them.
 pub const RESERVED_ENV: &[&str] = &[
     "PORT",
@@ -511,7 +647,7 @@ pub enum Restart {
     Always,
 }
 
-/// `LOCALFOREST_SERVICES`: the services as JSON (the devenv module writes it).
+/// `LAZY_COW_TREE_SERVICES`: the services as JSON (the devenv module writes it).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(transparent)]
 pub struct Services(pub BTreeMap<String, Service>);
@@ -522,7 +658,7 @@ impl std::str::FromStr for Services {
     fn from_str(s: &str) -> std::result::Result<Self, String> {
         let s = if s.trim().is_empty() { "{}" } else { s };
         let services: Services =
-            serde_json::from_str(s).map_err(|e| format!("LOCALFOREST_SERVICES: {e}"))?;
+            serde_json::from_str(s).map_err(|e| format!("LAZY_COW_TREE_SERVICES: {e}"))?;
         services.validate()?;
         Ok(services)
     }
@@ -541,12 +677,32 @@ impl Services {
         if self.0.values().filter(|s| s.default).count() > 1 {
             return Err("more than one default service".into());
         }
+        let mut hosts = BTreeMap::new();
+        for (name, s) in &self.0 {
+            let Some(h) = &s.hostname else { continue };
+            let valid = h == &h.to_ascii_lowercase()
+                && h.ends_with(".localhost")
+                && h.split('.').all(|l| {
+                    !l.is_empty()
+                        && !l.starts_with('-')
+                        && !l.ends_with('-')
+                        && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                });
+            if !valid {
+                return Err(format!(
+                    "service {name}: hostname {h} must be a lowercase name ending in .localhost"
+                ));
+            }
+            if let Some(other) = hosts.insert(h.clone(), name.clone()) {
+                return Err(format!("services {other} and {name} share hostname {h}"));
+            }
+        }
         Ok(())
     }
 
     /// Place every port in the 10-port block: services at their `portOffset` (default:
     /// position by name), then their secondary ports at their `offset`, the rest from
-    /// the top down (9, 8, ...) by service and port name. Pure: `localforest env` and
+    /// the top down (9, 8, ...) by service and port name. Pure: `lazy-cow-tree env` and
     /// the daemon agree.
     pub fn layout(&self) -> std::result::Result<Layout, String> {
         fn take(
@@ -575,7 +731,7 @@ impl Services {
             layout.services.insert(name.clone(), off);
         }
         let mut envs: BTreeMap<String, String> = BTreeMap::new();
-        // LOCALFOREST_<SERVICE>_PORT / _<SERVICE>_<PORT>_PORT (and _URL) must not collide.
+        // LAZY_COW_TREE_<SERVICE>_PORT / _<SERVICE>_<PORT>_PORT (and _URL) must not collide.
         let mut generated: BTreeMap<String, String> = BTreeMap::new();
         for name in self.0.keys() {
             generated.insert(env_var_name(name), format!("service {name}"));
@@ -602,8 +758,8 @@ impl Services {
                 if !valid_env_name(&env) {
                     return Err(format!("{what}: env {env} is not [A-Z_][A-Z0-9_]*"));
                 }
-                if RESERVED_ENV.contains(&env.as_str()) || env.starts_with("LOCALFOREST_") {
-                    return Err(format!("{what}: env {env} is set by localforest"));
+                if RESERVED_ENV.contains(&env.as_str()) || env.starts_with("LAZY_COW_TREE_") {
+                    return Err(format!("{what}: env {env} is set by lazy-cow-tree"));
                 }
                 if let Some(other) = envs.insert(env.clone(), what.clone()) {
                     return Err(format!("{other} and {what} share env {env}"));
@@ -611,7 +767,7 @@ impl Services {
                 let var = format!("{}_{}", env_var_name(svc), env_var_name(name));
                 if let Some(other) = generated.insert(var.clone(), what.clone()) {
                     return Err(format!(
-                        "{other} and {what} both set LOCALFOREST_{var}_PORT"
+                        "{other} and {what} both set LAZY_COW_TREE_{var}_PORT"
                     ));
                 }
                 if let Some(off) = p.offset {
@@ -668,7 +824,7 @@ fn short_hash(s: &str) -> String {
     hex::encode(&Sha256::digest(s.as_bytes())[..4])
 }
 
-/// Every database and role name localforest makes: kept when it fits PostgreSQL's 63
+/// Every database and role name lazy-cow-tree makes: kept when it fits PostgreSQL's 63
 /// bytes, else cut and suffixed with a hash of the whole, so two long names can't
 /// truncate to the same one.
 pub fn pg_name(s: &str) -> String {
@@ -763,9 +919,13 @@ impl Checkout {
     /// `<worktree>.<service>.<project>.localhost`, `<service>.<project>.localhost` in
     /// the primary checkout.
     pub fn service_host(&self, name: &str) -> String {
+        let base = self
+            .service(name)
+            .and_then(|s| s.hostname.clone())
+            .unwrap_or_else(|| format!("{name}.{}.localhost", self.project));
         match &self.worktree {
-            Some(w) => format!("{w}.{name}.{}.localhost", self.project),
-            None => format!("{name}.{}.localhost", self.project),
+            Some(w) => format!("{w}.{base}"),
+            None => base,
         }
     }
 
@@ -931,7 +1091,7 @@ impl Checkout {
 
     /// Environment of a service: its port and hostname, the checkout's database and
     /// Redis (FIXME: shared by all its services for now; see `Service`), plus
-    /// LOCALFOREST_<SERVICE>_URL / _PORT of every service of the checkout.
+    /// LAZY_COW_TREE_<SERVICE>_URL / _PORT of every service of the checkout.
     pub fn service_env(&self, g: &Global, service: Option<&str>) -> Vec<(String, String)> {
         let (host, port) = match service {
             Some(n) if self.service(n).is_some() => (self.service_host(n), self.service_port(n)),
@@ -940,7 +1100,7 @@ impl Checkout {
         let dev = self.dev_db();
         let test = self.test_db();
         let id = self.id();
-        // The user picks this checkout at localforest's PostgreSQL proxy.
+        // The user picks this checkout at lazy-cow-tree's PostgreSQL proxy.
         let pw = self.pg_password().unwrap_or_default();
         let pg_url = |db: &str| format!("postgres://{id}:{pw}@127.0.0.1:{}/{db}", g.pg_port);
         let url = |host: &str| {
@@ -951,25 +1111,25 @@ impl Checkout {
             }
         };
         let mut env: Vec<(String, String)> = vec![
-            ("LOCALFOREST_PROJECT".into(), self.project.clone()),
+            ("LAZY_COW_TREE_PROJECT".into(), self.project.clone()),
             (
-                "LOCALFOREST_WORKTREE".into(),
+                "LAZY_COW_TREE_WORKTREE".into(),
                 self.worktree.clone().unwrap_or_default(),
             ),
             (
-                "LOCALFOREST_SERVICE".into(),
+                "LAZY_COW_TREE_SERVICE".into(),
                 service.unwrap_or_default().into(),
             ),
-            ("LOCALFOREST_HOST".into(), host.clone()),
-            ("LOCALFOREST_URL".into(), url(&host)),
+            ("LAZY_COW_TREE_HOST".into(), host.clone()),
+            ("LAZY_COW_TREE_URL".into(), url(&host)),
             ("PORT".into(), port.to_string()),
             ("PGHOST".into(), "127.0.0.1".into()),
             ("PGPORT".into(), g.pg_port.to_string()),
             ("PGUSER".into(), id.clone()),
             ("PGPASSWORD".into(), pw.clone()),
             ("PGDATABASE".into(), dev.clone()),
-            ("LOCALFOREST_DEV_DATABASE".into(), dev.clone()),
-            ("LOCALFOREST_TEST_DATABASE".into(), test.clone()),
+            ("LAZY_COW_TREE_DEV_DATABASE".into(), dev.clone()),
+            ("LAZY_COW_TREE_TEST_DATABASE".into(), test.clone()),
             ("DATABASE_URL".into(), pg_url(&dev)),
             ("TEST_DATABASE_URL".into(), pg_url(&test)),
             (
@@ -984,17 +1144,20 @@ impl Checkout {
         for (n, s) in &self.services.0 {
             let var = env_var_name(n);
             env.push((
-                format!("LOCALFOREST_{var}_PORT"),
+                format!("LAZY_COW_TREE_{var}_PORT"),
                 self.service_port(n).to_string(),
             ));
             if s.http {
-                env.push((format!("LOCALFOREST_{var}_URL"), url(&self.service_host(n))));
+                env.push((
+                    format!("LAZY_COW_TREE_{var}_URL"),
+                    url(&self.service_host(n)),
+                ));
             }
         }
         for p in self.port_slots() {
             let port = (self.port + p.offset).to_string();
             let var = format!(
-                "LOCALFOREST_{}_{}",
+                "LAZY_COW_TREE_{}_{}",
                 env_var_name(&p.service),
                 env_var_name(&p.name)
             );
@@ -1042,6 +1205,76 @@ pub fn framework_env(dir: &Path, host: &str) -> Vec<(String, String)> {
         env.push(("__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS".into(), host.into()));
     }
     env
+}
+
+/// `text` with each path starting with `from` (the primary checkout) moved to `to`
+/// (a worktree): an occurrence counts at a path boundary (start, `:`, `=`, space,
+/// quote) followed by the end, `/`, `:`, space or quote. One already under `to` (a
+/// worktree inside the primary) is left alone.
+pub fn rewrite_root(text: &str, from: &Path, to: &Path) -> String {
+    let (from, to) = (from.to_string_lossy(), to.to_string_lossy());
+    if from.is_empty() || from == to || !text.contains(from.as_ref()) {
+        return text.to_string();
+    }
+    let rest_of_to = to.strip_prefix(from.as_ref());
+    let starts = |c: char| matches!(c, ':' | '=' | ' ' | '"' | '\'' | '\n' | '\t');
+    let ends = |c: char| matches!(c, '/' | ':' | ' ' | '"' | '\'' | '\n' | '\t' | ';');
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while let Some(pos) = text[i..].find(from.as_ref()) {
+        let at = i + pos;
+        let after = at + from.len();
+        let before_ok = text[..at].chars().next_back().is_none_or(starts);
+        let tail = &text[after..];
+        let after_ok = tail.chars().next().is_none_or(ends);
+        let already = rest_of_to.is_some_and(|r| !r.is_empty() && tail.starts_with(r));
+        out.push_str(&text[i..at]);
+        if before_ok && after_ok && !already {
+            out.push_str(&to);
+        } else {
+            out.push_str(&from);
+        }
+        i = after;
+    }
+    out.push_str(&text[i..]);
+    out
+}
+
+/// Variables of a checkout's env files (`Project::env_files`, later files win),
+/// and the keys only the primary's copies set: in a worktree those came into the
+/// project env from the primary (devenv reads its dotenv there) and are removed.
+pub fn env_file_vars(
+    root: &Path,
+    checkout: &Path,
+    files: &[String],
+) -> (Vec<(String, String)>, Vec<String>) {
+    let read = |dir: &Path| -> BTreeMap<String, String> {
+        let mut vars = BTreeMap::new();
+        for f in files {
+            let Ok(iter) = dotenvy::from_path_iter(dir.join(f)) else {
+                continue;
+            };
+            for item in iter {
+                match item {
+                    Ok((k, v)) => {
+                        vars.insert(k, v);
+                    }
+                    Err(e) => tracing::warn!("{}: {e}", dir.join(f).display()),
+                }
+            }
+        }
+        vars
+    };
+    let own = read(checkout);
+    let primary_only = if checkout == root {
+        Vec::new()
+    } else {
+        read(root)
+            .into_keys()
+            .filter(|k| !own.contains_key(k))
+            .collect()
+    };
+    (own.into_iter().collect(), primary_only)
 }
 
 /// Primary checkout of the repository containing `path`.
@@ -1125,6 +1358,152 @@ mod tests {
     }
 
     #[test]
+    fn service_start_ready_hostname_and_back_compat() {
+        // Without the new fields: as before.
+        let old: Services = r#"{"web": {"exec": "mix phx.server"}}"#.parse().unwrap();
+        let web = &old.0["web"];
+        assert_eq!(web.start, StartMode::Demand);
+        assert_eq!(
+            (web.idle_timeout, web.ready.as_ref(), web.hostname.as_ref()),
+            (None, None, None)
+        );
+        let new: Services =
+            r#"{"web": {"exec": "/nix/store/x-web", "start": "up", "idleTimeout": 900,
+            "ready": {"timeout": 5}, "hostname": "care.treat.localhost"},
+            "adm": {"exec": "x", "start": "manual"}}"#
+                .parse()
+                .unwrap();
+        let web = &new.0["web"];
+        assert_eq!(web.start, StartMode::Up);
+        assert_eq!(new.0["adm"].start, StartMode::Manual);
+        assert_eq!(web.idle_timeout, Some(900));
+        assert_eq!(
+            web.ready,
+            Some(Ready {
+                path: "/".into(),
+                timeout: 5
+            })
+        );
+        // Unknown fields are still refused.
+        assert!(r#"{"web": {"exec": "x", "nope": 1}}"#.parse::<Services>().is_err());
+        assert!(r#"{"web": {"exec": "x", "start": "later"}}"#.parse::<Services>().is_err());
+    }
+
+    #[test]
+    fn service_hostname_override() {
+        let c = with_services(
+            r#"{"care": {"exec": "x", "hostname": "care.treat.localhost"}, "web": {"exec": "y"}}"#,
+        );
+        assert_eq!(c.service_host("care"), "wt.care.treat.localhost");
+        assert_eq!(c.service_host("web"), "wt.web.my-app.localhost");
+        let primary = Checkout {
+            worktree: None,
+            ..c.clone()
+        };
+        assert_eq!(primary.service_host("care"), "care.treat.localhost");
+        assert!(
+            c.routes()
+                .iter()
+                .any(|(_, h, _)| h == "wt.care.treat.localhost")
+        );
+        for bad in [
+            r#"{"a": {"exec": "x", "hostname": "Care.localhost"}}"#,
+            r#"{"a": {"exec": "x", "hostname": "care.example.com"}}"#,
+            r#"{"a": {"exec": "x", "hostname": "-a.localhost"}}"#,
+            r#"{"a": {"exec": "x", "hostname": "h.localhost"}, "b": {"exec": "y", "hostname": "h.localhost"}}"#,
+        ] {
+            assert!(bad.parse::<Services>().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn rewrites_primary_paths_to_the_worktree() {
+        let (r, w) = (
+            Path::new("/src/app"),
+            Path::new("/src/app/.claude/worktrees/wt"),
+        );
+        assert_eq!(
+            rewrite_root("/src/app", r, w),
+            "/src/app/.claude/worktrees/wt"
+        );
+        assert_eq!(
+            rewrite_root("/src/app/bin:/usr/bin:/src/app/node_modules/.bin", r, w),
+            "/src/app/.claude/worktrees/wt/bin:/usr/bin:/src/app/.claude/worktrees/wt/node_modules/.bin"
+        );
+        // Already the worktree's, another directory, or mid-word: untouched.
+        for keep in [
+            "/src/app/.claude/worktrees/wt/x",
+            "/src/application",
+            "x/src/app",
+        ] {
+            assert_eq!(rewrite_root(keep, r, w), keep);
+        }
+        assert_eq!(
+            rewrite_root("cd \"/src/app/api\" && exec x", r, Path::new("/wt")),
+            "cd \"/wt/api\" && exec x"
+        );
+        assert_eq!(rewrite_root("/src/app/x", r, r), "/src/app/x");
+    }
+
+    #[test]
+    fn env_files_later_win_and_primary_only_keys() {
+        let d = tempfile::tempdir().unwrap();
+        let (root, wt) = (d.path().join("root"), d.path().join("wt"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(root.join(".env.local"), "A=1\nGONE=primary\n").unwrap();
+        std::fs::write(wt.join(".env.local"), "A=2\nB=x\n").unwrap();
+        std::fs::write(wt.join(".env.more"), "B=y\n").unwrap();
+        let files = vec![".env.local".to_string(), ".env.more".to_string()];
+        let (vars, primary_only) = env_file_vars(&root, &wt, &files);
+        let vars: BTreeMap<_, _> = vars.into_iter().collect();
+        assert_eq!(vars["A"], "2");
+        assert_eq!(vars["B"], "y");
+        assert_eq!(primary_only, ["GONE"]);
+        let (vars, primary_only) = env_file_vars(&root, &root, &files);
+        assert_eq!(vars.len(), 2);
+        assert!(primary_only.is_empty());
+        assert_eq!(env_file_vars(&root, &wt, &[]).0, vec![]);
+    }
+
+    #[test]
+    fn project_settings_from_env() {
+        let settings = ProjectSettings {
+            name: Some("app".into()),
+            port: 4000,
+            remote: "origin".into(),
+            base: None,
+            worktrees_dir: ".claude/worktrees".into(),
+            migrate: None,
+            seed: None,
+            setup: None,
+            services: Default::default(),
+            preview_ttl_hours: 48,
+            no_sync: false,
+            no_auto_remove: false,
+        };
+        let mut p = Project::new("/src/app".into(), settings);
+        assert!(p.copy_on_write());
+        assert!(!p.template_refresh_manual() && !p.postgres_durable());
+        assert!(!p.redis_shared() && !p.redis_start_up());
+        assert!(p.env_files().is_empty());
+        p.env = [
+            ("LAZY_COW_TREE_POSTGRES_COW", "0"),
+            ("LAZY_COW_TREE_POSTGRES_TEMPLATE_REFRESH", "manual"),
+            ("LAZY_COW_TREE_POSTGRES_DURABLE", "1"),
+            ("LAZY_COW_TREE_REDIS_INSTANCE", "shared"),
+            ("LAZY_COW_TREE_REDIS_START", "up"),
+            ("LAZY_COW_TREE_ENV_FILES", r#"[".env.local"]"#),
+        ]
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .to_vec();
+        assert!(!p.copy_on_write());
+        assert!(p.template_refresh_manual() && p.postgres_durable());
+        assert!(p.redis_shared() && p.redis_start_up());
+        assert_eq!(p.env_files(), [".env.local"]);
+    }
+
+    #[test]
     fn services() {
         let c = with_services(
             r#"{"web": {"exec": "mix phx.server", "dependsOn": ["worker"]},
@@ -1154,15 +1533,15 @@ mod tests {
         // Every service shares the checkout's database and Redis (for now).
         let env: BTreeMap<_, _> = c.service_env(&global(), Some("api")).into_iter().collect();
         assert_eq!(env["PORT"], "20000");
-        assert_eq!(env["LOCALFOREST_URL"], "https://wt.api.my-app.localhost");
+        assert_eq!(env["LAZY_COW_TREE_URL"], "https://wt.api.my-app.localhost");
         assert_eq!(env["PGDATABASE"], "my_app_dev_wt");
         assert!(env["REDIS_URL"].starts_with("redis://:my-app--wt@"));
         assert_eq!(
-            env["LOCALFOREST_WEB_URL"],
+            env["LAZY_COW_TREE_WEB_URL"],
             "https://wt.web.my-app.localhost"
         );
-        assert_eq!(env["LOCALFOREST_WORKER_PORT"], "20002");
-        assert!(!env.contains_key("LOCALFOREST_WORKER_URL"));
+        assert_eq!(env["LAZY_COW_TREE_WORKER_PORT"], "20002");
+        assert!(!env.contains_key("LAZY_COW_TREE_WORKER_URL"));
         let web: BTreeMap<_, _> = c.env(&global()).into_iter().collect();
         assert_eq!(web["PORT"], "20001");
         assert_eq!(web["DATABASE_URL"], env["DATABASE_URL"]);
@@ -1242,13 +1621,13 @@ mod tests {
             assert_eq!(env["TEST_PORT"], "4008");
             assert_eq!(env["ADMIN_PORT"], "4007");
             assert_eq!(env["METRICS_PORT"], "4005");
-            assert_eq!(env["LOCALFOREST_WEB_DEBUGGER_PORT"], "4009");
+            assert_eq!(env["LAZY_COW_TREE_WEB_DEBUGGER_PORT"], "4009");
             assert_eq!(
-                env["LOCALFOREST_WEB_DEBUGGER_URL"],
+                env["LAZY_COW_TREE_WEB_DEBUGGER_URL"],
                 "https://debugger.my-app.localhost"
             );
-            assert_eq!(env["LOCALFOREST_WEB_TEST_PORT"], "4008");
-            assert!(!env.contains_key("LOCALFOREST_WEB_TEST_URL"));
+            assert_eq!(env["LAZY_COW_TREE_WEB_TEST_PORT"], "4008");
+            assert!(!env.contains_key("LAZY_COW_TREE_WEB_TEST_URL"));
         }
 
         let err = |json: &str| json.parse::<Services>().unwrap_err();
@@ -1284,21 +1663,21 @@ mod tests {
             err(r#"{"a": {"exec": "x", "ports": {"p": {"env": "lower"}}}}"#).contains("not [A-Z_]")
         );
         assert!(err(r#"{"a": {"exec": "x", "ports": {"P": {}}}}"#).contains("a-z"));
-        for reserved in RESERVED_ENV.iter().chain(&["LOCALFOREST_X"]) {
+        for reserved in RESERVED_ENV.iter().chain(&["LAZY_COW_TREE_X"]) {
             let json =
                 format!(r#"{{"a": {{"exec": "x", "ports": {{"p": {{"env": "{reserved}"}}}}}}}}"#);
-            assert!(err(&json).contains("set by localforest"), "{reserved}");
+            assert!(err(&json).contains("set by lazy-cow-tree"), "{reserved}");
         }
         assert!(
             err(r#"{"web": {"exec": "x", "ports": {"debugger": {}}}, "web-debugger": {"exec": "y"}}"#)
-                .contains("both set LOCALFOREST_WEB_DEBUGGER_PORT")
+                .contains("both set LAZY_COW_TREE_WEB_DEBUGGER_PORT")
         );
         // Everything else service_env sets is reserved.
         let env = c.service_env(&global(), Some("web"));
         let ports: Vec<String> = c.port_slots().into_iter().map(|p| p.env).collect();
         for (k, _) in env {
             assert!(
-                k.starts_with("LOCALFOREST_")
+                k.starts_with("LAZY_COW_TREE_")
                     || RESERVED_ENV.contains(&k.as_str())
                     || ports.contains(&k),
                 "{k} not in RESERVED_ENV"
@@ -1396,7 +1775,25 @@ mod tests {
             redis_server: None,
             postgres_extensions: Some("postgis, vector  pg_trgm,".into()),
             devenv_proxy_socket: None,
+            postgres_durable: false,
+            redis_idle_timeout: None,
         }
+    }
+
+    #[test]
+    fn state_dir_moves_from_the_former_name_once() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(state_dir(d.path()), d.path().join("lazy-cow-tree"));
+        std::fs::create_dir_all(d.path().join("localforest/ca")).unwrap();
+        std::fs::write(d.path().join("localforest/ca/ca.pem"), "x").unwrap();
+        let dir = state_dir(d.path());
+        assert_eq!(dir, d.path().join("lazy-cow-tree"));
+        assert!(dir.join("ca/ca.pem").exists());
+        assert!(!d.path().join("localforest").exists());
+        // Both present: the new one wins, the old one is left alone.
+        std::fs::create_dir(d.path().join("localforest")).unwrap();
+        assert_eq!(state_dir(d.path()), dir);
+        assert!(d.path().join("localforest").exists());
     }
 
     #[test]

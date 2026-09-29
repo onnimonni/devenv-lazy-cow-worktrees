@@ -1214,6 +1214,50 @@ dependencies = [
 ]
 
 [[package]]
+name = "lazy-cow-tree"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.23.1",
+ "bytes",
+ "clap",
+ "dotenvy",
+ "filetime",
+ "futures-util",
+ "git-cow",
+ "git2",
+ "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "ignore",
+ "keyring",
+ "libc",
+ "libgit2-sys",
+ "notify",
+ "openssl-sys",
+ "rcgen",
+ "reflink-copy",
+ "reqwest",
+ "rustls",
+ "rustls-webpki",
+ "security-framework 3.7.0",
+ "serde",
+ "serde_json",
+ "sha2",
+ "shell-words",
+ "tempfile",
+ "time",
+ "tokio",
+ "tokio-postgres",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1285,50 +1329,6 @@ name = "litemap"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
-
-[[package]]
-name = "localforest"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "base64 0.23.1",
- "bytes",
- "clap",
- "dotenvy",
- "filetime",
- "futures-util",
- "git-cow",
- "git2",
- "hex",
- "http-body-util",
- "hyper",
- "hyper-util",
- "ignore",
- "keyring",
- "libc",
- "libgit2-sys",
- "notify",
- "openssl-sys",
- "rcgen",
- "reflink-copy",
- "reqwest",
- "rustls",
- "rustls-webpki",
- "security-framework 3.7.0",
- "serde",
- "serde_json",
- "sha2",
- "shell-words",
- "tempfile",
- "time",
- "tokio",
- "tokio-postgres",
- "tokio-rustls",
- "tokio-tungstenite",
- "tracing",
- "tracing-subscriber",
-]
 
 [[package]]
 name = "lock_api"

@@ -25,11 +25,15 @@ pub struct Ca {
     leaves: Mutex<HashMap<String, Arc<CertifiedKey>>>,
 }
 
+/// The CA's common name. Leaves name it as their issuer, so a CA created under another
+/// name (the project's former `localforest`) is replaced rather than reused.
+const CA_NAME: &str = "lazy-cow-tree local development CA";
+
 fn ca_params() -> CertificateParams {
     let mut p = CertificateParams::default();
     let mut dn = DistinguishedName::new();
-    dn.push(DnType::CommonName, "localforest local development CA");
-    dn.push(DnType::OrganizationName, "localforest");
+    dn.push(DnType::CommonName, CA_NAME);
+    dn.push(DnType::OrganizationName, "lazy-cow-tree");
     p.distinguished_name = dn;
     p.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
     p.key_usages = vec![
@@ -45,9 +49,25 @@ impl Ca {
     pub fn load_or_create(dir: &Path) -> Result<Self> {
         let cert_path = dir.join("ca.pem");
         let key_path = dir.join("ca-key.pem");
-        let (cert_pem, key) = if cert_path.exists() && key_path.exists() {
+        let existing = (cert_path.exists() && key_path.exists())
+            .then(|| std::fs::read_to_string(&cert_path))
+            .transpose()?
+            .filter(|pem| {
+                // DER keeps the common name's bytes verbatim.
+                let current = rustls_pemfile_cert(pem).is_ok_and(|der| {
+                    der.windows(CA_NAME.len()).any(|w| w == CA_NAME.as_bytes())
+                });
+                if !current {
+                    tracing::warn!(
+                        "replacing the local CA in {} (created under another name); run `lazy-cow-tree trust` again",
+                        dir.display()
+                    );
+                }
+                current
+            });
+        let (cert_pem, key) = if let Some(pem) = existing {
             let key = KeyPair::from_pem(&std::fs::read_to_string(&key_path)?)?;
-            (std::fs::read_to_string(&cert_path)?, key)
+            (pem, key)
         } else {
             std::fs::create_dir_all(dir)?;
             let key = KeyPair::generate()?;
@@ -59,7 +79,7 @@ impl Ca {
             write_private(&key_path, key.serialize_pem().as_bytes())?;
             std::fs::write(&cert_path, cert.pem())?;
             tracing::info!(
-                "created local CA {}; run `localforest trust` to trust it",
+                "created local CA {}; run `lazy-cow-tree trust` to trust it",
                 cert_path.display()
             );
             (cert.pem(), key)
@@ -195,4 +215,34 @@ pub fn trust(_ca: &Ca) -> Result<()> {
         "automatic trust is macOS only; add {} to your system and browser trust stores",
         crate::config::ca_cert_path().display()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keeps_its_own_ca_and_replaces_one_made_under_another_name() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let d = tempfile::tempdir().unwrap();
+        let first = Ca::load_or_create(d.path()).unwrap();
+        let again = Ca::load_or_create(d.path()).unwrap();
+        assert_eq!(first.cert_der(), again.cert_der());
+
+        // A CA like the former name's: same files, another common name.
+        let key = KeyPair::generate().unwrap();
+        let mut params = ca_params();
+        params.distinguished_name = DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "localforest local development CA");
+        let old = params.self_signed(&key).unwrap();
+        std::fs::write(d.path().join("ca.pem"), old.pem()).unwrap();
+        std::fs::write(d.path().join("ca-key.pem"), key.serialize_pem()).unwrap();
+        let replaced = Ca::load_or_create(d.path()).unwrap();
+        assert_ne!(replaced.cert_der().as_ref(), old.der().as_ref());
+        let pem = std::fs::read_to_string(d.path().join("ca.pem")).unwrap();
+        let der = rustls_pemfile_cert(&pem).unwrap();
+        assert!(der.windows(CA_NAME.len()).any(|w| w == CA_NAME.as_bytes()));
+    }
 }

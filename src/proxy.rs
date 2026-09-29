@@ -43,6 +43,16 @@ struct Route {
     subdomains: bool,
     /// Checkout id, whose activity a request touches.
     id: String,
+    /// Service id (`Checkout::service_id`) whose open connections it counts.
+    service: Option<String>,
+}
+
+/// Open proxied connections of a service and when the last one ended (or a request
+/// came in).
+#[derive(Debug, Clone, Copy)]
+struct Conns {
+    open: usize,
+    last: std::time::Instant,
 }
 
 /// host -> route.
@@ -50,6 +60,23 @@ struct Route {
 pub struct Routes {
     map: Arc<RwLock<HashMap<String, Route>>>,
     activity: crate::history::Activity,
+    conns: Arc<std::sync::Mutex<HashMap<String, Conns>>>,
+}
+
+/// Counts one open connection of a service while alive (`Routes::guard`).
+pub struct ConnGuard {
+    conns: Arc<std::sync::Mutex<HashMap<String, Conns>>>,
+    service: String,
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        let mut conns = self.conns.lock().unwrap();
+        if let Some(c) = conns.get_mut(&self.service) {
+            c.open = c.open.saturating_sub(1);
+            c.last = std::time::Instant::now();
+        }
+    }
 }
 
 impl Routes {
@@ -57,18 +84,59 @@ impl Routes {
         Self {
             map: Default::default(),
             activity,
+            conns: Default::default(),
         }
     }
 
-    pub fn set(&self, host: String, port: u16, subdomains: bool, id: String) {
+    pub fn set(
+        &self,
+        host: String,
+        port: u16,
+        subdomains: bool,
+        id: String,
+        service: Option<String>,
+    ) {
         self.map.write().unwrap().insert(
             host,
             Route {
                 port,
                 subdomains,
                 id,
+                service,
             },
         );
+    }
+
+    /// An open connection of `service` until dropped.
+    pub fn guard(&self, service: &str) -> ConnGuard {
+        let now = std::time::Instant::now();
+        self.conns
+            .lock()
+            .unwrap()
+            .entry(service.to_string())
+            .and_modify(|c| {
+                c.open += 1;
+                c.last = now;
+            })
+            .or_insert(Conns { open: 1, last: now });
+        ConnGuard {
+            conns: self.conns.clone(),
+            service: service.to_string(),
+        }
+    }
+
+    /// When `service` last had an open connection (or a request), None while one is
+    /// open; `since` when it never had one.
+    pub fn idle_since(
+        &self,
+        service: &str,
+        since: std::time::Instant,
+    ) -> Option<std::time::Instant> {
+        match self.conns.lock().unwrap().get(service) {
+            Some(c) if c.open > 0 => None,
+            Some(c) => Some(c.last.max(since)),
+            None => Some(since),
+        }
     }
 
     pub fn remove(&self, host: &str) {
@@ -96,7 +164,13 @@ impl Routes {
     /// debug.wt.web.app.localhost -> wt.web.app.localhost). Primary hosts don't, so a
     /// removed worktree's host never silently reaches the primary checkout. Counts as
     /// activity of the checkout.
+    #[cfg(test)]
     pub fn lookup(&self, host: &str) -> Option<u16> {
+        self.lookup_service(host).map(|(port, _)| port)
+    }
+
+    /// `lookup`, with the service id its connections count for.
+    pub fn lookup_service(&self, host: &str) -> Option<(u16, Option<String>)> {
         let routes = self.map.read().unwrap();
         let route = routes.get(host).or_else(|| {
             let mut h = host;
@@ -109,11 +183,11 @@ impl Routes {
             None
         })?;
         self.activity.touch(&route.id);
-        Some(route.port)
+        Some((route.port, route.service.clone()))
     }
 }
 
-/// Renders the dashboard served at https://localforest.localhost.
+/// Renders the dashboard served at https://lazy-cow-tree.localhost.
 pub type Dashboard = Arc<dyn Fn() -> String + Send + Sync>;
 
 /// Called with the host when nothing listens on its port: starts the worktree's
@@ -176,7 +250,7 @@ async fn bind(port: u16) -> Result<TcpListener> {
 }
 
 /// A devenv route's own certificate (its project's mkcert CA), else a leaf from
-/// localforest's CA.
+/// lazy-cow-tree's CA.
 #[derive(Debug)]
 struct Certificates {
     ca: Arc<crate::tls::Ca>,
@@ -241,7 +315,11 @@ pub async fn serve(
                 Ok(s) => s,
                 Err(e) => return debug!("TLS handshake with {peer}: {e}"),
             };
-            let svc = service_fn(move |req| handle(shared.clone(), peer, req, "https"));
+            // The service this connection last reached: counted open while it lasts.
+            let slot: ConnSlot = Default::default();
+            let svc = service_fn(move |req| {
+                handle(shared.clone(), peer, req, "https", Some(slot.clone()))
+            });
             if let Err(e) = http1::Builder::new()
                 .serve_connection(TokioIo::new(stream), svc)
                 .with_upgrades()
@@ -273,7 +351,7 @@ async fn http_loop(listener: TcpListener, https_port: u16, shared: Arc<Shared>) 
                         return Ok(full(StatusCode::NO_CONTENT, "text/plain", Bytes::new()));
                     }
                     if shared.devenv.resolve(&host).is_some() {
-                        return handle(shared, peer, req, "http").await;
+                        return handle(shared, peer, req, "http", None).await;
                     }
                     let port = if https_port == 443 {
                         String::new()
@@ -326,30 +404,35 @@ fn is_upgrade(req: &Request<Incoming>) -> bool {
         .is_some_and(|v| v.to_ascii_lowercase().contains("upgrade"))
 }
 
+/// A connection's open-connection count (`ConnGuard`), set by its first request to a
+/// service and moved to another service by a request there.
+type ConnSlot = Arc<std::sync::Mutex<Option<(String, ConnGuard)>>>;
+
 async fn handle(
     shared: Arc<Shared>,
     peer: SocketAddr,
     req: Request<Incoming>,
     scheme: &'static str,
+    slot: Option<ConnSlot>,
 ) -> Result<Response<Body>, Infallible> {
     let host = request_host(&req);
-    if host == "localforest.localhost" || host == "localhost" {
+    if host == "lazy-cow-tree.localhost" || host == "localhost" {
         return Ok(full(
             StatusCode::OK,
             "text/html; charset=utf-8",
             (shared.dashboard)(),
         ));
     }
-    let Some(port) = shared.routes.lookup(&host) else {
+    let Some((port, service)) = shared.routes.lookup_service(&host) else {
         if let Some(upstream) = shared.devenv.resolve(&host) {
             let upstream = devenv_proxy::reachable(upstream).await;
-            return Ok(forward(&shared, req, peer, &host, upstream, scheme)
+            return Ok(forward(&shared, req, peer, &host, upstream, scheme, None)
                 .await
                 .unwrap_or_else(|e| {
                     full(
                         StatusCode::BAD_GATEWAY,
                         "text/plain; charset=utf-8",
-                        format!("localforest: nothing answers for {host} on {upstream} ({e}); devenv registered it\n"),
+                        format!("lazy-cow-tree: nothing answers for {host} on {upstream} ({e}); devenv registered it\n"),
                     )
                 }));
         }
@@ -378,10 +461,22 @@ async fn handle(
         return Ok(full(
             StatusCode::NOT_FOUND,
             "text/plain; charset=utf-8",
-            format!("localforest: no worktree serves {host}; see https://localforest.localhost\n"),
+            format!(
+                "lazy-cow-tree: no worktree serves {host}; see https://lazy-cow-tree.localhost\n"
+            ),
         ));
     };
 
+    // Counted before starting it: an idle stop never races the request it serves.
+    let upgrade_guard = service.as_ref().map(|s| {
+        if let Some(slot) = &slot {
+            let mut slot = slot.lock().unwrap();
+            if slot.as_ref().is_none_or(|(cur, _)| cur != s) {
+                *slot = Some((s.clone(), shared.routes.guard(s)));
+            }
+        }
+        shared.routes.guard(s)
+    });
     if tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
         .is_err()
@@ -391,25 +486,26 @@ async fn handle(
             StatusCode::BAD_GATEWAY,
             "text/plain; charset=utf-8",
             format!(
-                "localforest: could not start {host}: {e}\nSee `localforest status` and the logs in ~/.local/state/localforest/logs.\n"
+                "lazy-cow-tree: could not start {host}: {e}\nSee `lazy-cow-tree status` and the logs in ~/.local/state/lazy-cow-tree/logs.\n"
             ),
         ));
     }
     let upstream = SocketAddr::from(([127, 0, 0, 1], port));
-    Ok(forward(&shared, req, peer, &host, upstream, scheme)
+    Ok(forward(&shared, req, peer, &host, upstream, scheme, upgrade_guard)
         .await
         .unwrap_or_else(|e| {
             full(
                 StatusCode::BAD_GATEWAY,
                 "text/plain; charset=utf-8",
                 format!(
-                    "localforest: nothing answers for {host} on 127.0.0.1:{port} ({e}).\nSet localforest.server (devenv.nix) to start it on demand, or run it with PORT={port} (see `localforest env`); logs: `localforest server log <name>`.\n"
+                    "lazy-cow-tree: nothing answers for {host} on 127.0.0.1:{port} ({e}).\nSet lazy-cow-tree.server (devenv.nix) to start it on demand, or run it with PORT={port} (see `lazy-cow-tree env`); logs: `lazy-cow-tree server log <name>`.\n"
                 ),
             )
         }))
 }
 
-/// Proxy `req` to `upstream`, websockets included.
+/// Proxy `req` to `upstream`, websockets included; `guard` counts the request, and
+/// an upgraded connection for as long as it's open.
 async fn forward(
     shared: &Shared,
     mut req: Request<Incoming>,
@@ -417,6 +513,7 @@ async fn forward(
     host: &str,
     upstream: SocketAddr,
     scheme: &'static str,
+    guard: Option<ConnGuard>,
 ) -> Result<Response<Body>, hyper_util::client::legacy::Error> {
     let path = req.uri().path_and_query().map_or("/", |p| p.as_str());
     let Ok(uri) = format!("http://{upstream}{path}").parse() else {
@@ -440,6 +537,7 @@ async fn forward(
     {
         let upstream_upgrade = hyper::upgrade::on(&mut resp);
         tokio::spawn(async move {
+            let _guard = guard;
             match tokio::try_join!(client_upgrade, upstream_upgrade) {
                 Ok((c, u)) => {
                     let _ =
@@ -467,11 +565,47 @@ mod tests {
     }
 
     #[test]
+    fn counts_open_connections_per_service() {
+        let r = Routes::default();
+        r.set(
+            "web.app.localhost".into(),
+            4000,
+            false,
+            "app".into(),
+            Some("app.web".into()),
+        );
+        let started = std::time::Instant::now();
+        assert_eq!(
+            r.lookup_service("web.app.localhost"),
+            Some((4000, Some("app.web".into())))
+        );
+        // Never connected: idle since it started.
+        assert_eq!(r.idle_since("app.web", started), Some(started));
+        let a = r.guard("app.web");
+        let b = r.guard("app.web");
+        assert_eq!(r.idle_since("app.web", started), None);
+        drop(a);
+        assert_eq!(r.idle_since("app.web", started), None);
+        drop(b);
+        let since = r.idle_since("app.web", started).unwrap();
+        assert!(since >= started && since.elapsed() < std::time::Duration::from_secs(1));
+        // A restart after the last connection counts from the restart.
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        assert_eq!(r.idle_since("app.web", later), Some(later));
+    }
+
+    #[test]
     fn lookup_falls_back_to_parent() {
         let r = Routes::default();
-        r.set("app.localhost".into(), 4000, false, "app".into());
-        r.set("api.app.localhost".into(), 4001, false, "app".into());
-        r.set("wt.api.app.localhost".into(), 20010, true, "app-wt".into());
+        r.set("app.localhost".into(), 4000, false, "app".into(), None);
+        r.set("api.app.localhost".into(), 4001, false, "app".into(), None);
+        r.set(
+            "wt.api.app.localhost".into(),
+            20010,
+            true,
+            "app-wt".into(),
+            None,
+        );
         assert_eq!(r.lookup("wt.api.app.localhost"), Some(20010));
         assert_eq!(r.lookup("debug.wt.api.app.localhost"), Some(20010));
         assert!(r.activity.get("app-wt").is_some());
