@@ -254,6 +254,11 @@ impl Daemon {
         }
         let lock = rt.migrate_lock(c);
         let _g = lock.lock().await;
+        // Removed meanwhile (`remove_locked` holds this lock while it drops the databases):
+        // nothing to migrate, and a clone now would outlive the worktree.
+        if c.worktree.is_some() && !c.path.join(".git").exists() {
+            return Ok(());
+        }
         // Its changed files restart its services after migrating, not during.
         let _hold = self.servers.hold(&c.path);
         if !force && let Some(f) = rt.migrate_failure(c).filter(MigrateFailure::backing_off) {

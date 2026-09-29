@@ -306,6 +306,9 @@ impl Daemon {
                 info.name
             ));
         }
+        // Not while its migrations run: they would clone its dev database again.
+        let lock = rt.migrate_lock(&c);
+        let _migrating = lock.lock().await;
         if let Err(e) = self.deprovision(&c).await {
             // Still known: the next reconcile finds it gone and tries again.
             anyhow::bail!(
