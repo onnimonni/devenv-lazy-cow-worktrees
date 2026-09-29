@@ -227,3 +227,20 @@ fn watched_files() {
     assert!(w.concerns(&dir.join("config")));
     assert!(!w.concerns(&dir.join("lib/a.exs")));
 }
+
+#[test]
+fn services_skip_the_shell_hook_but_keep_the_users_bash_env() {
+    let kv = |k: &str, v: &str| (k.to_string(), v.to_string());
+    let env = without_shell_hook(vec![
+        kv("PATH", "/bin"),
+        kv("BASH_ENV", "/nix/store/x-lazy-cow-tree-hook"),
+        kv("ZDOTDIR", "/nix/store/x-zdotdir"),
+        kv("LAZY_COW_TREE_BASH_ENV", "/home/u/.bashenv"),
+        kv("LAZY_COW_TREE_ZDOTDIR", ""),
+        kv("LAZY_COW_TREE_SHELL", "{}"),
+    ]);
+    assert_eq!(
+        env,
+        vec![kv("PATH", "/bin"), kv("BASH_ENV", "/home/u/.bashenv")]
+    );
+}
