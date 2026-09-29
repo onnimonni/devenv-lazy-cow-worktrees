@@ -400,8 +400,12 @@ that project's `devenv up` finds a running proxy and registers its hostnames her
 its processes are served over HTTPS with the project's own mkcert certificate and
 over plain HTTP, like with devenv's proxy. Nothing changes in that project.
 
-- Start localforest first: a `devenv-proxy` that is already running keeps the
-  socket, and the daemon logs that devenv projects keep their own proxy.
+- To have `devenv up` start localforest when nothing runs yet, point devenv at it
+  instead of its own proxy: `DEVENV_PROXY_BINARY=<localforest>/bin/localforest-devenv-proxy`
+  (e.g. `home.sessionVariables` in home-manager). It runs the daemon with the ports
+  and socket devenv asks for, the proxy up before PostgreSQL. Without it, start
+  localforest first: a `devenv-proxy` that is already running keeps the socket,
+  and the daemon logs that devenv projects keep their own proxy.
 - Hostnames localforest serves can't be registered by a devenv project, and the
   other way around.
 - devenv expects the proxy on `127.0.0.1:80` (plain HTTP, its health check) and
