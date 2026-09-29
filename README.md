@@ -56,7 +56,7 @@ get the environment of the worktree they're in.
 | **HTTPS** | Local CA, websockets included. `https://lazy-cow-tree.localhost` lists everything. |
 | **GitHub** | Webhook websocket (polling without repo admin rights): pushes pull every branch and merge the base branch into worktrees (conflict-free merges only, dirty worktrees skipped). A worktree whose PR merged is removed unless it has newer work or wasn't made at least 5 minutes before the merge (a new task reusing the branch name; `worktree rm` without `--force` refuses it too); `lazyCowTree.autoRemoveMerged = false` keeps them. |
 | **Migrations** | When the base branch moves: the migrate commands run in the primary checkout, then the template is refreshed from its database; they also run in every worktree the base branch was merged into, and once in each new worktree after its database is cloned (its branch may carry migrations the template lacks; done is recorded per database, so one recreated after a reboot is migrated again). A worktree's services start only once its migrations succeeded; a failure shows in `lazy-cow-tree status` and on its 502 page and is retried with a growing backoff. Migrations don't block creating, syncing or removing other worktrees. A freshly created primary database (first start, after a reboot) is migrated and seeded whatever branch the primary is on, but the template is only made from an up-to-date base branch. Until it exists, worktrees clone the primary's database instead, so they do get the primary's feature-branch migrations (then their own on top). |
-| **LSP proxy** | `lazy-cow-tree lsp -- <server>` runs one language server per worktree, routes each request by file, and drops results from other worktrees. Wrapped in the devenv shell and given to Claude Code and Codex (dexter, typescript-language-server, pyright and rust-analyzer for now). |
+| **LSP proxy** | `lazy-cow-tree lsp -- <server>` runs one language server per worktree, routes each request by file, and drops results from other worktrees. Wrapped in the devenv shell and given to Claude Code, Codex and pi (dexter, typescript-language-server, pyright and rust-analyzer for now). |
 
 Removing a worktree SIGKILLs everything running in it (each service's process group,
 plus any process whose working directory or executable is inside it, with all
@@ -270,8 +270,9 @@ config :myapp, MyApp.Repo, url: System.fetch_env!("TEST_DATABASE_URL"), pool: Ec
   `git` wrapper makes it copy-on-write)
 
 **7. Work in a worktree without devenv.** Start the agent from the primary's
-`devenv shell` (`devenv shell -- claude`, `devenv shell -- codex`). Every bash and zsh
-started from it, including Claude Code's and Codex's tool shells and their subagents',
+`devenv shell` (`devenv shell -- claude`, `devenv shell -- codex`, `devenv shell -- pi`).
+Every bash and zsh started from it, including Claude Code's, Codex's and pi's tool
+shells and their subagents',
 gets the environment of the checkout it runs in, and again after `cd`/`pushd`/`popd`,
 with nothing to tell the agent:
 
@@ -324,6 +325,10 @@ runs the real one.
   (definition, references, diagnostics, hover, rename, edits). The wrapper is given by
   path: Codex starts MCP servers with only `PATH`, `HOME` and a few more variables. Your
   own Codex settings go in `files.".codex/config.toml".toml`.
+- **pi** has no LSP client either: with `lazyCowTree.pi.lsp` the same MCP servers go in
+  the project's `.pi/mcp.json` (read once the project is trusted). It's a writable copy
+  that `devenv shell` rewrites, since pi saves `/mcp` changes (enable, exposure) into it;
+  your own pi servers go in `files.".pi/mcp.json".json.mcpServers`.
 
 FIXME: other language servers. devenv's `languages.*.lsp` has only `enable` and
 `package`, not the arguments a server starts with nor its file extensions
@@ -348,7 +353,8 @@ FIXME: other language servers. devenv's `languages.*.lsp` has only `enable` and
 | `lazyCowTree.git.package` | `pkgs.git` | the real git it runs |
 | `lazyCowTree.claude.lsp` | `true` | the language servers as Claude Code plugin `lazy-cow-tree-lsp` from a local marketplace in `.claude/settings.local.json` (step 8) |
 | `lazyCowTree.codex.lsp` | `true` | each supported language server as Codex MCP server `lsp-<binary>` (mcp-language-server) in `.codex/config.toml` (step 8) |
-| `lazyCowTree.codex.mcpLanguageServer` | `pkgs.mcp-language-server` | the LSP-to-MCP bridge |
+| `lazyCowTree.codex.mcpLanguageServer` | `pkgs.mcp-language-server` | the LSP-to-MCP bridge (Codex and pi) |
+| `lazyCowTree.pi.lsp` | `true` | each supported language server as pi MCP server `lsp-<binary>` in `.pi/mcp.json` (step 8) |
 | `lazyCowTree.codex.noDaemon` | `true` | wraps `codex` with `--no-daemon`, so it runs commands with this shell's environment |
 | `lazyCowTree.claude.trustCa` | `true` | sets `NODE_EXTRA_CA_CERTS` to the local CA in `.claude/settings.local.json` (a value you set there wins) |
 | `lazyCowTree.home` | `$LAZY_COW_TREE_HOME`, else `~/.local/state/lazy-cow-tree` | where the module looks for the daemon's CA (read from devenv's environment at evaluation; `env.LAZY_COW_TREE_HOME` too) |

@@ -181,6 +181,23 @@ let
     }
   ) config.languages;
   lspWrapperPath = s: "${lspWrapper s.cmd}/bin/${baseNameOf (lib.head s.cmd)}";
+  # Each language server as an MCP server `lsp-<binary>` for agents without an LSP client
+  # (Codex, pi): mcp-language-server on its wrapper, given by path (Codex passes MCP
+  # servers only PATH, HOME and a few more variables).
+  lspMcpServers = lib.mapAttrs' (
+    name: s:
+    lib.nameValuePair "lsp-${name}" {
+      command = lib.getExe cfg.codex.mcpLanguageServer;
+      args = [
+        "--workspace"
+        config.devenv.root
+        "--lsp"
+        (lspWrapperPath s)
+        "--"
+      ]
+      ++ s.args;
+    }
+  ) lspServers;
   # Claude Code runs language servers from plugins only: a local marketplace with one
   # plugin holding them, each through its wrapper.
   claudeLsp = cfg.claude.lsp && lspServers != { };
@@ -833,7 +850,12 @@ in
       type = types.package;
       default = pkgs.mcp-language-server;
       defaultText = lib.literalExpression "pkgs.mcp-language-server";
-      description = "The LSP-to-MCP bridge `codex.lsp` uses (isaacphi/mcp-language-server).";
+      description = "The LSP-to-MCP bridge `codex.lsp` and `pi.lsp` use (isaacphi/mcp-language-server).";
+    };
+    pi.lsp = mkOption {
+      type = types.bool;
+      default = true;
+      description = "Give pi (which has no LSP client) each supported language server of the enabled `languages.*` (dexter, typescript-language-server, pyright, rust-analyzer) as an MCP server `lsp-<name>` in the project's `.pi/mcp.json` (read once the project is trusted): mcp-language-server on the server's wrapper, so it runs behind `lazy-cow-tree lsp` too. Add your own pi servers through `files.\".pi/mcp.json\".json.mcpServers`.";
     };
     codex.noDaemon = mkOption {
       type = types.bool;
@@ -997,24 +1019,11 @@ in
       description = "codex --no-daemon (lazy-cow-tree.codex.noDaemon)";
     };
 
-    # Codex has no LSP client: each language server as an MCP server, through its
-    # wrapper by path (Codex gives MCP servers only PATH, HOME and a few more).
-    files.".codex/config.toml".toml.mcp_servers = lib.mkIf (cfg.codex.lsp && lspServers != { }) (
-      lib.mapAttrs' (
-        name: s:
-        lib.nameValuePair "lsp-${name}" {
-          command = lib.getExe cfg.codex.mcpLanguageServer;
-          args = [
-            "--workspace"
-            config.devenv.root
-            "--lsp"
-            (lspWrapperPath s)
-            "--"
-          ]
-          ++ s.args;
-        }
-      ) lspServers
-    );
+    # Codex and pi have no LSP client: each language server as an MCP server.
+    files.".codex/config.toml".toml.mcp_servers = lib.mkIf (cfg.codex.lsp && lspServers != { }) lspMcpServers;
+    files.".pi/mcp.json".json.mcpServers = lib.mkIf (cfg.pi.lsp && lspServers != { }) lspMcpServers;
+    # pi writes /mcp changes (enable, exposure) back to the file defining the server.
+    files.".pi/mcp.json".copyMode = lib.mkIf (cfg.pi.lsp && lspServers != { }) "copy";
 
     # Claude Code runs language servers from plugins only: ours, from a local marketplace.
     files.".claude/settings.local.json".json.extraKnownMarketplaces = lib.mkIf claudeLsp {
