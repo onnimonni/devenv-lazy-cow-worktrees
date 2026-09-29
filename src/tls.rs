@@ -1,13 +1,10 @@
 //! Local certificate authority for https://*.localhost. The CA is created once in
 //! the state directory; leaf certificates are issued in memory per SNI name.
 
-use std::{
-    collections::HashMap,
-    path::Path,
-    sync::{Arc, Mutex},
-};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 use anyhow::{Context, Result};
+use parking_lot::Mutex;
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
     Issuer, KeyPair, KeyUsagePurpose,
@@ -99,7 +96,7 @@ impl Ca {
     }
 
     fn leaf(&self, host: &str) -> Result<Arc<CertifiedKey>> {
-        if let Some(k) = self.leaves.lock().unwrap().get(host) {
+        if let Some(k) = self.leaves.lock().get(host) {
             return Ok(k.clone());
         }
         let key = KeyPair::generate()?;
@@ -123,10 +120,7 @@ impl Ca {
             vec![cert.der().clone(), self.cert_der.clone()],
             signing,
         ));
-        self.leaves
-            .lock()
-            .unwrap()
-            .insert(host.to_string(), ck.clone());
+        self.leaves.lock().insert(host.to_string(), ck.clone());
         Ok(ck)
     }
 }

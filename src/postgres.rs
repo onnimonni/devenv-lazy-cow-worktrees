@@ -117,7 +117,7 @@ impl Postgres {
             None => which("postgres")
                 .context("`postgres` not in PATH; add pkgs.postgresql_18 to devenv.nix packages")?
                 .parent()
-                .unwrap()
+                .context("`postgres` in PATH has no parent directory")?
                 .to_path_buf(),
         };
         let postgres = bin.join("postgres");

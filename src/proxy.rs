@@ -4,12 +4,7 @@
 //! Hosts that devenv projects register (devenv_proxy.rs) go through the same
 //! listeners, over HTTPS and plain HTTP like devenv's own proxy.
 
-use std::{
-    collections::HashMap,
-    convert::Infallible,
-    net::SocketAddr,
-    sync::{Arc, RwLock},
-};
+use std::{collections::HashMap, convert::Infallible, net::SocketAddr, sync::Arc};
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -25,6 +20,7 @@ use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::{TokioExecutor, TokioIo},
 };
+use parking_lot::RwLock;
 use rustls::{
     server::{ClientHello, ResolvesServerCert},
     sign::CertifiedKey,
@@ -57,18 +53,18 @@ struct Conns {
 #[derive(Clone, Default)]
 pub struct Routes {
     map: Arc<RwLock<HashMap<String, Route>>>,
-    conns: Arc<std::sync::Mutex<HashMap<String, Conns>>>,
+    conns: Arc<parking_lot::Mutex<HashMap<String, Conns>>>,
 }
 
 /// Counts one open connection of a service while alive (`Routes::guard`).
 pub struct ConnGuard {
-    conns: Arc<std::sync::Mutex<HashMap<String, Conns>>>,
+    conns: Arc<parking_lot::Mutex<HashMap<String, Conns>>>,
     service: String,
 }
 
 impl Drop for ConnGuard {
     fn drop(&mut self) {
-        let mut conns = self.conns.lock().unwrap();
+        let mut conns = self.conns.lock();
         if let Some(c) = conns.get_mut(&self.service) {
             c.open = c.open.saturating_sub(1);
             c.last = std::time::Instant::now();
@@ -78,7 +74,7 @@ impl Drop for ConnGuard {
 
 impl Routes {
     pub fn set(&self, host: String, port: u16, subdomains: bool, service: Option<String>) {
-        self.map.write().unwrap().insert(
+        self.map.write().insert(
             host,
             Route {
                 port,
@@ -93,7 +89,6 @@ impl Routes {
         let now = std::time::Instant::now();
         self.conns
             .lock()
-            .unwrap()
             .entry(service.to_string())
             .and_modify(|c| {
                 c.open += 1;
@@ -113,7 +108,7 @@ impl Routes {
         service: &str,
         since: std::time::Instant,
     ) -> Option<std::time::Instant> {
-        match self.conns.lock().unwrap().get(service) {
+        match self.conns.lock().get(service) {
             Some(c) if c.open > 0 => None,
             Some(c) => Some(c.last.max(since)),
             None => Some(since),
@@ -121,12 +116,12 @@ impl Routes {
     }
 
     pub fn remove(&self, host: &str) {
-        self.map.write().unwrap().remove(host);
+        self.map.write().remove(host);
     }
 
     /// Whether a request for `host` would reach a checkout.
     pub fn serves(&self, host: &str) -> bool {
-        let routes = self.map.read().unwrap();
+        let routes = self.map.read();
         if routes.contains_key(host) {
             return true;
         }
@@ -150,7 +145,7 @@ impl Routes {
 
     /// `lookup`, with the service id its connections count for.
     pub fn lookup_service(&self, host: &str) -> Option<(u16, Option<String>)> {
-        let routes = self.map.read().unwrap();
+        let routes = self.map.read();
         let route = routes.get(host).or_else(|| {
             let mut h = host;
             while let Some((_, parent)) = h.split_once('.') {
@@ -185,12 +180,12 @@ struct Shared {
     ensure: Ensure,
 }
 
-fn full(status: StatusCode, content_type: &str, body: impl Into<Bytes>) -> Response<Body> {
-    Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, content_type)
-        .body(Full::new(body.into()).map_err(|n| match n {}).boxed())
-        .unwrap()
+fn full(status: StatusCode, content_type: &'static str, body: impl Into<Bytes>) -> Response<Body> {
+    let mut resp = Response::new(Full::new(body.into()).map_err(|n| match n {}).boxed());
+    *resp.status_mut() = status;
+    resp.headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    resp
 }
 
 /// Bind `port`; below 1024 on all interfaces (unprivileged on macOS), else loopback.
@@ -312,13 +307,17 @@ async fn http_loop(listener: TcpListener, https_port: u16, shared: Arc<Shared>) 
                     };
                     let path = req.uri().path_and_query().map_or("/", |p| p.as_str());
                     let host = if host.is_empty() { "localhost" } else { &host };
-                    Ok::<_, Infallible>(
-                        Response::builder()
-                            .status(StatusCode::PERMANENT_REDIRECT)
-                            .header(header::LOCATION, format!("https://{host}{port}{path}"))
-                            .body(Full::new(Bytes::new()).map_err(|n| match n {}).boxed())
-                            .unwrap(),
-                    )
+                    // The Host header is the client's: one that can't be a header value gets a 400.
+                    let mut resp =
+                        Response::new(Full::new(Bytes::new()).map_err(|n| match n {}).boxed());
+                    match HeaderValue::from_str(&format!("https://{host}{port}{path}")) {
+                        Ok(location) => {
+                            *resp.status_mut() = StatusCode::PERMANENT_REDIRECT;
+                            resp.headers_mut().insert(header::LOCATION, location);
+                        }
+                        Err(_) => *resp.status_mut() = StatusCode::BAD_REQUEST,
+                    }
+                    Ok::<_, Infallible>(resp)
                 }
             });
             let _ = http1::Builder::new()
@@ -358,7 +357,7 @@ fn is_upgrade(req: &Request<Incoming>) -> bool {
 
 /// A connection's open-connection count (`ConnGuard`), set by its first request to a
 /// service and moved to another service by a request there.
-type ConnSlot = Arc<std::sync::Mutex<Option<(String, ConnGuard)>>>;
+type ConnSlot = Arc<parking_lot::Mutex<Option<(String, ConnGuard)>>>;
 
 async fn handle(
     shared: Arc<Shared>,
@@ -400,7 +399,7 @@ async fn handle(
     // Counted before starting it: an idle stop never races the request it serves.
     let upgrade_guard = service.as_ref().map(|s| {
         if let Some(slot) = &slot {
-            let mut slot = slot.lock().unwrap();
+            let mut slot = slot.lock();
             if slot.as_ref().is_none_or(|(cur, _)| cur != s) {
                 *slot = Some((s.clone(), shared.routes.guard(s)));
             }

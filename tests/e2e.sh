@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 # End to end, on macOS (APFS RAM disk) and Linux: a real daemon with PostgreSQL 18
 # and Redis from PATH, a project with a remote, worktrees made by lazy-cow-tree and by
-# plain git, their databases, Redis, HTTPS services, .env, and removal.
+# the devenv module's git wrapper, their databases, Redis, HTTPS services, and removal.
 #
-#   tests/e2e.sh [path to the lazy-cow-tree binary]   (default: target/debug/lazy-cow-tree)
+#   tests/e2e.sh [path to the lazy-cow-tree binary]   (default: target/debug/lazy-cow-tree;
+#   lazy-cow-tree-cow next to it)
 #
 # Needs in PATH: postgres, initdb, psql, redis-server, redis-cli, git, curl, jq, and
 # python3 (or uv).
 set -euo pipefail
 
 bin=$(realpath "${1:-target/debug/lazy-cow-tree}")
+cow=$(dirname "$bin")/lazy-cow-tree-cow
 for tool in postgres initdb psql redis-server redis-cli git curl jq; do
   command -v "$tool" >/dev/null || { echo "missing $tool in PATH" >&2; exit 1; }
 done
@@ -47,6 +49,11 @@ echo started >> "$home/mix-starts.log"
 exec $python -m http.server "\$PORT" --bind 127.0.0.1
 EOF
 chmod +x "$home/bin/mix"
+# The devenv module's git wrapper (`git worktree add` via lazy-cow-tree-cow).
+sed -e "s|@git@|$(command -v git)|" -e "s|@cow@|$cow|" -e "s|@gh@|$(command -v false)|" -e "s|@lazyCowTree@|$bin|" \
+  "$(dirname "$0")/../devenv-module/git.sh" >"$home/bin/git"
+chmod +x "$home/bin/git"
+wgit() { "$home/bin/git" "$@"; }
 LAZY_COW_TREE_SERVICES=$(jq -nc --arg web "$web" --arg phx "$home/bin/mix phx.server" \
   '{web: {exec: $web, portOffset: 0, ports: {debugger: {http: true}, test: {env: "TEST_PORT"}, idle: {http: true, offset: 5}}},
     phx: {exec: $phx, portOffset: 3}}')
@@ -84,6 +91,8 @@ curl_lf() { curl -sS --max-time 90 --cacert "$home/ca/ca.pem" "$@"; }
 # Straight to the real server (the daemon's own superuser path).
 admin_psql() { PGUSER=postgres psql -h "$home/pg" -p 55500 -d postgres -tAc "$1"; }
 g() { git -c user.name=t -c user.email=t@t "$@"; }
+# `lazy-cow-tree shell-hook`'s value of <var> in <dir>.
+env_of() { (cd "$1" && unset LAZY_COW_TREE_SHELL && eval "$("$bin" shell-hook)" && printenv "$2"); }
 
 cd "$work"
 git init -q --bare -b main origin.git
@@ -110,7 +119,7 @@ wt=$("$bin" worktree new feat-a 2>/dev/null)
 [[ -f $wt/index.html ]] || fail "worktree not created"
 pass "worktree new: $wt"
 
-eval "$(cd "$wt" && "$bin" env)"
+eval "$(cd "$wt" && "$bin" shell-hook)"
 # A template refresh racing the first connect: the clone still gets the template.
 "$bin" snapshot & snap=$!
 # Row counts depend on how the template is made; the marker says it was migrated.
@@ -138,12 +147,12 @@ done
 pass "worktree role owns its clone, can't touch other checkouts"
 
 redis-cli --no-auth-warning -u "$REDIS_URL" set k worktree >/dev/null
-primary_redis=$(cd "$work/app" && "$bin" env --json | jq -r .REDIS_URL)
+primary_redis=$(env_of "$work/app" REDIS_URL)
 [[ -z $(redis-cli --no-auth-warning -u "$primary_redis" get k) ]] || fail "redis not isolated"
 [[ $(redis-cli --no-auth-warning -u "$REDIS_URL" get k) == worktree ]] || fail "redis lost the key"
 pass "redis isolated per checkout"
 
-base=$(cd "$wt" && "$bin" env --json | jq -r .PORT)
+base=$(env_of "$wt" PORT)
 [[ $DEBUGGER_PORT == $((base + 9)) && $TEST_PORT == $((base + 8)) ]] ||
   fail "named ports: DEBUGGER_PORT=$DEBUGGER_PORT TEST_PORT=$TEST_PORT (base $base)"
 [[ $LAZY_COW_TREE_WEB_DEBUGGER_URL == https://feat-a.debugger.demo.localhost:8443 ]] ||
@@ -165,10 +174,8 @@ code=$(curl_lf -o "$work/idle.txt" -w '%{http_code}' "https://feat-a.idle.demo.l
   fail "unbound named port: $code in $((SECONDS - start)) s: $(cat "$work/idle.txt")"
 pass "unbound named port answers 502 after a short grace"
 
-grep -q "DATABASE_URL=" "$wt/.env" || fail ".env not written"
-git -C "$wt" check-ignore -q .env || fail ".env not gitignored"
 [[ -z $(git -C "$wt" status --porcelain) ]] || fail "worktree not clean"
-pass ".env written and gitignored"
+pass "worktree clean"
 
 "$bin" worktree new broken >/dev/null 2>&1 || fail "worktree new failed on a failing migration"
 [[ $("$bin" status) == *"migrations failed"* ]] || fail "failed migration not in status"
@@ -179,17 +186,19 @@ out=$(curl_lf "https://broken.web.demo.localhost:8443/" 2>&1) || true
 "$bin" worktree rm --force broken
 pass "failed migration: in status and on the 502 page, services not started"
 
-git worktree add -q -b manual .claude/worktrees/manual
-eventually 30 test -f .claude/worktrees/manual/.env || fail "plain git worktree not provisioned"
+wgit worktree add -q -b manual .claude/worktrees/manual
+[[ -f $(git -C .claude/worktrees/manual rev-parse --absolute-git-dir)/lazy-cow-tree-populated ]] ||
+  fail "git wrapper did not populate the worktree"
+[[ -z $(git -C .claude/worktrees/manual status --porcelain) ]] || fail "wrapper's worktree not clean"
 eventually 30 grep -q manual "$home/setup.log" || fail "setup did not run"
-pass "plain git worktree add provisioned, setup ran"
+pass "git wrapper: worktree add populated, provisioned, setup ran"
 eventually 30 test -f "$(git -C .claude/worktrees/manual rev-parse --absolute-git-dir)/lazy-cow-tree-setup" ||
   fail "setup not marked done"
 out=$("$bin" worktree rm --force manual 2>&1) || fail "rm of a fresh worktree failed: $out"
 [[ $out != *"deleting gitignored"* ]] || fail "fresh worktree's removal warned: $out"
 pass "fresh worktree removed without a gitignored-files warning"
 
-port=$(cd "$wt" && "$bin" env --json | jq -r .PORT)
+port=$(env_of "$wt" PORT)
 "$bin" worktree rm --force feat-a
 [[ ! -e $wt ]] || fail "worktree still there"
 for p in "$port" "$((port + 9))"; do
@@ -198,9 +207,17 @@ done
 [[ -z $(admin_psql "select 1 from pg_database where datname in ('demo_dev_feat_a', 'demo_test_feat_a2')") ]] || fail "its databases survived"
 pass "rm killed its service and dropped its database"
 
-code=$(curl_lf -o "$work/gone.html" -w '%{http_code}' "https://feat-a.web.demo.localhost:8443/")
-[[ $code == 503 ]] && grep -q "Recreate worktree" "$work/gone.html" || fail "no gone page ($code)"
-pass "gone page (503) for the removed worktree"
+code=$(curl_lf -o /dev/null -w '%{http_code}' "https://feat-a.web.demo.localhost:8443/")
+[[ $code == 404 ]] || fail "removed worktree's host answered $code"
+pass "removed worktree's host: 404"
+
+wgit worktree add -q -b manual2 .claude/worktrees/manual2
+role_exists() { [[ -n $(admin_psql "select 1 from pg_roles where rolname = 'demo--manual2'") ]]; }
+eventually 30 role_exists || fail "wrapper's worktree not provisioned"
+wgit worktree remove --force .claude/worktrees/manual2
+role_gone() { ! role_exists; }
+eventually 30 role_gone || fail "git worktree remove: its role survived"
+pass "git wrapper: worktree remove cleaned up"
 
 mix_starts() { [[ $(wc -l <"$home/mix-starts.log") -eq $1 ]]; }
 setups() { [[ $(wc -l <"$home/setup.log") -eq $1 ]]; }
@@ -228,7 +245,7 @@ pass "mix service restarted when mix.lock (after setup) or config changed"
 g checkout -qb primary-feat
 admin_psql "DROP DATABASE demo_template WITH (FORCE)" >/dev/null
 admin_psql "DROP DATABASE demo_dev WITH (FORCE)" >/dev/null
-git worktree add -q -b fresh .claude/worktrees/fresh
+wgit worktree add -q -b fresh .claude/worktrees/fresh
 fresh_marker=$(git -C .claude/worktrees/fresh rev-parse --absolute-git-dir)/lazy-cow-tree-migrated
 eventually 60 test -f "$fresh_marker" || fail "worktree not migrated after the fresh primary"
 (($(PGUSER=postgres psql -h "$home/pg" -p 55500 -d demo_dev -tAc "select count(*) from seeds") >= 1)) ||

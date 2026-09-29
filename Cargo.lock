@@ -1230,6 +1230,7 @@ dependencies = [
  "libgit2-sys",
  "notify",
  "openssl-sys",
+ "parking_lot",
  "rcgen",
  "reflink-copy",
  "reqwest",
