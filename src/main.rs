@@ -319,7 +319,8 @@ async fn main() -> Result<()> {
             json,
         } => {
             let (root, wt, co_path) = config::locate(&path)?;
-            let p = Project::new(root, project);
+            let mut p = Project::new(root, project);
+            p.env = std::env::vars().collect();
             // The port the daemon records (or will): same plan over the same projects.
             let port = if wt.is_some() && worktree::recorded_port(&co_path).is_none() {
                 let mut all = daemon::registered_projects();
@@ -336,11 +337,16 @@ async fn main() -> Result<()> {
                 Some(port) => p.checkout_on(wt.as_deref(), co_path, port),
                 None => p.checkout(wt.as_deref(), co_path),
             };
-            let env = match service.as_deref() {
+            let mut env = match service.as_deref() {
                 Some(s) if c.service(s).is_none() => anyhow::bail!("no service {s}"),
                 Some(s) => c.service_env(&cli.global, Some(s)),
                 None => c.env(&cli.global),
             };
+            // The checkout's env files (LOCALFOREST_ENV_FILES) win, as for everything
+            // the daemon runs there.
+            let (files, primary_only) = config::env_file_vars(&p.root, &c.path, &p.env_files());
+            env.retain(|(k, _)| !files.iter().any(|(f, _)| f == k));
+            env.extend(files);
             if json {
                 let map: serde_json::Map<String, Value> = env
                     .into_iter()
@@ -348,6 +354,9 @@ async fn main() -> Result<()> {
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&map)?);
             } else {
+                for k in primary_only {
+                    println!("unset {k}");
+                }
                 for (k, v) in env {
                     println!("export {k}={}", shell_quote(&v));
                 }
@@ -424,7 +433,10 @@ async fn main() -> Result<()> {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                ramdisk::eject(&config::pg_dir())?;
+                // A durable cluster (LOCALFOREST_POSTGRES_DURABLE) has no RAM disk.
+                if config::pg_dir().exists() {
+                    ramdisk::eject(&config::pg_dir())?;
+                }
             }
             Ok(())
         }

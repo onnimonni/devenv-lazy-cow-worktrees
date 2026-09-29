@@ -112,6 +112,17 @@ pub struct Global {
     #[arg(long, env = "LOCALFOREST_DEVENV_PROXY_SOCKET", global = true)]
     #[serde(default)]
     pub devenv_proxy_socket: Option<PathBuf>,
+    /// PostgreSQL keeps its data safe (on disk, fsync on) instead of the RAM disk with
+    /// fsync, synchronous_commit and full_page_writes off. Daemon-wide: projects with
+    /// another value are refused.
+    #[arg(long, env = "LOCALFOREST_POSTGRES_DURABLE", global = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new())]
+    #[serde(default)]
+    pub postgres_durable: bool,
+    /// Stop a per-checkout redis-server after this many seconds without connections
+    /// (it starts again on the next one).
+    #[arg(long, env = "LOCALFOREST_REDIS_IDLE_TIMEOUT", global = true)]
+    #[serde(default)]
+    pub redis_idle_timeout: Option<u64>,
 }
 
 impl Global {
@@ -225,6 +236,11 @@ pub fn pg_dir() -> PathBuf {
     home().join("pg")
 }
 
+/// Data and socket directory of a durable cluster (`Global::postgres_durable`).
+pub fn pg_durable_dir() -> PathBuf {
+    home().join("pg-durable")
+}
+
 pub fn ca_cert_path() -> PathBuf {
     home().join("ca/ca.pem")
 }
@@ -336,6 +352,57 @@ impl Project {
         self.name.replace('-', "_")
     }
 
+    /// A variable of the registering `localforest serve`'s environment.
+    pub fn env_var(&self, name: &str) -> Option<&str> {
+        self.env
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+            .filter(|v| !v.is_empty())
+    }
+
+    fn env_flag(&self, name: &str, default: bool) -> bool {
+        match self.env_var(name) {
+            Some(v) => matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+            None => default,
+        }
+    }
+
+    /// `LOCALFOREST_POSTGRES_DURABLE` of this project (unset: not durable).
+    pub fn postgres_durable(&self) -> bool {
+        self.env_flag("LOCALFOREST_POSTGRES_DURABLE", false)
+    }
+
+    /// `LOCALFOREST_POSTGRES_COW`: worktree databases are clones of the template
+    /// (default), else created empty and migrated.
+    pub fn copy_on_write(&self) -> bool {
+        self.env_flag("LOCALFOREST_POSTGRES_COW", true)
+    }
+
+    /// `LOCALFOREST_POSTGRES_TEMPLATE_REFRESH=manual`: base-branch moves don't
+    /// refresh the template; `localforest snapshot` does.
+    pub fn template_refresh_manual(&self) -> bool {
+        self.env_var("LOCALFOREST_POSTGRES_TEMPLATE_REFRESH") == Some("manual")
+    }
+
+    /// `LOCALFOREST_REDIS_START=up`: a checkout's redis-server starts with it.
+    pub fn redis_start_up(&self) -> bool {
+        self.env_var("LOCALFOREST_REDIS_START") == Some("up")
+    }
+
+    /// `LOCALFOREST_REDIS_INSTANCE=shared`: one redis-server for all its checkouts.
+    pub fn redis_shared(&self) -> bool {
+        self.env_var("LOCALFOREST_REDIS_INSTANCE") == Some("shared")
+    }
+
+    /// `LOCALFOREST_ENV_FILES`: checkout-relative files applied last to everything
+    /// run in a checkout (unset: none).
+    pub fn env_files(&self) -> Vec<String> {
+        self.env_var("LOCALFOREST_ENV_FILES")
+            .and_then(|j| serde_json::from_str::<Vec<String>>(j).ok())
+            .unwrap_or_default()
+    }
+
     pub fn worktrees_dir(&self) -> PathBuf {
         self.root.join(&self.settings.worktrees_dir)
     }
@@ -438,6 +505,50 @@ pub struct Service {
     /// block, exported to every environment of the checkout.
     #[serde(default)]
     pub ports: BTreeMap<String, ExtraPort>,
+    /// When it starts: with its checkout (`up`), on its first request or as a
+    /// dependency (`demand`), or only by `localforest service start` (`manual`).
+    #[serde(default)]
+    pub start: StartMode,
+    /// Stop it after this many seconds without open connections through the proxy;
+    /// its next request starts it again. None: never.
+    #[serde(default)]
+    pub idle_timeout: Option<u64>,
+    /// HTTP probe its first request waits for, instead of its port listening.
+    #[serde(default)]
+    pub ready: Option<Ready>,
+    /// Its hostname in the primary checkout instead of `<service>.<project>.localhost`;
+    /// worktrees prefix theirs (`<worktree>.<hostname>`).
+    #[serde(default)]
+    pub hostname: Option<String>,
+}
+
+/// `Service::start`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum StartMode {
+    Up,
+    #[default]
+    Demand,
+    Manual,
+}
+
+/// `Service::ready`: GET 127.0.0.1:<port><path>, ready on a 2xx or 3xx answer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Ready {
+    #[serde(default = "root_path")]
+    pub path: String,
+    /// Seconds.
+    #[serde(default = "sixty")]
+    pub timeout: u64,
+}
+
+fn root_path() -> String {
+    "/".into()
+}
+
+fn sixty() -> u64 {
+    60
 }
 
 /// A service's secondary port (`localforest.services.<svc>.ports.<name>`).
@@ -540,6 +651,26 @@ impl Services {
         }
         if self.0.values().filter(|s| s.default).count() > 1 {
             return Err("more than one default service".into());
+        }
+        let mut hosts = BTreeMap::new();
+        for (name, s) in &self.0 {
+            let Some(h) = &s.hostname else { continue };
+            let valid = h == &h.to_ascii_lowercase()
+                && h.ends_with(".localhost")
+                && h.split('.').all(|l| {
+                    !l.is_empty()
+                        && !l.starts_with('-')
+                        && !l.ends_with('-')
+                        && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                });
+            if !valid {
+                return Err(format!(
+                    "service {name}: hostname {h} must be a lowercase name ending in .localhost"
+                ));
+            }
+            if let Some(other) = hosts.insert(h.clone(), name.clone()) {
+                return Err(format!("services {other} and {name} share hostname {h}"));
+            }
         }
         Ok(())
     }
@@ -763,9 +894,13 @@ impl Checkout {
     /// `<worktree>.<service>.<project>.localhost`, `<service>.<project>.localhost` in
     /// the primary checkout.
     pub fn service_host(&self, name: &str) -> String {
+        let base = self
+            .service(name)
+            .and_then(|s| s.hostname.clone())
+            .unwrap_or_else(|| format!("{name}.{}.localhost", self.project));
         match &self.worktree {
-            Some(w) => format!("{w}.{name}.{}.localhost", self.project),
-            None => format!("{name}.{}.localhost", self.project),
+            Some(w) => format!("{w}.{base}"),
+            None => base,
         }
     }
 
@@ -1044,6 +1179,76 @@ pub fn framework_env(dir: &Path, host: &str) -> Vec<(String, String)> {
     env
 }
 
+/// `text` with each path starting with `from` (the primary checkout) moved to `to`
+/// (a worktree): an occurrence counts at a path boundary (start, `:`, `=`, space,
+/// quote) followed by the end, `/`, `:`, space or quote. One already under `to` (a
+/// worktree inside the primary) is left alone.
+pub fn rewrite_root(text: &str, from: &Path, to: &Path) -> String {
+    let (from, to) = (from.to_string_lossy(), to.to_string_lossy());
+    if from.is_empty() || from == to || !text.contains(from.as_ref()) {
+        return text.to_string();
+    }
+    let rest_of_to = to.strip_prefix(from.as_ref());
+    let starts = |c: char| matches!(c, ':' | '=' | ' ' | '"' | '\'' | '\n' | '\t');
+    let ends = |c: char| matches!(c, '/' | ':' | ' ' | '"' | '\'' | '\n' | '\t' | ';');
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while let Some(pos) = text[i..].find(from.as_ref()) {
+        let at = i + pos;
+        let after = at + from.len();
+        let before_ok = text[..at].chars().next_back().is_none_or(starts);
+        let tail = &text[after..];
+        let after_ok = tail.chars().next().is_none_or(ends);
+        let already = rest_of_to.is_some_and(|r| !r.is_empty() && tail.starts_with(r));
+        out.push_str(&text[i..at]);
+        if before_ok && after_ok && !already {
+            out.push_str(&to);
+        } else {
+            out.push_str(&from);
+        }
+        i = after;
+    }
+    out.push_str(&text[i..]);
+    out
+}
+
+/// Variables of a checkout's env files (`Project::env_files`, later files win),
+/// and the keys only the primary's copies set: in a worktree those came into the
+/// project env from the primary (devenv reads its dotenv there) and are removed.
+pub fn env_file_vars(
+    root: &Path,
+    checkout: &Path,
+    files: &[String],
+) -> (Vec<(String, String)>, Vec<String>) {
+    let read = |dir: &Path| -> BTreeMap<String, String> {
+        let mut vars = BTreeMap::new();
+        for f in files {
+            let Ok(iter) = dotenvy::from_path_iter(dir.join(f)) else {
+                continue;
+            };
+            for item in iter {
+                match item {
+                    Ok((k, v)) => {
+                        vars.insert(k, v);
+                    }
+                    Err(e) => tracing::warn!("{}: {e}", dir.join(f).display()),
+                }
+            }
+        }
+        vars
+    };
+    let own = read(checkout);
+    let primary_only = if checkout == root {
+        Vec::new()
+    } else {
+        read(root)
+            .into_keys()
+            .filter(|k| !own.contains_key(k))
+            .collect()
+    };
+    (own.into_iter().collect(), primary_only)
+}
+
 /// Primary checkout of the repository containing `path`.
 pub fn primary_root(path: &Path) -> Result<PathBuf> {
     let repo = Repository::discover(path)
@@ -1122,6 +1327,152 @@ mod tests {
             services: json.parse().unwrap(),
             ..co(Some("wt"))
         }
+    }
+
+    #[test]
+    fn service_start_ready_hostname_and_back_compat() {
+        // Without the new fields: as before.
+        let old: Services = r#"{"web": {"exec": "mix phx.server"}}"#.parse().unwrap();
+        let web = &old.0["web"];
+        assert_eq!(web.start, StartMode::Demand);
+        assert_eq!(
+            (web.idle_timeout, web.ready.as_ref(), web.hostname.as_ref()),
+            (None, None, None)
+        );
+        let new: Services =
+            r#"{"web": {"exec": "/nix/store/x-web", "start": "up", "idleTimeout": 900,
+            "ready": {"timeout": 5}, "hostname": "care.treat.localhost"},
+            "adm": {"exec": "x", "start": "manual"}}"#
+                .parse()
+                .unwrap();
+        let web = &new.0["web"];
+        assert_eq!(web.start, StartMode::Up);
+        assert_eq!(new.0["adm"].start, StartMode::Manual);
+        assert_eq!(web.idle_timeout, Some(900));
+        assert_eq!(
+            web.ready,
+            Some(Ready {
+                path: "/".into(),
+                timeout: 5
+            })
+        );
+        // Unknown fields are still refused.
+        assert!(r#"{"web": {"exec": "x", "nope": 1}}"#.parse::<Services>().is_err());
+        assert!(r#"{"web": {"exec": "x", "start": "later"}}"#.parse::<Services>().is_err());
+    }
+
+    #[test]
+    fn service_hostname_override() {
+        let c = with_services(
+            r#"{"care": {"exec": "x", "hostname": "care.treat.localhost"}, "web": {"exec": "y"}}"#,
+        );
+        assert_eq!(c.service_host("care"), "wt.care.treat.localhost");
+        assert_eq!(c.service_host("web"), "wt.web.my-app.localhost");
+        let primary = Checkout {
+            worktree: None,
+            ..c.clone()
+        };
+        assert_eq!(primary.service_host("care"), "care.treat.localhost");
+        assert!(
+            c.routes()
+                .iter()
+                .any(|(_, h, _)| h == "wt.care.treat.localhost")
+        );
+        for bad in [
+            r#"{"a": {"exec": "x", "hostname": "Care.localhost"}}"#,
+            r#"{"a": {"exec": "x", "hostname": "care.example.com"}}"#,
+            r#"{"a": {"exec": "x", "hostname": "-a.localhost"}}"#,
+            r#"{"a": {"exec": "x", "hostname": "h.localhost"}, "b": {"exec": "y", "hostname": "h.localhost"}}"#,
+        ] {
+            assert!(bad.parse::<Services>().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn rewrites_primary_paths_to_the_worktree() {
+        let (r, w) = (
+            Path::new("/src/app"),
+            Path::new("/src/app/.claude/worktrees/wt"),
+        );
+        assert_eq!(
+            rewrite_root("/src/app", r, w),
+            "/src/app/.claude/worktrees/wt"
+        );
+        assert_eq!(
+            rewrite_root("/src/app/bin:/usr/bin:/src/app/node_modules/.bin", r, w),
+            "/src/app/.claude/worktrees/wt/bin:/usr/bin:/src/app/.claude/worktrees/wt/node_modules/.bin"
+        );
+        // Already the worktree's, another directory, or mid-word: untouched.
+        for keep in [
+            "/src/app/.claude/worktrees/wt/x",
+            "/src/application",
+            "x/src/app",
+        ] {
+            assert_eq!(rewrite_root(keep, r, w), keep);
+        }
+        assert_eq!(
+            rewrite_root("cd \"/src/app/api\" && exec x", r, Path::new("/wt")),
+            "cd \"/wt/api\" && exec x"
+        );
+        assert_eq!(rewrite_root("/src/app/x", r, r), "/src/app/x");
+    }
+
+    #[test]
+    fn env_files_later_win_and_primary_only_keys() {
+        let d = tempfile::tempdir().unwrap();
+        let (root, wt) = (d.path().join("root"), d.path().join("wt"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(root.join(".env.local"), "A=1\nGONE=primary\n").unwrap();
+        std::fs::write(wt.join(".env.local"), "A=2\nB=x\n").unwrap();
+        std::fs::write(wt.join(".env.more"), "B=y\n").unwrap();
+        let files = vec![".env.local".to_string(), ".env.more".to_string()];
+        let (vars, primary_only) = env_file_vars(&root, &wt, &files);
+        let vars: BTreeMap<_, _> = vars.into_iter().collect();
+        assert_eq!(vars["A"], "2");
+        assert_eq!(vars["B"], "y");
+        assert_eq!(primary_only, ["GONE"]);
+        let (vars, primary_only) = env_file_vars(&root, &root, &files);
+        assert_eq!(vars.len(), 2);
+        assert!(primary_only.is_empty());
+        assert_eq!(env_file_vars(&root, &wt, &[]).0, vec![]);
+    }
+
+    #[test]
+    fn project_settings_from_env() {
+        let settings = ProjectSettings {
+            name: Some("app".into()),
+            port: 4000,
+            remote: "origin".into(),
+            base: None,
+            worktrees_dir: ".claude/worktrees".into(),
+            migrate: None,
+            seed: None,
+            setup: None,
+            services: Default::default(),
+            preview_ttl_hours: 48,
+            no_sync: false,
+            no_auto_remove: false,
+        };
+        let mut p = Project::new("/src/app".into(), settings);
+        assert!(p.copy_on_write());
+        assert!(!p.template_refresh_manual() && !p.postgres_durable());
+        assert!(!p.redis_shared() && !p.redis_start_up());
+        assert!(p.env_files().is_empty());
+        p.env = [
+            ("LOCALFOREST_POSTGRES_COW", "0"),
+            ("LOCALFOREST_POSTGRES_TEMPLATE_REFRESH", "manual"),
+            ("LOCALFOREST_POSTGRES_DURABLE", "1"),
+            ("LOCALFOREST_REDIS_INSTANCE", "shared"),
+            ("LOCALFOREST_REDIS_START", "up"),
+            ("LOCALFOREST_ENV_FILES", r#"[".env.local"]"#),
+        ]
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .to_vec();
+        assert!(!p.copy_on_write());
+        assert!(p.template_refresh_manual() && p.postgres_durable());
+        assert!(p.redis_shared() && p.redis_start_up());
+        assert_eq!(p.env_files(), [".env.local"]);
     }
 
     #[test]
@@ -1396,6 +1747,8 @@ mod tests {
             redis_server: None,
             postgres_extensions: Some("postgis, vector  pg_trgm,".into()),
             devenv_proxy_socket: None,
+            postgres_durable: false,
+            redis_idle_timeout: None,
         }
     }
 

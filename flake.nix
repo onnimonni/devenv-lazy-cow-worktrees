@@ -23,7 +23,14 @@
         localforest = final.callPackage ./package.nix { };
       };
       # `imports = [ inputs.localforest.devenvModules.default ];` or, with
-      # `flake: false`, `imports: [ localforest/devenv-module ]` in devenv.yaml.
-      devenvModules.default = ./devenv-module/devenv.nix;
+      # `flake: false`, `imports: [ localforest/devenv-module ]` in devenv.yaml. As a
+      # flake input the package is this flake's (the one CI pushes to Cachix), so the
+      # module doesn't evaluate a second nixpkgs.
+      devenvModules.default =
+        { pkgs, lib, ... }:
+        {
+          imports = [ ./devenv-module/devenv.nix ];
+          localforest.package = lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+        };
     };
 }

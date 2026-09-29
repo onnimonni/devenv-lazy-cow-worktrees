@@ -81,22 +81,30 @@ Binaries for macOS (arm64) and Linux (x86_64) are on the
 
 ## Use with devenv
 
-**1. Import the module** in the primary checkout's `devenv.yaml`:
+**1. Import the module** in the primary checkout, as a flake input:
 
 ```yaml
 # devenv.yaml
 inputs:
   localforest:
-    url: github:onnimonni/localforest
-    flake: false
-imports:
-  - localforest/devenv-module
+    url: github:onnimonni/localforest   # don't make it follow your nixpkgs
 ```
 
-The module's localforest is built with localforest's own pinned nixpkgs
-(`flake.lock`), the exact derivation CI pushes to
-[localforest.cachix.org](https://localforest.cachix.org), so it is downloaded, not
-compiled. The module adds the cache with `cachix.pull`; a multi-user Nix (the
+```nix
+# devenv.nix
+{ inputs, ... }:
+{
+  imports = [ inputs.localforest.devenvModules.default ];
+}
+```
+
+or without the flake: `flake: false` on the input and `imports: [ localforest/devenv-module ]`
+in `devenv.yaml` (the module then evaluates localforest's pinned nixpkgs itself, a
+second nixpkgs evaluation per shell).
+
+Either way localforest is the exact derivation CI pushes to
+[localforest.cachix.org](https://localforest.cachix.org), built with its own pinned
+nixpkgs, so it is downloaded, not compiled. The module adds the cache with `cachix.pull`; a multi-user Nix (the
 default on macOS) only uses it if you are in `trusted-users` (`nix store info` shows
 `Trusted: 1`), or add it to the daemon's `nix.conf` yourself:
 
@@ -118,30 +126,118 @@ To build it yourself instead: `localforest.cachix.enable = false;` and
 `localforest.package = pkgs.callPackage (inputs.localforest + "/package.nix") { };`
 (your nixpkgs; compiled locally).
 
-**2. Describe the project** in `devenv.nix`. The module adds localforest,
-PostgreSQL 18 and Redis to the shell, runs `localforest serve` as a devenv process,
-exports the checkout's environment in `enterShell`, and wires Claude Code's
-worktree hooks and its trust in the local CA. Replace your own `services.postgres` / `services.redis` with it:
+**2. Describe the project** in plain devenv. The module reads `processes`,
+`services.postgres`, `services.redis` and `dotenv`, and localforest runs them in every
+checkout: each process gets its own port and `https://[<worktree>.]<hostname>`, PostgreSQL
+and Redis come from the daemon, and devenv doesn't start its own copies (nor its proxy:
+localforest serves the hostnames). It also adds localforest to the shell, runs `localforest
+serve` as a devenv process, exports the checkout's environment in `enterShell`, and wires
+Claude Code's worktree hooks and its trust in the local CA.
 
 ```nix
 # devenv.nix
+{ pkgs, config, inputs, ... }:
 {
-  localforest.port = 4000; # base port of the primary checkout's services
-  localforest.migrate = "mix ecto.migrate";
-  localforest.seed = "mix run priv/repo/seeds.exs";
-  localforest.setup = "mix deps.get";
-  localforest.services = {
-    web = { exec = "mix phx.server"; dependsOn = [ "worker" ]; };
-    api = {
-      exec = "bun run dev";
-      cwd = "api";
-      migrate = "bun run migrate";
-    };
-    worker = { exec = "mix run --no-halt"; http = false; restart = "on-failure"; };
+  imports = [ inputs.localforest.devenvModules.default ];
+
+  services.postgres = {
+    enable = true;
+    package = pkgs.postgresql_18;                 # 18+ for copy-on-write databases
+    initialDatabases = [ { name = "myapp_dev"; } { name = "myapp_test"; } ];
   };
-  localforest.lsp.elixir = [ "dexter" "lsp" ];
+  services.redis.enable = true;
+
+  processes.web = {
+    exec = "mix phx.server";
+    ports.http.allocate = 4000;
+    env.PORT = toString config.processes.web.ports.http.value;   # per checkout
+    proxy.hostname = "web.myapp.localhost";
+    after = [ "devenv:processes:worker@started" ];
+    ready.http.get = { port = config.processes.web.ports.http.value; path = "/"; };
+  };
+  processes.worker.exec = "mix run --no-halt";
+
+  localforest.migrate = "mix ecto.migrate";
+  localforest.setup = "mix deps.get";
 }
 ```
+
+How devenv's options map:
+
+| devenv | localforest |
+|---|---|
+| `processes.<name>.exec` | run as a bash script, in the checkout (a path under the primary's root is the checkout's) |
+| `cwd` | relative to the checkout |
+| `ports.http` (or the only port) | `$PORT`, the service's hostname; env entries holding a port's value are replaced by the checkout's port |
+| other `ports.<p>` | named port, in the variable that held its value (else `<P>_PORT`); `http` if it has its own `proxy.hostname` |
+| `proxy.hostname` | hostname in the primary; worktrees get `<worktree>.` in front |
+| `after = [ "devenv:processes:<x>" ]` | `dependsOn`, when localforest runs `<x>` too; other entries are ignored with a warning |
+| `ready.http.get.path`, `ready.timeout` | a first request waits for this probe (200–399), default 60 s |
+| `restart.on`, `watch.paths` | `restart`, `restartOnChange` |
+| `services.postgres.{package,extensions,settings}` | the daemon's PostgreSQL |
+| `services.postgres.initialDatabases` | databases per checkout |
+| `services.redis.package` | the daemon's Redis |
+| `dotenv.filename` | the checkout's own env files (see below) |
+
+When to start them, per process and for PostgreSQL / Redis:
+
+```nix
+processes.web.start = {
+  on = "demand";            # "up" | "demand" (default) | "manual"
+  idleTimeout = "15m";      # stop after 15 min without open connections; null (default) = never
+};
+services.postgres.start = { on = "demand"; idleTimeout = null; };   # default on = "up"
+services.redis.start = { on = "demand"; idleTimeout = "30m"; };     # default on = "demand"
+```
+
+`up` starts it with its checkout, `demand` on the first request (or connection, or as a
+dependency), `manual` only with `localforest service start`. A `demand` process nothing
+can start (no http port, nothing depends on it) is an evaluation error. Websockets count
+as open connections, so an open LiveView tab keeps its server up.
+
+Databases:
+
+```nix
+services.postgres = {
+  instance = "shared";                  # one cluster, databases per checkout (default)
+                                        # "unique": a cluster of its own per checkout
+  copyOnWrite = {
+    enable = true;                      # default: instance == "shared"
+    refresh = "on-base-change";         # or "manual" (`localforest snapshot`)
+  };
+  dangerouslyDisableDurabilityForSpeed = { enable = false; ramdiskSize = "4G"; };
+};
+services.redis.instance = "unique";     # a redis-server per checkout (default), or "shared"
+```
+
+With `copyOnWrite`, a worktree's databases are copy-on-write clones of the primary's
+(milliseconds, next to no disk; any filesystem that clones files: APFS, btrfs, XFS),
+refreshed from the primary when the base branch moves and its migrations ran. Without
+it (and always with `instance = "unique"`) they are created empty, then migrated and
+seeded. Setting both `instance = "unique"` and `copyOnWrite.enable = true` is an error.
+
+`dangerouslyDisableDurabilityForSpeed` runs PostgreSQL on a RAM disk with `fsync`,
+`synchronous_commit` and `full_page_writes` off. **Every database is lost on a reboot,
+on `localforest down --eject`, and on a crash, which can also corrupt the cluster.**
+Only for data you can recreate (migrations and seeds). Off by default: the cluster is
+then on disk with PostgreSQL's normal durability.
+
+A checkout's own variables go in `.env.local`, or devenv's `dotenv.filename` when
+`dotenv.enable` is on: the file is read from the checkout on every start of anything
+in it and applied last. A new worktree starts with a copy of the primary's; `.env`
+itself is localforest's output (below).
+
+Escape hatches, all optional:
+
+```nix
+processes.legacy.localforest.enable = false;   # leave this process to devenv (primary only)
+processes.web.localforest = { migrate = "mix ecto.migrate"; restartOnPull = true; };
+localforest.services.web.portOffset = 0;       # any localforest.services.<name> field wins
+localforest.envFiles = [ ".env.local" ".env.secrets" ];
+```
+
+The `localforest.services` vocabulary below still works on its own, for processes
+devenv doesn't know about.
 
 **3. Start it** with `devenv up` in the primary checkout. That starts the daemon, or
 registers the project with the one already running: one daemon serves every
@@ -220,6 +316,7 @@ so one session gets answers from the worktree each file belongs to.
 | `localforest.postgres.settings` | `{}` | extra postgresql.conf settings, e.g. `shared_preload_libraries` |
 | `localforest.postgres.ramdiskMB` | `4096` | RAM disk size (used as it fills); resizing needs `localforest down --eject`, which empties every database |
 | `localforest.redis` | `pkgs.redis` | Redis build |
+| `localforest.envFiles` | `dotenv.filename` if `dotenv.enable`, else `[ ".env.local" ]` | the checkout's own env files, relative to it |
 
 Service options:
 
@@ -237,6 +334,10 @@ Service options:
 | `restartOnPull` | `false` | restart it (if running) after the base branch was pulled into its checkout and migrated; for servers without a code reloader |
 | `restartOnChange` | Mix: `[ "mix.exs" "mix.lock" "config/*.exs" ]`, else `[]` | files (relative to `cwd`, `*` / `?` in the file name) whose content changing restarts it if running; see below |
 | `ports.<name>` | `{}` | further ports it listens on; see below |
+| `start` | `"demand"` | `"up"`, `"demand"` or `"manual"` |
+| `idleTimeout` | `null` | seconds without open connections before it's stopped |
+| `ready` | `null` | `{ path; timeout; }`: HTTP probe a first request waits for |
+| `hostname` | `<service>.<project>.localhost` | hostname in the primary; worktrees prefix `<worktree>.` |
 
 Commands are split like a shell would, then run directly (no shell) with the
 service's environment and the project's `PATH`. Logs: `localforest service log -s <name>`.

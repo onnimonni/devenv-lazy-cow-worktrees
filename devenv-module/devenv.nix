@@ -1,23 +1,24 @@
 # devenv module: runs `localforest serve` for this project and wires every checkout to it.
 #
-#   # devenv.yaml
-#   inputs:
-#     localforest:
-#       url: github:onnimonni/localforest   # or a path: input
-#       flake: false
-#   imports:
-#     - localforest/devenv-module
+#   # devenv.yaml                              # devenv.nix
+#   inputs:                                    { inputs, ... }: {
+#     localforest:                               imports = [ inputs.localforest.devenvModules.default ];
+#       url: github:onnimonni/localforest      }
 #
-#   # devenv.nix
-#   localforest.port = 4000;                  # base port of the primary checkout's services
+#   (or `flake: false` on the input and `imports: [ localforest/devenv-module ]`)
+#
+# It derives localforest's services from devenv's own `processes` (exec, cwd, ports,
+# proxy.hostname, after, ready, restart, watch, plus the new `start.on` /
+# `start.idleTimeout`), its database from `services.postgres` (plus `instance`,
+# `start`, `copyOnWrite`, `dangerouslyDisableDurabilityForSpeed`), Redis from
+# `services.redis` (plus `instance`, `start`) and the checkout's env files from `dotenv`,
+# and keeps devenv from starting its own copies. `localforest.*` options still work and
+# win over what is derived:
+#
 #   localforest.migrate = "mix ecto.migrate";
 #   localforest.seed = "mix run priv/repo/seeds.exs";
 #   localforest.setup = "mix deps.get";           # once in every new checkout
-#   localforest.services = {
-#     web = { exec = "mix phx.server"; dependsOn = [ "worker" ]; };
-#     api = { exec = "bun run dev"; cwd = "api"; migrate = "bun run migrate"; };
-#     worker = { exec = "mix run --no-halt"; http = false; restart = "on-failure"; };
-#   };
+#   localforest.services.api = { exec = "bun run dev"; cwd = "api"; };
 #   localforest.lsp.elixir = [ "dexter" "lsp" ];
 #
 # Every checkout (primary and worktrees) gets each service on demand:
@@ -32,6 +33,7 @@
   pkgs,
   lib,
   config,
+  options,
   ...
 }:
 
@@ -84,6 +86,226 @@ let
       };
     };
   };
+
+  # "30s" / "15m" / "1h" / 90 -> seconds; null stays null.
+  seconds =
+    d:
+    if d == null || builtins.isInt d then
+      d
+    else
+      let
+        m = builtins.match "([0-9]+)(s|m|h)?" d;
+        n = lib.toInt (builtins.elemAt m 0);
+        unit = builtins.elemAt m 1;
+      in
+      if m == null then
+        throw "localforest: duration ${builtins.toJSON d} is not like 30s, 15m or 1h"
+      else if unit == "h" then
+        n * 3600
+      else if unit == "m" then
+        n * 60
+      else
+        n;
+  # "4G" / "512M" / 4096 (MB) -> MB.
+  megabytes =
+    s:
+    if builtins.isInt s then
+      s
+    else
+      let
+        m = builtins.match "([0-9]+)([MmGg])?[Bb]?" s;
+        n = lib.toInt (builtins.elemAt m 0);
+      in
+      if m == null then
+        throw "localforest: size ${builtins.toJSON s} is not like 512M or 4G"
+      else if lib.toLower (toString (builtins.elemAt m 1)) == "g" then
+        n * 1024
+      else
+        n;
+  duration = types.nullOr (types.either types.ints.unsigned types.str);
+
+  # devenv's processes that localforest runs instead: every one but its own, devenv's
+  # postgres/redis (localforest provides those) and ones opted out.
+  own = [
+    "localforest"
+    "postgres"
+    "redis"
+  ];
+  derivedProcs = lib.filterAttrs (
+    name: p: cfg.enable && !(builtins.elem name own) && p.localforest.enable
+  ) config.processes;
+  root = config.devenv.root;
+  # A path under the checkout root as relative to `base` (itself relative to root, or
+  # null for root); null when outside.
+  relativeTo =
+    base: path:
+    let
+      abs = toString path;
+      prefix = if base == null then "${root}/" else "${root}/${base}/";
+    in
+    if lib.hasPrefix prefix abs then lib.removePrefix prefix abs else null;
+  processDep =
+    entry:
+    let
+      m = builtins.match "devenv:processes:([^@]+)(@.*)?" entry;
+    in
+    if m == null then null else builtins.head m;
+  deriveService =
+    name: p:
+    let
+      portNames = lib.attrNames p.ports;
+      httpPort =
+        if p.ports ? http then
+          "http"
+        else if builtins.length portNames == 1 then
+          builtins.head portNames
+        else
+          null;
+      value = port: toString p.ports.${port}.value;
+      envFor =
+        port:
+        let
+          matching = lib.attrNames (lib.filterAttrs (_: v: v == value port) p.env);
+        in
+        if matching != [ ] then
+          builtins.head matching
+        else
+          "${lib.toUpper (lib.replaceStrings [ "-" ] [ "_" ] port)}_PORT";
+      extraPorts = lib.filter (port: port != httpPort) portNames;
+      # localforest sets PORT and each named port's variable per checkout.
+      portValues = map value portNames;
+      env = lib.filterAttrs (_: v: !(builtins.elem v portValues)) p.env;
+      cwd =
+        if p.cwd == null || p.cwd == root then
+          null
+        else if lib.hasPrefix "${root}/" p.cwd then
+          lib.removePrefix "${root}/" p.cwd
+        else
+          p.cwd;
+      deps = lib.filter (d: d != null) (map processDep p.after);
+      others = lib.filter (d: !(builtins.elem d own)) deps;
+      ignored = lib.filter (
+        e:
+        let
+          d = processDep e;
+        in
+        d == null || !(builtins.elem d own || derivedProcs ? ${d})
+      ) p.after;
+      watched = lib.filter (x: x != null) (map (relativeTo cwd) p.watch.paths);
+    in
+    lib.warnIf (ignored != [ ])
+      "localforest: processes.${name}.after: ${lib.concatStringsSep ", " ignored} ignored (only other processes localforest runs are started first)"
+      {
+        exec = toString (pkgs.writeShellScript "localforest-${name}" p.exec);
+        inherit cwd env;
+        http = httpPort != null;
+        ports = lib.genAttrs extraPorts (port: {
+          env = envFor port;
+          http = p.ports.${port}.proxy.hostname != null;
+        });
+        dependsOn = lib.filter (d: derivedProcs ? ${d}) others;
+        restart =
+          {
+            never = "no";
+            on_failure = "on-failure";
+            always = "always";
+          }
+          .${p.restart.on};
+        restartOnChange = if watched == [ ] then null else watched;
+        ready =
+          if p.ready != null && p.ready.http.get != null then
+            {
+              inherit (p.ready.http.get) path;
+              timeout = if p.ready.timeout != null then p.ready.timeout else 60;
+            }
+          else
+            null;
+        start = p.start.on;
+        idleTimeout = seconds p.start.idleTimeout;
+        hostname = p.proxy.hostname;
+        inherit (p.localforest) migrate restartOnPull;
+      };
+
+  derived = lib.mapAttrs deriveService derivedProcs;
+
+  # The new per-process options, merged into devenv's `processes.<name>` submodule.
+  processExtension = types.submodule (
+    { name, config, ... }:
+    {
+      options = {
+        start = mkOption {
+          type = types.submodule {
+            options = {
+              on = mkOption {
+                type = types.enum [
+                  "up"
+                  "demand"
+                  "manual"
+                ];
+                default = "demand";
+                description = "When localforest starts it: with its checkout (`up`), on the first request or as a dependency (`demand`), or only by `localforest service start` (`manual`).";
+              };
+              idleTimeout = mkOption {
+                type = duration;
+                default = null;
+                example = "15m";
+                description = "Stop it after this long without open connections (30s, 15m, 1h or seconds); the next request starts it again. null: never.";
+              };
+            };
+          };
+        };
+        localforest = {
+          enable = mkOption {
+            type = types.bool;
+            default = true;
+            description = "Run this process in every checkout through localforest; false leaves it to devenv (primary checkout only).";
+          };
+          migrate = mkOption {
+            type = types.nullOr types.str;
+            default = null;
+            description = "Migrate command for the checkout's database, run in the process's cwd after `localforest.migrate`.";
+          };
+          restartOnPull = mkOption {
+            type = types.bool;
+            default = false;
+            description = "Restart it (if running) after the base branch was pulled into its checkout and migrations ran.";
+          };
+        };
+      };
+      # localforest runs it (and provides postgres/redis): `devenv up` doesn't too.
+      config.start.enable = lib.mkIf (
+        cfg.enable
+        && (
+          (builtins.elem name own && name != "localforest")
+          || (!(builtins.elem name own) && config.localforest.enable)
+        )
+      ) (lib.mkForce false);
+    }
+  );
+  startOptions = defaultOn: {
+    on = mkOption {
+      type = types.enum [
+        "up"
+        "demand"
+      ];
+      default = defaultOn;
+      description = "Start with the daemon (`up`) or on the first connection (`demand`).";
+    };
+    idleTimeout = mkOption {
+      type = duration;
+      default = null;
+      example = "30m";
+      description = "Stop after this long without connections (30s, 15m, 1h or seconds); null: never.";
+    };
+  };
+  pgCfg = config.services.postgres;
+  redisCfg = config.services.redis;
+  # devenv's postgres module sets these itself; localforest's cluster decides them.
+  pgOwnSettings = [
+    "listen_addresses"
+    "port"
+    "unix_socket_directories"
+  ];
 
   service = types.submodule {
     options = {
@@ -159,13 +381,122 @@ let
       restartOnChange = mkOption {
         type = types.nullOr (types.listOf types.str);
         default = null;
-        example = [ "Gemfile.lock" "config/*.rb" ];
+        example = [
+          "Gemfile.lock"
+          "config/*.rb"
+        ];
         description = "Files (relative to cwd, `*` / `?` in the file name) whose content changing restarts it if running (after localforest.setup when a dependency manifest or lockfile such as mix.lock, Gemfile.lock or package.json changed; not while its checkout pulls or migrates). Default: for a command running `mix`, mix.exs, mix.lock and config/*.exs (Phoenix's code reloader refuses to compile after those change); `[ ]` for others and to turn it off.";
+      };
+      start = mkOption {
+        type = types.enum [
+          "up"
+          "demand"
+          "manual"
+        ];
+        default = "demand";
+        description = "Start it with its checkout (`up`), on the first request or as a dependency (`demand`), or only with `localforest service start` (`manual`).";
+      };
+      idleTimeout = mkOption {
+        type = types.nullOr types.ints.unsigned;
+        default = null;
+        description = "Stop it after this many seconds without open connections; null: never.";
+      };
+      ready = mkOption {
+        type = types.nullOr (
+          types.submodule {
+            options = {
+              path = mkOption {
+                type = types.str;
+                default = "/";
+              };
+              timeout = mkOption {
+                type = types.ints.unsigned;
+                default = 60;
+              };
+            };
+          }
+        );
+        default = null;
+        description = "HTTP probe on its PORT (ready on 200-399) a first request waits for, up to `timeout` seconds; null: the port listening.";
+      };
+      hostname = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "web.myapp.localhost";
+        description = "Hostname in the primary checkout instead of <service>.<project>.localhost; worktrees prefix `<worktree>.`.";
       };
     };
   };
 in
 {
+  # Merged into devenv's own options: `processes.<name>.start.{on,idleTimeout}`,
+  # `processes.<name>.localforest.*`, and new `services.postgres` / `services.redis`
+  # settings. localforest derives its services and database settings from them.
+  options.processes = mkOption { type = types.attrsOf processExtension; };
+
+  options.services.postgres = {
+    instance = mkOption {
+      type = types.enum [
+        "shared"
+        "unique"
+      ];
+      default = "shared";
+      description = "One cluster with databases per checkout (`shared`, needed for copyOnWrite), or a cluster of its own per checkout (`unique`).";
+    };
+    start = startOptions "up";
+    copyOnWrite = {
+      enable = mkOption {
+        type = types.bool;
+        default = pgCfg.instance == "shared";
+        defaultText = lib.literalExpression ''services.postgres.instance == "shared"'';
+        description = "Worktree databases are copy-on-write clones of a template (milliseconds, near-zero disk); false: created empty, then migrated and seeded.";
+      };
+      template = mkOption {
+        type = types.enum [ "primary" ];
+        default = "primary";
+        description = "What worktree databases are cloned from: the primary checkout's databases.";
+      };
+      refresh = mkOption {
+        type = types.enum [
+          "on-base-change"
+          "manual"
+        ];
+        default = "on-base-change";
+        description = "Refresh the template from the primary when the base branch moves (after migrations), or only with `localforest snapshot`.";
+      };
+    };
+    dangerouslyDisableDurabilityForSpeed = {
+      enable = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          Run PostgreSQL on a RAM disk with fsync, synchronous_commit and
+          full_page_writes off. Every database is lost on reboot, on a crash (which
+          can also corrupt the cluster) and on `localforest down --eject`. For
+          disposable development and test data only.
+        '';
+      };
+      ramdiskSize = mkOption {
+        type = types.either types.ints.positive types.str;
+        default = "4G";
+        example = "8G";
+        description = "RAM disk size (512M, 4G, or MB); memory is only used as it fills.";
+      };
+    };
+  };
+
+  options.services.redis = {
+    instance = mkOption {
+      type = types.enum [
+        "unique"
+        "shared"
+      ];
+      default = "unique";
+      description = "A redis-server of its own per checkout (`unique`), or one for every checkout of the project (`shared`).";
+    };
+    start = startOptions "demand";
+  };
+
   options.localforest = {
     enable = mkOption {
       type = types.bool;
@@ -309,6 +640,12 @@ in
       default = true;
       description = "Set NODE_EXTRA_CA_CERTS to the local CA in `.claude/settings.local.json`, so Claude Code reaches MCP servers on https://*.localhost. Node reads one file only: to trust other CAs too, set `files.\".claude/settings.local.json\".json.env.NODE_EXTRA_CA_CERTS` to a bundle yourself.";
     };
+    envFiles = mkOption {
+      type = types.listOf types.str;
+      default = if config.dotenv.enable then lib.toList config.dotenv.filename else [ ".env.local" ];
+      defaultText = lib.literalExpression ''if dotenv.enable then dotenv.filename else [ ".env.local" ]'';
+      description = "Files, relative to each checkout, with the checkout's own variables: read on every start of anything in it and applied last (later files win). A new worktree starts with a copy of the primary's.";
+    };
     lsp = mkOption {
       type = types.attrsOf (types.listOf types.str);
       default = { };
@@ -323,7 +660,50 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    localforest.services = lib.mkIf (cfg.server != null) { web.exec = lib.mkDefault cfg.server; };
+    localforest.services = lib.mkMerge [
+      (lib.mkIf (cfg.server != null) { web.exec = lib.mkDefault cfg.server; })
+      # Each field a default, so an explicit localforest.services.<name> wins.
+      (lib.mapAttrs (_: lib.mapAttrs (_: lib.mkDefault)) derived)
+    ];
+
+    # One proxy, one CA: localforest serves the hostnames.
+    process.proxy.enable = lib.mkIf (derivedProcs != { }) (lib.mkForce false);
+
+    localforest.postgres = lib.mkIf pgCfg.enable {
+      package = lib.mkDefault pgCfg.package;
+      extensions = lib.mkDefault pgCfg.extensions;
+      settings = lib.mkDefault (
+        lib.mapAttrs (_: v: if builtins.isFloat v then toString v else v) (
+          removeAttrs pgCfg.settings pgOwnSettings
+        )
+      );
+      ramdiskMB = lib.mkIf pgCfg.dangerouslyDisableDurabilityForSpeed.enable (
+        lib.mkDefault (megabytes pgCfg.dangerouslyDisableDurabilityForSpeed.ramdiskSize)
+      );
+    };
+    localforest.redis = lib.mkIf redisCfg.enable (lib.mkDefault redisCfg.package);
+
+    assertions =
+      lib.mapAttrsToList (name: p: {
+        assertion =
+          p.start.on != "demand"
+          || derived.${name}.http
+          || lib.any (other: builtins.elem name other.dependsOn) (
+            lib.attrValues (removeAttrs derived [ name ])
+          );
+        message = ''processes.${name}: start.on = "demand" but nothing can start it: give it an http port (ports.http.allocate), make another process depend on it (after = [ "devenv:processes:${name}" ]), or use start.on = "up".'';
+      }) derivedProcs
+      ++ [
+        {
+          assertion =
+            !(
+              pgCfg.instance == "unique"
+              && pgCfg.copyOnWrite.enable
+              && options.services.postgres.copyOnWrite.enable.highestPrio < 1500
+            );
+          message = ''services.postgres: copyOnWrite clones databases inside one shared cluster; set copyOnWrite.enable = false or instance = "shared".'';
+        }
+      ];
 
     cachix.pull = lib.mkIf cfg.cachix.enable [ "localforest" ];
 
@@ -348,13 +728,37 @@ in
       LOCALFOREST_POSTGRES_SETTINGS = builtins.toJSON cfg.postgres.settings;
       LOCALFOREST_POSTGRES_EXTENSIONS = lib.concatStringsSep "," cfg.postgres.createExtensions;
       LOCALFOREST_REDIS_SERVER = lib.getExe' cfg.redis "redis-server";
+      LOCALFOREST_POSTGRES_DURABLE =
+        if pgCfg.dangerouslyDisableDurabilityForSpeed.enable then "0" else "1";
+      LOCALFOREST_POSTGRES_INSTANCE = pgCfg.instance;
+      LOCALFOREST_POSTGRES_START = pgCfg.start.on;
+      LOCALFOREST_POSTGRES_COW = if pgCfg.copyOnWrite.enable then "1" else "0";
+      LOCALFOREST_POSTGRES_TEMPLATE_REFRESH = pgCfg.copyOnWrite.refresh;
+      LOCALFOREST_REDIS_INSTANCE = redisCfg.instance;
+      LOCALFOREST_REDIS_START = redisCfg.start.on;
+      LOCALFOREST_ENV_FILES = builtins.toJSON cfg.envFiles;
     }
+    // lib.optionalAttrs (pgCfg.start.idleTimeout != null) {
+      LOCALFOREST_POSTGRES_IDLE_TIMEOUT = toString (seconds pgCfg.start.idleTimeout);
+    }
+    // lib.optionalAttrs (redisCfg.start.idleTimeout != null) {
+      LOCALFOREST_REDIS_IDLE_TIMEOUT = toString (seconds redisCfg.start.idleTimeout);
+    }
+    // lib.optionalAttrs (pgCfg.enable && pgCfg.initialDatabases != [ ]) {
+      LOCALFOREST_POSTGRES_INITIAL_DATABASES = builtins.toJSON (map (d: d.name) pgCfg.initialDatabases);
+    }
+    // lib.optionalAttrs config.devenv.isTesting { LOCALFOREST_NO_SYNC = "1"; }
     // lib.optionalAttrs (cfg.httpsPort != null) { LOCALFOREST_HTTPS_PORT = toString cfg.httpsPort; }
     // lib.optionalAttrs (cfg.httpPort != null) { LOCALFOREST_HTTP_PORT = toString cfg.httpPort; }
     // lib.optionalAttrs (cfg.project != null) { LOCALFOREST_PROJECT = cfg.project; }
-    // lib.optionalAttrs (cfg.migrate != null) { LOCALFOREST_MIGRATE = cfg.migrate; }
-    // lib.optionalAttrs (cfg.seed != null) { LOCALFOREST_SEED = cfg.seed; }
-    // lib.optionalAttrs (cfg.setup != null) { LOCALFOREST_SETUP = cfg.setup; };
+    # Under `devenv test` the checkout under test migrates itself.
+    // lib.optionalAttrs (cfg.migrate != null && !config.devenv.isTesting) {
+      LOCALFOREST_MIGRATE = cfg.migrate;
+    }
+    // lib.optionalAttrs (cfg.seed != null && !config.devenv.isTesting) { LOCALFOREST_SEED = cfg.seed; }
+    // lib.optionalAttrs (cfg.setup != null && !config.devenv.isTesting) {
+      LOCALFOREST_SETUP = cfg.setup;
+    };
 
     processes.localforest.exec = "${exe} serve";
 
