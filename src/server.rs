@@ -29,7 +29,7 @@ use crate::config::{self, Checkout, Global, Project, Restart, Service};
 
 /// `cmdline` split like a shell would, run directly (no shell) in `cwd` of the
 /// checkout at `checkout` with the registering project's environment (its PATH finds
-/// the program), then `env`, then the checkout's env files (`Project::env_files`).
+/// the program), then `env`.
 /// In a worktree the project environment was captured in the primary checkout, so
 /// its paths into the primary move to the worktree (`config::rewrite_root`: env values,
 /// arguments, `cwd`, and a script whose text names the primary runs as a rewritten
@@ -55,11 +55,10 @@ pub fn command(
             s.to_string()
         }
     };
-    let (file_vars, primary_only) = config::env_file_vars(root, checkout, &project.env_files());
     let base: Vec<(String, String)> = project
         .env
         .iter()
-        .filter(|(k, _)| !primary_only.contains(k) && !DEVENV_SERVICE_STATE.contains(&k.as_str()))
+        .filter(|(k, _)| !DEVENV_SERVICE_STATE.contains(&k.as_str()))
         .map(|(k, v)| (k.clone(), rw(v)))
         .collect();
     let argv = shell_words::split(cmdline)?;
@@ -94,12 +93,6 @@ pub fn command(
     if worktree {
         c.envs(devenv_vars(checkout));
     }
-    for (k, _) in &file_vars {
-        if config::RESERVED_ENV.contains(&k.as_str()) || k.starts_with("LAZY_COW_TREE_") {
-            warn_once(checkout, k);
-        }
-    }
-    c.envs(file_vars);
     Ok(c)
 }
 
@@ -145,18 +138,6 @@ fn rewritten_script(program: &Path, root: &Path, checkout: &Path, dir: &Path) ->
         std::fs::rename(&tmp, &path).ok()?;
     }
     Some(path)
-}
-
-/// Warn once per checkout and key that an env file overrides a lazy-cow-tree variable.
-fn warn_once(checkout: &Path, key: &str) {
-    static SEEN: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
-    let k = format!("{}\0{key}", checkout.display());
-    if SEEN.lock().unwrap().insert(k) {
-        warn!(
-            "{}: an env file overrides {key}, which lazy-cow-tree sets",
-            checkout.display()
-        );
-    }
 }
 
 /// Log of a service (`Checkout::service_id`) or a migrate run.
@@ -1079,20 +1060,18 @@ mod tests {
     }
 
     #[test]
-    fn worktree_commands_get_its_paths_devenv_vars_and_env_files() {
+    fn worktree_commands_get_its_paths_and_devenv_vars() {
         let d = tempfile::tempdir().unwrap();
         let root = d.path().join("app");
         let wt = root.join(".claude/worktrees/wt");
         std::fs::create_dir_all(&wt).unwrap();
-        std::fs::write(root.join(".env.local"), "FROM_PRIMARY=1\nSHARED=primary\n").unwrap();
-        std::fs::write(wt.join(".env.local"), "SHARED=wt\nPORT=1\n").unwrap();
         let mut project = Project::new(
             root.clone(),
             serde_json::from_value(serde_json::json!({
                 "name": "app", "port": 4000, "remote": "origin", "base": null,
                 "worktrees_dir": ".claude/worktrees",
                 "migrate": null, "seed": null, "setup": null, "services": {},
-                "preview_ttl_hours": 48, "no_sync": false, "no_auto_remove": false
+                "no_sync": false, "no_auto_remove": false
             }))
             .unwrap(),
         );
@@ -1100,8 +1079,6 @@ mod tests {
         project.env = vec![
             ("PATH".into(), format!("{r}/bin:/usr/bin:/bin")),
             ("DEVENV_ROOT".into(), r.clone()),
-            ("FROM_PRIMARY".into(), "1".into()),
-            ("LAZY_COW_TREE_ENV_FILES".into(), r#"[".env.local"]"#.into()),
             ("PGDATA".into(), format!("{r}/.devenv/state/postgres")),
             ("REDISDATA".into(), format!("{r}/.devenv/state/redis")),
         ];
@@ -1128,15 +1105,11 @@ mod tests {
         assert_eq!(env["DEVENV_STATE"], format!("{w}/.devenv/state"));
         assert!(env["DEVENV_RUNTIME"].starts_with("/tmp/lazy-cow-tree-"));
         assert_eq!(env["CFG"], format!("{w}/config"));
-        // Env files come last: over the derived PORT too.
-        assert_eq!(env["SHARED"], "wt");
-        assert_eq!(env["PORT"], "1");
-        // Only the primary's file set it: gone in the worktree.
-        assert!(!env.contains_key("FROM_PRIMARY"));
+        assert_eq!(env["PORT"], "20000");
         // devenv's own postgres/redis state never reaches what lazy-cow-tree runs.
         assert!(!env.contains_key("PGDATA") && !env.contains_key("REDISDATA"));
 
-        // The primary keeps its paths and its own file's values.
+        // The primary keeps its paths.
         let cmd = command(&project, &root, "echo hi", &root, vec![]).unwrap();
         let env: BTreeMap<String, String> = cmd
             .as_std()
@@ -1144,8 +1117,6 @@ mod tests {
             .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v?.to_str()?.to_string())))
             .collect();
         assert_eq!(env["DEVENV_ROOT"], r);
-        assert_eq!(env["SHARED"], "primary");
-        assert_eq!(env["FROM_PRIMARY"], "1");
         let _ = std::fs::remove_dir(&devenv_vars(&wt)[3].1);
     }
 

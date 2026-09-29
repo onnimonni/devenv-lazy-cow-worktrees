@@ -17,6 +17,7 @@ use tracing::{info, warn};
 
 use crate::{
     config::{self, Project, valid_label, worktree_label},
+    cow::{self, PER_CHECKOUT, populated_marker},
     sync::Syncer,
 };
 
@@ -286,308 +287,9 @@ pub fn create(
     }
     std::fs::create_dir_all(&dir)?;
     add_no_checkout(root, name, &path, name)?;
-    populate(root, &path, name)?;
+    cow::populate(root, &path, name)?;
     Ok(path.canonicalize()?)
 }
-
-/// Fill a fresh worktree (only `.git` in it) with copy-on-write clones of the primary
-/// checkout, gitignored build caches included (git-cow); a regular checkout if that
-/// fails. Per-checkout state that names the primary's paths is left behind.
-fn populate(root: &Path, path: &Path, name: &str) -> Result<()> {
-    let opts = git_cow::PopulateOptions {
-        from: Some(root.to_path_buf()),
-        include_ignored: true,
-        settle: false,
-    };
-    let carried = match git_cow::populate(path, &opts) {
-        Ok(r) if r.cloned > 0 => {
-            for w in &r.warnings {
-                warn!("git-cow: {w}");
-            }
-            info!(
-                "worktree {name}: {} clone, {} files written, carried {}",
-                r.filesystem,
-                r.rewritten,
-                git_cow::join_paths(&r.carried)
-            );
-            r.carried
-                .iter()
-                .map(|p| p.to_string_lossy().into_owned())
-                .collect()
-        }
-        // A regular checkout (no copy-on-write here): the caches are ours to bring.
-        Ok(_) => copy_caches(root, path, name)?,
-        Err(e) => {
-            warn!("git-cow: {e:#}; falling back to a regular checkout");
-            let wt = Repository::open(path)?;
-            wt.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))?;
-            copy_caches(root, path, name)?
-        }
-    };
-    for dir in PER_CHECKOUT {
-        let p = path.join(dir);
-        if p.exists() {
-            std::fs::remove_dir_all(&p)?;
-        }
-    }
-    // Never again for this worktree (its git admin dir goes away with it). Lists the
-    // carried caches, which removal then doesn't report as lost.
-    let list: String = carried.iter().map(|c| format!("{c}\n")).collect();
-    std::fs::write(populated_marker(path)?, list)?;
-    Ok(())
-}
-
-/// Top-level gitignored directories of the primary checkout (build caches) that
-/// `dest` lacks; with a `.worktreeinclude`, only the ones it names.
-fn missing_caches(root: &Path, dest: &Path) -> Result<Vec<String>> {
-    let primary = Repository::open(root)?;
-    let include = worktree_include(root);
-    let mut missing = Vec::new();
-    for entry in std::fs::read_dir(root)?.flatten() {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if !entry.file_type().is_ok_and(|t| t.is_dir())
-            || include
-                .as_ref()
-                .is_some_and(|inc| !inc.contains(name_str.as_ref()))
-            || NOT_CACHES.contains(&name_str.as_ref())
-            || dest.join(&name).exists()
-            || !primary.status_should_ignore(Path::new(&name)).unwrap_or(false)
-            // Nested worktrees (.claude/worktrees) and other repositories.
-            || entry.path().join(".git").exists()
-            || dest.starts_with(entry.path())
-        {
-            continue;
-        }
-        missing.push(name_str.into_owned());
-    }
-    Ok(missing)
-}
-
-/// Copy a directory tree: reflinks where the filesystem has them, else bytes; keeps
-/// modes, mtimes (build tools compare them) and symlinks.
-fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)?.flatten() {
-        let (from, to) = (entry.path(), dst.join(entry.file_name()));
-        let meta = std::fs::symlink_metadata(&from)?;
-        let kind = meta.file_type();
-        if kind.is_symlink() {
-            std::os::unix::fs::symlink(std::fs::read_link(&from)?, &to)?;
-        } else if kind.is_dir() {
-            copy_tree(&from, &to)?;
-        } else if kind.is_file() {
-            reflink_copy::reflink_or_copy(&from, &to)?;
-            std::fs::set_permissions(&to, meta.permissions())?;
-        } else {
-            // Sockets, fifos: live state, never cache.
-            continue;
-        }
-        if !kind.is_symlink() {
-            filetime::set_file_mtime(&to, filetime::FileTime::from_last_modification_time(&meta))?;
-        }
-    }
-    Ok(())
-}
-
-/// git-cow couldn't clone (no copy-on-write on this filesystem, e.g. ext4): copy the
-/// build caches ourselves, so the worktree still needs no fresh install/compile.
-/// Ok(the copied directories).
-fn copy_caches(root: &Path, path: &Path, name: &str) -> Result<Vec<String>> {
-    let missing = missing_caches(root, path)?;
-    if missing.is_empty() {
-        return Ok(missing);
-    }
-    let t = std::time::Instant::now();
-    for dir in &missing {
-        copy_tree(&root.join(dir), &path.join(dir))?;
-    }
-    info!(
-        "worktree {name}: no copy-on-write clone here; copied {} in {:?}",
-        missing.join(", "),
-        t.elapsed()
-    );
-    Ok(missing)
-}
-
-fn populated_marker(path: &Path) -> Result<PathBuf> {
-    Ok(Repository::open(path)?
-        .path()
-        .join("lazy-cow-tree-populated"))
-}
-
-/// First path segments named in the primary's `.worktreeinclude` (git-cow carries
-/// only those ignored paths when it exists).
-fn worktree_include(root: &Path) -> Option<HashSet<String>> {
-    let text = std::fs::read_to_string(root.join(".worktreeinclude")).ok()?;
-    Some(
-        text.lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with('!'))
-            .filter_map(|l| {
-                l.trim_start_matches('/')
-                    .split('/')
-                    .next()
-                    .map(str::to_string)
-            })
-            .collect(),
-    )
-}
-
-const ENV_BEGIN: &str = "# >>> lazy-cow-tree: this worktree's environment (regenerated) >>>";
-const ENV_END: &str = "# <<< lazy-cow-tree <<<";
-const ENV_OVERRIDDEN: &str = "# overridden by lazy-cow-tree: ";
-
-/// `.env` text without lazy-cow-tree's block.
-fn outside_env_block(text: &str) -> String {
-    let mut rest = String::new();
-    let mut inside = false;
-    for line in text.lines() {
-        if line == ENV_BEGIN {
-            inside = true;
-        } else if line == ENV_END {
-            inside = false;
-        } else if !inside {
-            rest.push_str(line);
-            rest.push('\n');
-        }
-    }
-    rest
-}
-
-/// The worktree's `.env` is only what lazy-cow-tree made of it: its block plus the
-/// primary's `.env` (keys the block sets commented out), or the block alone.
-fn env_is_ours(root: &Path, path: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(path.join(".env")) else {
-        return false;
-    };
-    if !text.lines().any(|l| l == ENV_BEGIN) {
-        return false;
-    }
-    let norm = |t: &str| {
-        let mut lines: Vec<&str> = t
-            .lines()
-            .map(|l| l.strip_prefix(ENV_OVERRIDDEN).unwrap_or(l).trim_end())
-            .collect();
-        while lines.last().is_some_and(|l| l.is_empty()) {
-            lines.pop();
-        }
-        lines.join("\n")
-    };
-    let primary = std::fs::read_to_string(root.join(".env")).unwrap_or_default();
-    norm(&outside_env_block(&text)) == norm(&primary)
-}
-
-/// A `.env` value. Single-quoted, which dotenvy, Node and Ruby dotenv, docker compose,
-/// direnv and `set -a; . .env` read verbatim (no escapes, no `$` expansion; Bun
-/// still expands `$VAR` in single quotes), unless it holds `'` or a line break,
-/// which single quotes can't carry; then double-quoted with `\\`, `\"`, `\$` and `\n`
-/// escaped, the escapes dotenvy, Ruby dotenv and docker compose share (a `\r` stays
-/// raw: dotenvy rejects the escape), and each backtick as a single-quoted piece
-/// (`"a"'`'"b"`: dotenvy has no `` \` `` escape), so a shell sourcing it runs nothing.
-/// Loaders differ on that fallback: Node dotenv keeps its backslashes, Ruby dotenv
-/// and docker compose don't join quoted pieces, sh reads `\n` as backslash-n.
-fn dotenv_quote(v: &str) -> String {
-    if !v.contains(['\'', '\n', '\r']) {
-        return format!("'{v}'");
-    }
-    let mut out = String::from("\"");
-    for c in v.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '$' => out.push_str("\\$"),
-            // No escape for it that dotenvy takes: a single-quoted piece.
-            '`' => out.push_str("\"'`'\""),
-            '\n' => out.push_str("\\n"),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
-/// Write `env` into the worktree's `.env` (as a block at the top, so first-wins
-/// loaders see it), making sure `.env` is gitignored (`.git/info/exclude` if not)
-/// and never touching a tracked one. Keys of the rest of the file (e.g. a `.env`
-/// cloned from the primary checkout) that the block sets are commented out, so no
-/// loader picks up the primary's DATABASE_URL.
-pub fn write_env(path: &Path, env: &[(String, String)]) -> Result<()> {
-    let repo = Repository::open(path)?;
-    let file = path.join(".env");
-    if repo.index()?.get_path(Path::new(".env"), 0).is_some() {
-        warn!(
-            "{}: .env is tracked by git; not writing lazy-cow-tree's environment into it",
-            path.display()
-        );
-        return Ok(());
-    }
-    if !repo.status_should_ignore(Path::new(".env"))? {
-        let exclude = repo.commondir().join("info/exclude");
-        std::fs::create_dir_all(exclude.parent().unwrap())?;
-        let mut text = std::fs::read_to_string(&exclude).unwrap_or_default();
-        if !text.is_empty() && !text.ends_with('\n') {
-            text.push('\n');
-        }
-        text.push_str("# lazy-cow-tree writes each worktree's .env\n.env\n");
-        std::fs::write(&exclude, text)?;
-        info!("added .env to {}", exclude.display());
-    }
-    let old = std::fs::read_to_string(&file).unwrap_or_default();
-    // Drop our previous block.
-    let rest = outside_env_block(&old);
-    let ours: HashSet<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
-    let mut out = format!("{ENV_BEGIN}\n");
-    for (k, v) in env {
-        if v.contains('$') {
-            warn!(
-                "{}: .env value of {k} contains '$', which some loaders (Bun) expand",
-                path.display()
-            );
-        }
-        out.push_str(&format!("{k}={}\n", dotenv_quote(v)));
-    }
-    out.push_str(ENV_END);
-    out.push('\n');
-    for line in rest.lines() {
-        let key = line
-            .trim_start()
-            .trim_start_matches("export ")
-            .split('=')
-            .next()
-            .unwrap_or_default()
-            .trim();
-        if !line.trim_start().starts_with('#') && line.contains('=') && ours.contains(key) {
-            out.push_str(&format!("{ENV_OVERRIDDEN}{line}\n"));
-        } else {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    std::fs::write(&file, out)?;
-    Ok(())
-}
-
-/// Ignored state that belongs to one checkout: language server indexes (absolute
-/// paths of the checkout they were built in) and environments.
-const PER_CHECKOUT: &[&str] = &[".dexter", ".elixir_ls", ".lexical", ".expert"];
-
-/// Top-level gitignored entries never worth carrying (or checking for).
-const NOT_CACHES: &[&str] = &[
-    ".git",
-    ".devenv",
-    ".direnv",
-    ".claude",
-    ".venv",
-    "venv",
-    "tmp",
-    "log",
-    ".env",
-    ".dexter",
-    ".elixir_ls",
-    ".lexical",
-    ".expert",
-];
 
 /// `git worktree lock`ed: automatic removal leaves it alone.
 pub fn is_locked(root: &Path, info: &Info) -> bool {
@@ -630,55 +332,6 @@ pub fn initializing(root: &Path, info: &Info) -> bool {
                 Ok(git2::WorktreeLockStatus::Locked(Some(ref r))) if r.starts_with("initializing")
             )
         })
-}
-
-/// A worktree made by plain `git worktree add` (not lazy-cow-tree or git-cow) has no
-/// build caches. While it's still exactly its fresh checkout (clean, nothing
-/// untracked) and the primary has gitignored top-level entries it lacks (`deps/`,
-/// `_build/`, `node_modules/`, …), redo it as a copy-on-write clone of the primary,
-/// caches included. Ok(true) when it did.
-pub fn carry_caches(root: &Path, info: &Info) -> Result<bool> {
-    // Only just created: an old worktree someone works in is left alone.
-    let age = std::fs::symlink_metadata(info.path.join(".git"))?
-        .modified()?
-        .elapsed()
-        .unwrap_or_default();
-    if age > Duration::from_secs(600) {
-        return Ok(false);
-    }
-    if populated_marker(&info.path)?.exists() {
-        return Ok(false);
-    }
-    let missing = missing_caches(root, &info.path)?;
-    if missing.is_empty() {
-        return Ok(false);
-    }
-    if is_dirty(&info.path)? {
-        info!(
-            "worktree {}: lacks {} but has changes; not touching it",
-            info.name,
-            missing.join(", ")
-        );
-        return Ok(false);
-    }
-    info!(
-        "worktree {}: made without copy-on-write (lacks {}); cloning it from the primary",
-        info.name,
-        missing.join(", ")
-    );
-    for entry in std::fs::read_dir(&info.path)?.flatten() {
-        if entry.file_name() == ".git" {
-            continue;
-        }
-        let p = entry.path();
-        if entry.file_type()?.is_dir() {
-            std::fs::remove_dir_all(&p)?;
-        } else {
-            std::fs::remove_file(&p)?;
-        }
-    }
-    populate(root, &info.path, &info.name)?;
-    Ok(true)
 }
 
 /// Uncommitted and untracked (not ignored) paths.
@@ -851,7 +504,6 @@ pub fn ignored_files(root: &Path, path: &Path) -> Result<Vec<String>> {
             !REBUILDABLE.contains(&top)
                 && !PER_CHECKOUT.contains(&top)
                 && !carried.contains(rel, p.ends_with('/'))
-                && !(rel == ".env" && env_is_ours(root, path))
                 && !provisioned.is_some_and(|t| unchanged_since(&path.join(rel), t))
                 && !is_copy(&path.join(rel), &root.join(rel)).unwrap_or(false)
         })
@@ -1402,44 +1054,6 @@ mod tests {
     use git2::{Signature, WorktreeAddOptions};
     use tempfile::TempDir;
 
-    #[test]
-    fn env_values_read_back_verbatim() {
-        let values = [
-            "postgres://u:pw@127.0.0.1:55432/db",
-            "a $HOME ${HOME} $(id) `id` b",
-            "it's",
-            "say \"hi\" \\ back\\slash",
-            "two\nlines",
-            "it's $HOME\nand \"more\"\\n",
-            "it's `id` $(id)",
-            "cr\r\nlf",
-            "",
-            "#not a comment",
-        ];
-        assert_eq!(dotenv_quote("a $B"), "'a $B'");
-        assert_eq!(dotenv_quote("it's $B\n"), "\"it's \\$B\\n\"");
-        // Backticks in single-quoted pieces: `set -a; . .env` must not run them.
-        assert_eq!(
-            dotenv_quote("it's `id` $(id) \"q\" \\"),
-            r#""it's "'`'"id"'`'" \$(id) \"q\" \\""#
-        );
-        let dir = TempDir::new().unwrap();
-        let file = dir.path().join(".env");
-        let text: String = values
-            .iter()
-            .enumerate()
-            .map(|(i, v)| format!("K{i}={}\n", dotenv_quote(v)))
-            .collect();
-        std::fs::write(&file, text).unwrap();
-        let parsed: HashMap<String, String> = dotenvy::from_path_iter(&file)
-            .unwrap()
-            .map(Result::unwrap)
-            .collect();
-        for (i, v) in values.iter().enumerate() {
-            assert_eq!(parsed[&format!("K{i}")], *v, "value {i}");
-        }
-    }
-
     fn settings() -> ProjectSettings {
         ProjectSettings {
             name: Some("app".into()),
@@ -1451,7 +1065,6 @@ mod tests {
             seed: None,
             setup: None,
             services: Default::default(),
-            preview_ttl_hours: 48,
             no_sync: false,
             no_auto_remove: false,
         }
@@ -1808,32 +1421,6 @@ mod tests {
     }
 
     #[test]
-    fn env_holding_only_lazy_cow_trees_block_is_not_reported() {
-        let (_d, project, syncer) = fixture();
-        let path = create(&project, &syncer, "feat-x", None).unwrap();
-        std::thread::sleep(Duration::from_millis(20));
-        let env = [("DATABASE_URL".to_string(), "postgres://x".to_string())];
-        write_env(&path, &env).unwrap();
-        assert_eq!(
-            ignored_files(&project.root, &path).unwrap(),
-            Vec::<String>::new()
-        );
-        // The primary's .env under the block, its DATABASE_URL overridden: still ours.
-        std::fs::write(project.root.join(".env"), "DATABASE_URL=p\nKEY=1\n").unwrap();
-        std::fs::write(path.join(".env"), "DATABASE_URL=p\nKEY=1\n").unwrap();
-        write_env(&path, &env).unwrap();
-        assert_eq!(
-            ignored_files(&project.root, &path).unwrap(),
-            Vec::<String>::new()
-        );
-        // A key of one's own: reported.
-        let mut text = std::fs::read_to_string(path.join(".env")).unwrap();
-        text.push_str("MINE=2\n");
-        std::fs::write(path.join(".env"), text).unwrap();
-        assert_eq!(ignored_files(&project.root, &path).unwrap(), vec![".env"]);
-    }
-
-    #[test]
     fn files_from_before_setup_finished_are_not_reported() {
         let (_d, project, syncer) = fixture();
         set_exclude(&project, ".mcp.json\n.claude/\ntmp/\n");
@@ -2000,7 +1587,7 @@ mod tests {
         filetime::set_file_mtime(src.join("lib/a.beam"), old).unwrap();
 
         let dst = d.path().join("dst");
-        copy_tree(&src, &dst).unwrap();
+        cow::copy_tree(&src, &dst).unwrap();
         assert_eq!(
             std::fs::read_to_string(dst.join("lib/a.beam")).unwrap(),
             "beam"
@@ -2016,67 +1603,5 @@ mod tests {
             std::fs::read_link(dst.join("link")).unwrap(),
             Path::new("lib/a.beam")
         );
-    }
-
-    #[test]
-    fn plain_git_worktree_gets_caches_and_env() {
-        let (_d, project, _) = fixture();
-        let root = &project.root;
-        // Per-checkout index of the primary: must not follow.
-        std::fs::create_dir(root.join(".dexter")).unwrap();
-        std::fs::write(root.join(".dexter/index.db"), root.display().to_string()).unwrap();
-        // What `git worktree add` does: a full checkout, no ignored files.
-        let repo = Repository::open(root).unwrap();
-        let head = repo.head().unwrap().peel_to_commit().unwrap();
-        let branch = repo.branch("plain", &head, false).unwrap().into_reference();
-        let path = root.join(".claude/worktrees/plain");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        repo.worktree(
-            "plain",
-            &path,
-            Some(WorktreeAddOptions::new().reference(Some(&branch))),
-        )
-        .unwrap();
-        let info = list(root)
-            .unwrap()
-            .into_iter()
-            .find(|i| i.name == "plain")
-            .unwrap();
-        assert!(!initializing(root, &info));
-        assert!(!info.path.join("cache").exists());
-
-        assert!(carry_caches(root, &info).unwrap());
-        assert_eq!(
-            std::fs::read_to_string(info.path.join("cache/big")).unwrap(),
-            "built\n"
-        );
-        assert!(!info.path.join(".dexter").exists());
-        assert!(!is_dirty(&info.path).unwrap());
-        // Has them now: nothing more to do.
-        assert!(!carry_caches(root, &info).unwrap());
-
-        // .env: gitignored via info/exclude, block on top, cloned keys disabled.
-        std::fs::write(
-            info.path.join(".env"),
-            "DATABASE_URL=postgres://primary\nOTHER=1\n",
-        )
-        .unwrap();
-        let env = vec![
-            ("DATABASE_URL".to_string(), "postgres://wt".to_string()),
-            ("PORT".to_string(), "20000".to_string()),
-        ];
-        write_env(&info.path, &env).unwrap();
-        write_env(&info.path, &env).unwrap();
-        let text = std::fs::read_to_string(info.path.join(".env")).unwrap();
-        assert_eq!(
-            text,
-            format!(
-                "{ENV_BEGIN}\nDATABASE_URL='postgres://wt'\nPORT='20000'\n{ENV_END}\n\
-                 # overridden by lazy-cow-tree: DATABASE_URL=postgres://primary\nOTHER=1\n"
-            )
-        );
-        let wt = Repository::open(&info.path).unwrap();
-        assert!(wt.status_should_ignore(Path::new(".env")).unwrap());
-        assert!(!is_dirty(&info.path).unwrap());
     }
 }

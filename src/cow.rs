@@ -1,0 +1,178 @@
+//! Filling a fresh `git worktree add --no-checkout` worktree: copy-on-write clones of
+//! the primary checkout, gitignored build caches included (git-cow). Shared by the
+//! daemon (`lazy-cow-tree worktree new`) and the `lazy-cow-tree-cow` binary the devenv
+//! module's `git` wrapper runs, so it only uses std, git2, git-cow and tracing.
+
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
+
+use anyhow::Result;
+use git2::Repository;
+use tracing::{info, warn};
+
+/// Fill a fresh worktree (only `.git` in it) with copy-on-write clones of the primary
+/// checkout, gitignored build caches included (git-cow); a regular checkout if that
+/// fails. Per-checkout state that names the primary's paths is left behind.
+pub fn populate(root: &Path, path: &Path, name: &str) -> Result<()> {
+    let opts = git_cow::PopulateOptions {
+        from: Some(root.to_path_buf()),
+        include_ignored: true,
+        settle: false,
+    };
+    let carried = match git_cow::populate(path, &opts) {
+        Ok(r) if r.cloned > 0 => {
+            for w in &r.warnings {
+                warn!("git-cow: {w}");
+            }
+            info!(
+                "worktree {name}: {} clone, {} files written, carried {}",
+                r.filesystem,
+                r.rewritten,
+                git_cow::join_paths(&r.carried)
+            );
+            r.carried
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect()
+        }
+        // A regular checkout (no copy-on-write here): the caches are ours to bring.
+        Ok(_) => copy_caches(root, path, name)?,
+        Err(e) => {
+            warn!("git-cow: {e:#}; falling back to a regular checkout");
+            let wt = Repository::open(path)?;
+            wt.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))?;
+            copy_caches(root, path, name)?
+        }
+    };
+    for dir in PER_CHECKOUT {
+        let p = path.join(dir);
+        if p.exists() {
+            std::fs::remove_dir_all(&p)?;
+        }
+    }
+    // Never again for this worktree (its git admin dir goes away with it). Lists the
+    // carried caches, which removal then doesn't report as lost.
+    let list: String = carried.iter().map(|c| format!("{c}\n")).collect();
+    std::fs::write(populated_marker(path)?, list)?;
+    Ok(())
+}
+
+/// Top-level gitignored directories of the primary checkout (build caches) that
+/// `dest` lacks; with a `.worktreeinclude`, only the ones it names.
+fn missing_caches(root: &Path, dest: &Path) -> Result<Vec<String>> {
+    let primary = Repository::open(root)?;
+    let include = worktree_include(root);
+    let mut missing = Vec::new();
+    for entry in std::fs::read_dir(root)?.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !entry.file_type().is_ok_and(|t| t.is_dir())
+            || include
+                .as_ref()
+                .is_some_and(|inc| !inc.contains(name_str.as_ref()))
+            || NOT_CACHES.contains(&name_str.as_ref())
+            || dest.join(&name).exists()
+            || !primary.status_should_ignore(Path::new(&name)).unwrap_or(false)
+            // Nested worktrees (.claude/worktrees) and other repositories.
+            || entry.path().join(".git").exists()
+            || dest.starts_with(entry.path())
+        {
+            continue;
+        }
+        missing.push(name_str.into_owned());
+    }
+    Ok(missing)
+}
+
+/// Copy a directory tree: reflinks where the filesystem has them, else bytes; keeps
+/// modes, mtimes (build tools compare them) and symlinks.
+pub fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)?.flatten() {
+        let (from, to) = (entry.path(), dst.join(entry.file_name()));
+        let meta = std::fs::symlink_metadata(&from)?;
+        let kind = meta.file_type();
+        if kind.is_symlink() {
+            std::os::unix::fs::symlink(std::fs::read_link(&from)?, &to)?;
+        } else if kind.is_dir() {
+            copy_tree(&from, &to)?;
+        } else if kind.is_file() {
+            reflink_copy::reflink_or_copy(&from, &to)?;
+            std::fs::set_permissions(&to, meta.permissions())?;
+        } else {
+            // Sockets, fifos: live state, never cache.
+            continue;
+        }
+        if !kind.is_symlink() {
+            filetime::set_file_mtime(&to, filetime::FileTime::from_last_modification_time(&meta))?;
+        }
+    }
+    Ok(())
+}
+
+/// git-cow couldn't clone (no copy-on-write on this filesystem, e.g. ext4): copy the
+/// build caches ourselves, so the worktree still needs no fresh install/compile.
+/// Ok(the copied directories).
+fn copy_caches(root: &Path, path: &Path, name: &str) -> Result<Vec<String>> {
+    let missing = missing_caches(root, path)?;
+    if missing.is_empty() {
+        return Ok(missing);
+    }
+    let t = std::time::Instant::now();
+    for dir in &missing {
+        copy_tree(&root.join(dir), &path.join(dir))?;
+    }
+    info!(
+        "worktree {name}: no copy-on-write clone here; copied {} in {:?}",
+        missing.join(", "),
+        t.elapsed()
+    );
+    Ok(missing)
+}
+
+pub fn populated_marker(path: &Path) -> Result<PathBuf> {
+    Ok(Repository::open(path)?
+        .path()
+        .join("lazy-cow-tree-populated"))
+}
+
+/// First path segments named in the primary's `.worktreeinclude` (git-cow carries
+/// only those ignored paths when it exists).
+fn worktree_include(root: &Path) -> Option<HashSet<String>> {
+    let text = std::fs::read_to_string(root.join(".worktreeinclude")).ok()?;
+    Some(
+        text.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with('!'))
+            .filter_map(|l| {
+                l.trim_start_matches('/')
+                    .split('/')
+                    .next()
+                    .map(str::to_string)
+            })
+            .collect(),
+    )
+}
+
+/// Ignored state that belongs to one checkout: language server indexes (absolute
+/// paths of the checkout they were built in) and environments.
+pub const PER_CHECKOUT: &[&str] = &[".dexter", ".elixir_ls", ".lexical", ".expert"];
+
+/// Top-level gitignored entries never worth carrying (or checking for).
+const NOT_CACHES: &[&str] = &[
+    ".git",
+    ".devenv",
+    ".direnv",
+    ".claude",
+    ".venv",
+    "venv",
+    "tmp",
+    "log",
+    ".env",
+    ".dexter",
+    ".elixir_ls",
+    ".lexical",
+    ".expert",
+];

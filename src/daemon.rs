@@ -5,8 +5,9 @@
 //! - services per checkout at https://<worktree>.<service>.<project>.localhost; the
 //!   first request starts one (after what it depends on) if nothing listens
 //! - one Redis port; the password picks the checkout's own redis-server
-//! - watches `.git/worktrees`: worktrees made by anyone (git, git-cow, Claude Code)
-//!   are provisioned, deleted ones cleaned up
+//! - reconciles `git worktree list` on start, every minute and when asked (the devenv
+//!   module's `git` wrapper, Claude Code's hooks): new worktrees are provisioned,
+//!   deleted ones cleaned up
 //! - GitHub webhook websocket (polling as fallback): pushes pull branches and merge
 //!   the base branch into worktrees, which are then migrated (new worktrees are
 //!   migrated once too); when the base branch moves, the migrate command runs in the
@@ -17,7 +18,7 @@
 //! with the running one, then takes over if that one goes away.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -35,14 +36,13 @@ use axum::{
     routing::{get, post},
 };
 use git2::{Oid, Repository};
-use notify::{RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use tokio::{net::UnixListener, sync::Notify, task::JoinHandle};
 use tracing::{debug, error, info, warn};
 
 use crate::{
     config::{self, Checkout, Global, Project, StartMode},
-    github, history,
+    github,
     postgres::Postgres,
     proxy::{self, Routes},
     redis::Redis,
@@ -62,8 +62,6 @@ pub struct Daemon {
     redis: Arc<Redis>,
     servers: Arc<Servers>,
     routes: Routes,
-    /// Last activity per checkout (previews close after `preview_ttl_hours` without).
-    activity: history::Activity,
     projects: Mutex<BTreeMap<PathBuf, Arc<ProjectRt>>>,
     shutdown: Notify,
     /// Checkouts (by project root) whose `start = "up"` services to start, drained
@@ -127,8 +125,6 @@ struct ProjectRt {
     lock: tokio::sync::Mutex<()>,
     /// Provisioned worktrees by name.
     known: Mutex<BTreeMap<String, Checkout>>,
-    /// Removed worktrees whose history is written but databases not yet dropped.
-    recorded: Mutex<HashSet<String>>,
     gh: Option<Arc<github::Client>>,
     token: Option<String>,
     pending: Pending,
@@ -142,7 +138,6 @@ struct ProjectRt {
     migrate_failures: Mutex<BTreeMap<String, MigrateFailure>>,
     ws_ok: AtomicBool,
     tasks: Mutex<Vec<JoinHandle<()>>>,
-    watcher: Mutex<Option<notify::RecommendedWatcher>>,
     /// The primary's `start = "up"` services were queued.
     up_queued: AtomicBool,
 }
@@ -315,14 +310,6 @@ pub struct CreateResp {
     pub env: Vec<(String, String)>,
 }
 
-/// Why an idle preview stays open.
-enum PreviewKeep {
-    /// It has work that closing would lose.
-    Work(String),
-    /// Can't tell right now (GitHub unreachable, …).
-    Unknown(String),
-}
-
 #[derive(Serialize, Deserialize)]
 pub struct RemoveReq {
     pub root: PathBuf,
@@ -438,7 +425,6 @@ impl Daemon {
             base,
             lock: Default::default(),
             known: Mutex::new(known),
-            recorded: Default::default(),
             gh,
             token,
             pending: Pending::default(),
@@ -449,7 +435,6 @@ impl Daemon {
             migrate_failures: Default::default(),
             ws_ok: AtomicBool::new(false),
             tasks: Mutex::new(Vec::new()),
-            watcher: Mutex::new(None),
             up_queued: AtomicBool::new(false),
         });
         // Replaces (and so stops) an older registration of the same checkout.
@@ -469,7 +454,6 @@ impl Daemon {
         let (r, wd) = (root.clone(), rt.project.worktrees_dir());
         tokio::task::spawn_blocking(move || worktree::clean_trash(&r, &wd)).await?;
         self.reconcile(&rt).await?;
-        self.start_watcher(&rt)?;
         let mut tasks = Vec::new();
         tasks.push(tokio::spawn(worker(self.clone(), rt.clone())));
         tasks.push(tokio::spawn(ticker(rt.clone())));
@@ -479,31 +463,6 @@ impl Daemon {
         rt.tasks.lock().unwrap().extend(tasks);
         rt.trigger(&rt.pending.migrate);
         rt.trigger(&rt.pending.merged);
-        Ok(())
-    }
-
-    fn start_watcher(self: &Arc<Self>, rt: &Arc<ProjectRt>) -> Result<()> {
-        let common = Repository::open(&rt.project.root)?
-            .commondir()
-            .to_path_buf();
-        let dir = common.join("worktrees");
-        std::fs::create_dir_all(&dir)?;
-        let weak = Arc::downgrade(rt);
-        let mut watcher =
-            notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-                if res.is_ok()
-                    && let Some(rt) = weak.upgrade()
-                {
-                    rt.trigger(&rt.pending.reconcile);
-                }
-            })?;
-        watcher.watch(&dir, RecursiveMode::NonRecursive)?;
-        // The worktree dirs too: deleting one by hand leaves git's metadata behind.
-        let wt_dir = rt.project.worktrees_dir();
-        if wt_dir.is_dir() {
-            watcher.watch(&wt_dir, RecursiveMode::NonRecursive)?;
-        }
-        *rt.watcher.lock().unwrap() = Some(watcher);
         Ok(())
     }
 
@@ -540,26 +499,17 @@ impl Daemon {
             .with_context(|| format!("{}: handing its databases to its role", c.id()))?;
         for (svc, host, port) in c.routes() {
             let service = svc.map(|s| c.service_id(&s));
-            self.routes
-                .set(host, port, c.worktree.is_some(), c.id(), service);
+            self.routes.set(host, port, c.worktree.is_some(), service);
         }
         self.redis.allow(&c.id(), &self.redis_key_of(c));
-        if c.worktree.is_some() {
-            let (path, env) = (c.path.clone(), c.env(&self.global));
-            if let Err(e) =
-                tokio::task::spawn_blocking(move || worktree::write_env(&path, &env)).await?
-            {
-                warn!("{}: writing .env: {e:#}", c.id());
-            }
-        }
         Ok(created)
     }
 
     /// Upgrade: a worktree whose name changed when names started coming from git
-    /// admin dirs keeps its databases (renamed) and preview record (its old role:
-    /// `migrate_role`, via `legacy_id`). Skipped for anything another checkout
-    /// (`others`) uses under that name.
-    async fn adopt_legacy(&self, rt: &ProjectRt, c: &Checkout, others: &[Checkout]) -> Result<()> {
+    /// admin dirs keeps its databases (renamed; its old role: `migrate_role`, via
+    /// `legacy_id`). Skipped for anything another checkout (`others`) uses under that
+    /// name.
+    async fn adopt_legacy(&self, c: &Checkout, others: &[Checkout]) -> Result<()> {
         let Some(old) = c.legacy() else {
             return Ok(());
         };
@@ -586,13 +536,6 @@ impl Daemon {
         for db in dbs.iter().filter(|d| old.owns_partition(d) && !taken(d)) {
             self.pg.drop(db).await?;
             info!("dropped old test database {db}");
-        }
-        if let Some(new) = c.worktree.clone() {
-            history::History::update(&rt.project.root, |h| {
-                if let Some(p) = h.previews.remove(&old.name) {
-                    h.previews.entry(new).or_insert(p);
-                }
-            })?;
         }
         Ok(())
     }
@@ -654,15 +597,6 @@ impl Daemon {
 
     /// A worktree seen for the first time: clone build caches into it when it was made
     /// by plain `git worktree add`. Before `provision`, which writes its `.env`.
-    async fn carry_caches(&self, rt: &ProjectRt, info: &worktree::Info, c: &Checkout) {
-        let (root, i) = (rt.project.root.clone(), info.clone());
-        match tokio::task::spawn_blocking(move || worktree::carry_caches(&root, &i)).await {
-            Ok(Err(e)) => warn!("{}: cloning caches: {e:#}", c.id()),
-            Err(e) => warn!("{}: {e}", c.id()),
-            Ok(Ok(_)) => {}
-        }
-    }
-
     /// Run the setup command once in a new worktree, after `provision` (its role and
     /// `.env` exist, so setup may use the database). A failure is only logged.
     async fn run_setup(&self, rt: &ProjectRt, c: &Checkout) {
@@ -684,7 +618,7 @@ impl Daemon {
         self.run_command(rt, &c.path, &id, &cmd, &c.path, c.env(&self.global))
             .await
             .context("setup failed")?;
-        if let Err(e) = std::fs::write(&marker, history::now().to_string()) {
+        if let Err(e) = std::fs::write(&marker, config::now().to_string()) {
             warn!("{}: {}: {e}", c.id(), marker.display());
         }
         Ok(())
@@ -904,7 +838,6 @@ impl Daemon {
         let others = self.all_checkouts();
         let create_dev = pg_access(user, found.as_ref().map(|(_, c)| c), db, &others)?;
         if let Some((rt, c)) = found {
-            self.activity.touch(&c.id());
             // A database squatted by another checkout's role (CREATEDB lets it make
             // any name) would hand it this checkout's data.
             if db != "postgres"
@@ -1004,9 +937,6 @@ impl Daemon {
             }
             let fresh = !known.contains_key(name);
             let info = infos.iter().find(|i| &i.name == name);
-            if fresh && let Some(info) = info {
-                self.carry_caches(rt, info, c).await;
-            }
             match self.provision(c).await {
                 Ok(_) => {
                     if fresh {
@@ -1017,7 +947,7 @@ impl Daemon {
                             .chain(current.values().cloned())
                             .filter(|o| o.path != c.path)
                             .collect();
-                        if let Err(e) = self.adopt_legacy(rt, c, &others).await {
+                        if let Err(e) = self.adopt_legacy(c, &others).await {
                             warn!("worktree {name}: adopting its old databases: {e:#}");
                         }
                     }
@@ -1045,74 +975,10 @@ impl Daemon {
                     continue;
                 }
                 rt.known.lock().unwrap().remove(name);
-                if rt.recorded.lock().unwrap().remove(name) {
-                    // Removed by us; history already says why.
-                    continue;
-                }
-                // Its own branch (named after it) usually survives a deleted directory.
-                let head = Repository::open(&rt.project.root).ok().and_then(|r| {
-                    r.find_reference(&format!("refs/heads/{name}"))
-                        .ok()?
-                        .target()
-                        .map(|o| o.to_string())
-                });
-                self.remember(
-                    rt,
-                    name,
-                    head.is_some().then(|| name.clone()),
-                    head,
-                    history::Reason::Deleted,
-                    None,
-                    Vec::new(),
-                );
-            }
-        }
-        if let Some(w) = rt.watcher.lock().unwrap().as_mut() {
-            let wt_dir = rt.project.worktrees_dir();
-            if wt_dir.is_dir() {
-                let _ = w.watch(&wt_dir, RecursiveMode::NonRecursive);
             }
         }
         Ok(())
     }
-    /// Record a removed worktree in the main checkout's history; `lost`: gitignored
-    /// files deleted with it.
-    #[allow(clippy::too_many_arguments)]
-    fn remember(
-        &self,
-        rt: &ProjectRt,
-        name: &str,
-        branch: Option<String>,
-        head: Option<String>,
-        reason: history::Reason,
-        pr: Option<u64>,
-        lost: Vec<String>,
-    ) {
-        let rec = history::Removed {
-            branch,
-            head,
-            at: history::now(),
-            reason,
-            pr,
-            preview_closed: None,
-            lost: lost.clone(),
-        };
-        if let Err(e) = history::History::update(&rt.project.root, |h| {
-            // A closed preview keeps why it was gone in the first place.
-            let rec = match h.previews.remove(name) {
-                Some(p) => history::Removed {
-                    preview_closed: Some(history::now()),
-                    lost,
-                    ..p.original
-                },
-                None => rec,
-            };
-            h.removed.insert(name.to_string(), rec);
-        }) {
-            warn!("recording removed worktree {name}: {e:#}");
-        }
-    }
-
     async fn create_worktree(&self, req: CreateReq) -> Result<CreateResp> {
         let rt = self.project(&req.root)?;
         let resp = {
@@ -1149,215 +1015,14 @@ impl Daemon {
         };
         let ports = self.assign_ports().await?;
         let c = checkout_with(&rt.project, &info, &ports);
-        self.carry_caches(rt, &info, &c).await;
         self.provision(&c).await?;
         rt.known.lock().unwrap().insert(name.to_string(), c.clone());
         self.run_setup(rt, &c).await;
-        if let Err(e) = history::History::update(&rt.project.root, |h| {
-            h.removed.remove(name);
-        }) {
-            warn!("{e:#}");
-        }
         Ok(CreateResp {
             path,
             url: format!("https://{}", c.main_host()),
             env: c.env(&self.global),
         })
-    }
-
-    /// Bring back a removed worktree at the commit it had, to preview its branch.
-    /// Previews are never auto-removed for their merged PR.
-    async fn recreate_preview(&self, rt: &ProjectRt, name: &str) -> Result<()> {
-        let _g = rt.lock.lock().await;
-        if rt.known.lock().unwrap().contains_key(name) {
-            return Ok(());
-        }
-        let rec = history::History::load(&rt.project.root)
-            .removed
-            .get(name)
-            .cloned()
-            .ok_or_else(|| anyhow!("no removed worktree {name}"))?;
-        let rec_for_preview = history::Removed {
-            preview_closed: None,
-            ..rec.clone()
-        };
-        let (root, remote, gh) = (
-            rt.project.root.clone(),
-            rt.project.settings.remote.clone(),
-            rt.gh.is_some(),
-        );
-        let n = name.to_string();
-        let syncer = rt.syncer();
-        // The branch if it's still here, else its last commit, fetched if gc'd:
-        // the branch from the remote or (GitHub) the pull request's head.
-        let base = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
-            let repo = Repository::open(&root)?;
-            if repo.find_branch(&n, git2::BranchType::Local).is_ok() {
-                return Ok(None);
-            }
-            let head = rec
-                .head
-                .clone()
-                .ok_or_else(|| anyhow!("{n}'s last commit is unknown"))?;
-            let oid = Oid::from_str(&head)?;
-            if repo.find_commit(oid).is_err() {
-                let mut refspecs = Vec::new();
-                if let Some(b) = &rec.branch {
-                    refspecs.push(format!("+refs/heads/{b}:refs/remotes/{remote}/{b}"));
-                }
-                if let (Some(pr), true) = (rec.pr, gh) {
-                    refspecs.push(format!("+refs/pull/{pr}/head:refs/lazy-cow-tree/pull/{pr}"));
-                }
-                if let Err(e) = syncer.fetch_refspecs(&repo, &refspecs) {
-                    warn!("fetching {n}'s commit: {e:#}");
-                }
-                repo.find_commit(oid)
-                    .map_err(|_| anyhow!("{head:.7} is gone locally and on the remote"))?;
-            }
-            Ok(Some(head))
-        })
-        .await??;
-        self.create_locked(rt, name, base).await?;
-        let now = history::now();
-        history::History::update(&rt.project.root, |h| {
-            h.previews.insert(
-                name.to_string(),
-                history::Preview {
-                    since: now,
-                    last_active: now,
-                    original: rec_for_preview,
-                },
-            );
-        })?;
-        info!("recreated worktree {name} as a preview");
-        Ok(())
-    }
-
-    /// Close previews without activity for `preview_ttl_hours` (every minute; saves
-    /// their last activity so it survives restarts).
-    async fn close_idle_previews(&self, rt: &ProjectRt) -> Result<()> {
-        let ttl = rt.project.settings.preview_ttl_hours * 3600;
-        let now = history::now();
-        let mut idle = Vec::new();
-        history::History::update(&rt.project.root, |h| {
-            for (name, p) in h.previews.iter_mut() {
-                let id = rt.project.checkout(Some(name), PathBuf::new()).id();
-                if let Some(t) = self.activity.get(&id) {
-                    p.last_active = p.last_active.max(t);
-                }
-                if ttl > 0 && now.saturating_sub(p.last_active) > ttl {
-                    idle.push(name.clone());
-                }
-            }
-        })?;
-        if idle.is_empty() {
-            return Ok(());
-        }
-        let _g = rt.lock.lock().await;
-        let root = rt.project.root.clone();
-        let infos = tokio::task::spawn_blocking(move || worktree::list(&root)).await??;
-        for name in idle {
-            let Some(info) = infos.iter().find(|i| i.name == name) else {
-                continue;
-            };
-            if worktree::is_locked(&rt.project.root, info) {
-                debug!("keeping idle preview {name}: its worktree is locked");
-                continue;
-            }
-            match self.preview_closable(rt, info).await {
-                Ok(()) => {}
-                Err(PreviewKeep::Work(why)) => {
-                    info!("keeping idle preview {name}: {why}");
-                    // Ask again after another TTL, not every minute.
-                    history::History::update(&rt.project.root, |h| {
-                        if let Some(p) = h.previews.get_mut(&name) {
-                            p.last_active = now;
-                        }
-                    })?;
-                    continue;
-                }
-                Err(PreviewKeep::Unknown(why)) => {
-                    // Asked again next minute: closes once it can tell.
-                    debug!("idle preview {name}: can't tell yet if it's safe to close: {why}");
-                    continue;
-                }
-            }
-            info!(
-                "closing preview {name}: no activity for {} h",
-                rt.project.settings.preview_ttl_hours
-            );
-            if let Err(e) = self
-                .remove_locked(rt, info, &[], history::Reason::Removed, None)
-                .await
-            {
-                warn!("closing preview {name}: {e:#}");
-            }
-        }
-        Ok(())
-    }
-
-    /// Can an idle preview close without losing work? Clean, and every commit on
-    /// the base branch, pushed to its branch on the remote (merged or not), or in
-    /// its merged PR.
-    async fn preview_closable(
-        &self,
-        rt: &ProjectRt,
-        info: &worktree::Info,
-    ) -> std::result::Result<(), PreviewKeep> {
-        let unknown = |e: anyhow::Error| PreviewKeep::Unknown(format!("{e:#}"));
-        let (remote, base, i) = (
-            rt.project.settings.remote.clone(),
-            rt.base.clone(),
-            info.clone(),
-        );
-        let unpushed = tokio::task::spawn_blocking(move || -> Result<Option<usize>> {
-            if worktree::is_dirty(&i.path)? {
-                return Ok(None);
-            }
-            worktree::unpushed(&i, &remote, &base).map(Some)
-        })
-        .await
-        .map_err(|e| unknown(e.into()))?
-        .map_err(unknown)?;
-        let n = match unpushed {
-            None => return Err(PreviewKeep::Work("uncommitted changes".into())),
-            Some(0) => return Ok(()),
-            Some(n) => n,
-        };
-        let (Some(gh), Some(branch)) = (&rt.gh, &info.branch) else {
-            return Err(PreviewKeep::Work(format!(
-                "{n} unpushed commit(s) and no GitHub to look up a merged PR"
-            )));
-        };
-        let Some(github::MergedPr {
-            number,
-            head: pr_head,
-            ..
-        }) = gh.merged_pr(branch).await.map_err(unknown)?
-        else {
-            return Err(PreviewKeep::Work(format!(
-                "{n} commit(s) neither pushed nor merged"
-            )));
-        };
-        let pr_head = Oid::from_str(&pr_head).map_err(|e| unknown(e.into()))?;
-        let (remote, base, i) = (
-            rt.project.settings.remote.clone(),
-            rt.base.clone(),
-            info.clone(),
-        );
-        let covered = tokio::task::spawn_blocking(move || {
-            worktree::covered_by_pr(&i, pr_head, &remote, &base)
-        })
-        .await
-        .map_err(|e| unknown(e.into()))?
-        .map_err(unknown)?;
-        if covered {
-            Ok(())
-        } else {
-            Err(PreviewKeep::Work(format!(
-                "commits after #{number} merged, not pushed"
-            )))
-        }
     }
 
     async fn remove_worktree(&self, req: RemoveReq) -> Result<Vec<String>> {
@@ -1386,13 +1051,7 @@ impl Daemon {
         } else {
             self.check_removable(&rt, &info).await?
         };
-        let reason = if pr.is_some() {
-            history::Reason::Merged
-        } else {
-            history::Reason::Removed
-        };
-        self.remove_locked(&rt, &info, &req.keep_pids, reason, pr)
-            .await
+        self.remove_locked(&rt, &info, &req.keep_pids, pr).await
     }
 
     /// Ok(Some(pr)) when a merged PR is what makes it safe.
@@ -1487,14 +1146,9 @@ impl Daemon {
         rt: &ProjectRt,
         info: &worktree::Info,
         keep: &[i32],
-        reason: history::Reason,
         pr: Option<u64>,
     ) -> Result<Vec<String>> {
         let mut warnings = Vec::new();
-        let head = Repository::open(&info.path)
-            .ok()
-            .and_then(|r| r.head().ok()?.target())
-            .map(|o| o.to_string());
         let p = info.path.clone();
         if let Ok(Ok(files)) = tokio::task::spawn_blocking(move || worktree::uncommitted(&p)).await
             && !files.is_empty()
@@ -1539,11 +1193,8 @@ impl Daemon {
                 info.name
             ));
         }
-        let branch = kept.or_else(|| info.branch.clone());
-        self.remember(rt, &info.name, branch, head, reason, pr, lost);
         if let Err(e) = self.deprovision(&c).await {
             // Still known: the next reconcile finds it gone and tries again.
-            rt.recorded.lock().unwrap().insert(info.name.clone());
             anyhow::bail!(
                 "removed {}, but not its databases yet (retrying later): {e:#}",
                 info.name
@@ -1554,8 +1205,7 @@ impl Daemon {
         Ok(warnings)
     }
 
-    /// Remove every worktree whose branch's PR merged with nothing left unmerged
-    /// (except previews of merged branches).
+    /// Remove every worktree whose branch's PR merged with nothing left unmerged.
     async fn remove_merged(&self, rt: &ProjectRt) -> Result<()> {
         let Some(gh) = rt.gh.clone() else {
             return Ok(());
@@ -1566,7 +1216,6 @@ impl Daemon {
         let _g = rt.lock.lock().await;
         let root = rt.project.root.clone();
         let infos = tokio::task::spawn_blocking(move || worktree::list(&root)).await??;
-        let previews = history::History::load(&rt.project.root).previews;
         let managed = rt
             .project
             .worktrees_dir()
@@ -1576,10 +1225,7 @@ impl Daemon {
             let Some(branch) = info.branch.clone() else {
                 continue;
             };
-            if branch == rt.base
-                || !info.path.starts_with(&managed)
-                || previews.contains_key(&info.name)
-            {
+            if branch == rt.base || !info.path.starts_with(&managed) {
                 continue;
             }
             if worktree::is_locked(&rt.project.root, &info) {
@@ -1628,10 +1274,7 @@ impl Daemon {
                 "{branch}: #{number} merged; removing worktree {}",
                 info.name
             );
-            if let Err(e) = self
-                .remove_locked(rt, &info, &[], history::Reason::Merged, Some(number))
-                .await
-            {
+            if let Err(e) = self.remove_locked(rt, &info, &[], Some(number)).await {
                 warn!("removing {}: {e:#}", info.name);
             }
         }
@@ -2337,6 +1980,14 @@ fn api(d: Arc<Daemon>) -> Router {
             }),
         )
         .route(
+            "/reconcile",
+            post(|State(d): State<Arc<Daemon>>, Json(r): Json<RootReq>| async move {
+                let rt = d.project(&r.root)?;
+                d.reconcile(&rt).await?;
+                ApiResult::Ok(Json(serde_json::json!({})))
+            }),
+        )
+        .route(
             "/sync",
             post(|State(d): State<Arc<Daemon>>, Json(r): Json<RootReq>| async move {
                 let rt = d.project(&r.root)?;
@@ -2397,196 +2048,6 @@ fn api(d: Arc<Daemon>) -> Router {
             }),
         )
         .with_state(d)
-}
-
-/// POSTed by the gone page's button.
-const RECREATE_PATH: &str = "/.lazy-cow-tree/recreate";
-
-impl Daemon {
-    /// The project and removed worktree a hostname belonged to:
-    /// `<wt>.<service>.<project>.localhost`, `<wt>.<project>.localhost` without
-    /// services, or a subdomain of those.
-    fn removed_for_host(&self, host: &str) -> Option<(Arc<ProjectRt>, String, history::Removed)> {
-        let projects: Vec<Arc<ProjectRt>> =
-            self.projects.lock().unwrap().values().cloned().collect();
-        for rt in projects {
-            let Some(prefix) = host.strip_suffix(&format!(".{}.localhost", rt.project.name)) else {
-                continue;
-            };
-            let labels: Vec<&str> = prefix.split('.').collect();
-            let back = if rt.project.settings.services.0.is_empty() {
-                1
-            } else {
-                2
-            };
-            let Some(wt) = labels.len().checked_sub(back).map(|i| labels[i]) else {
-                continue;
-            };
-            if rt.known.lock().unwrap().contains_key(wt) {
-                continue;
-            }
-            let rec = history::History::load(&rt.project.root)
-                .removed
-                .get(wt)
-                .cloned()?;
-            return Some((rt, wt.to_string(), rec));
-        }
-        None
-    }
-
-    /// Requests to hosts without a route: a removed worktree's hostname gets the gone
-    /// page (503), whose button recreates it as a preview.
-    async fn unrouted(&self, u: proxy::Unrouted) -> Option<proxy::Page> {
-        let (rt, name, rec) = self.removed_for_host(&u.host)?;
-        let mut error = None;
-        if u.method == hyper::Method::POST && u.path == RECREATE_PATH {
-            // Only from the page itself (a browser always sends Origin on a form POST).
-            let origin_host = u.origin.as_deref().map(|o| {
-                o.trim_start_matches("https://")
-                    .split(':')
-                    .next()
-                    .unwrap_or_default()
-                    .to_string()
-            });
-            if origin_host.is_some_and(|h| h != u.host) {
-                return Some(proxy::Page {
-                    status: StatusCode::FORBIDDEN,
-                    html: "cross-origin request refused".into(),
-                    location: None,
-                });
-            }
-            match self.recreate_preview(&rt, &name).await {
-                Ok(()) => {
-                    return Some(proxy::Page {
-                        status: StatusCode::SEE_OTHER,
-                        html: String::new(),
-                        location: Some("/".into()),
-                    });
-                }
-                Err(e) => {
-                    warn!("recreating {name}: {e:#}");
-                    error = Some(format!("{e:#}"));
-                }
-            }
-        }
-        let remote_url = Repository::open(&rt.project.root).ok().and_then(|r| {
-            r.find_remote(&rt.project.settings.remote)
-                .ok()?
-                .url()
-                .ok()
-                .map(str::to_string)
-        });
-        let forge = remote_url.as_deref().and_then(history::Forge::from_remote);
-        Some(proxy::Page {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            html: gone_page(&name, &rec, forge.as_ref(), error.as_deref()),
-            location: None,
-        })
-    }
-}
-
-fn ago(at: u64) -> String {
-    let s = history::now().saturating_sub(at);
-    match s {
-        0..60 => "just now".into(),
-        60..3600 => format!("{} min ago", s / 60),
-        3600..86400 => format!("{} h ago", s / 3600),
-        _ => format!("{} days ago", s / 86400),
-    }
-}
-
-fn gone_page(
-    name: &str,
-    rec: &history::Removed,
-    forge: Option<&history::Forge>,
-    error: Option<&str>,
-) -> String {
-    let e = html_escape;
-    let link = |href: &str, text: &str| format!("<a href=\"{}\">{}</a>", e(href), e(text));
-    let headline = match (rec.reason, rec.pr) {
-        (history::Reason::Merged, Some(n)) => match forge {
-            Some(f) => format!("Its {} was merged", link(&f.pr(n), &f.pr_label(n))),
-            None => format!("Its pull request #{n} was merged"),
-        },
-        (history::Reason::Merged, None) => "Its branch was merged".into(),
-        (history::Reason::Removed, _) => "It was removed".into(),
-        (history::Reason::Deleted, _) => "Its directory was deleted".into(),
-    };
-    let mut links = Vec::new();
-    if let Some(f) = forge {
-        if let Some(b) = &rec.branch {
-            links.push(link(&f.branch(b), &format!("branch {b}")));
-        }
-        if let Some(h) = &rec.head {
-            links.push(link(
-                &f.commit(h),
-                &format!("commit {}", &h[..h.len().min(7)]),
-            ));
-        }
-        links.push(link(&f.repo, &format!("repository on {}", f.name)));
-    } else {
-        if let Some(b) = &rec.branch {
-            links.push(format!("branch <code>{}</code>", e(b)));
-        }
-        if let Some(h) = &rec.head {
-            links.push(format!("commit <code>{}</code>", e(&h[..h.len().min(7)])));
-        }
-    }
-    let can_recreate = rec.head.is_some() || rec.branch.is_some();
-    let button = if can_recreate {
-        format!(
-            r#"<form method="post" action="{RECREATE_PATH}" onsubmit="this.querySelector('button').disabled=true;this.querySelector('button').textContent='Recreating…'">
-<button type="submit">Recreate worktree to preview {}</button></form>
-<p class="note">Checks out the commit it was at, with a fresh copy of the database; its services start on the first request. A preview isn't removed for its merged pull request: remove it with <code>lazy-cow-tree worktree rm {}</code>.</p>"#,
-            e(name),
-            e(name)
-        )
-    } else {
-        "<p class=\"note\">Its last commit is unknown, so it can't be recreated.</p>".into()
-    };
-    let mut error = error
-        .map(|m| format!("<p class=\"error\">Recreating failed: {}</p>", e(m)))
-        .unwrap_or_default();
-    if !rec.lost.is_empty() {
-        error = format!(
-            "<p class=\"muted\">Deleted with it (gitignored): {}</p>{error}",
-            e(&rec.lost.join(", "))
-        );
-    }
-    if let Some(at) = rec.preview_closed {
-        error = format!(
-            "<p class=\"muted\">A preview of it was closed {} for inactivity.</p>{error}",
-            ago(at)
-        );
-    }
-    format!(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{name} is gone</title>
-<style>
-:root{{--bg:#fafaf9;--fg:#1c1917;--muted:#78716c;--card:#fff;--line:#e7e5e4;--accent:#2563eb;--accent-fg:#fff;--err:#b91c1c}}
-@media (prefers-color-scheme:dark){{:root{{--bg:#0c0a09;--fg:#e7e5e4;--muted:#a8a29e;--card:#1c1917;--line:#292524;--accent:#60a5fa;--accent-fg:#0c0a09;--err:#f87171}}}}
-body{{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,sans-serif}}
-main{{max-width:34rem;margin:1rem;padding:2rem;background:var(--card);border:1px solid var(--line);border-radius:12px}}
-.tag{{display:inline-block;font:600 12px/1 system-ui;letter-spacing:.05em;text-transform:uppercase;color:var(--muted)}}
-h1{{margin:.4rem 0 .2rem;font-size:1.5rem}} h1 code{{font-size:1.3rem}}
-p{{margin:.5rem 0}} .muted,.note{{color:var(--muted)}} .note{{font-size:.9rem}}
-ul{{padding-left:1.2rem}} a{{color:var(--accent)}}
-button{{margin-top:1rem;padding:.7rem 1.1rem;border:0;border-radius:8px;background:var(--accent);color:var(--accent-fg);font:600 1rem system-ui;cursor:pointer}}
-button:disabled{{opacity:.6;cursor:wait}} .error{{color:var(--err)}}
-</style></head><body><main>
-<span class="tag">503 · worktree removed</span>
-<h1>Worktree <code>{name}</code> is gone</h1>
-<p>{headline} <span class="muted">({ago})</span>.</p>
-<ul>{links}</ul>
-{error}{button}
-</main></body></html>"#,
-        name = e(name),
-        ago = ago(rec.at),
-        links = links
-            .iter()
-            .map(|l| format!("<li>{l}</li>"))
-            .collect::<String>(),
-    )
 }
 
 fn html_escape(s: &str) -> String {
@@ -2799,10 +2260,6 @@ fn start_proxy(
             })
         })
     };
-    let fallback: proxy::Fallback = Arc::new(move |u| {
-        let d = get();
-        Box::pin(async move { d?.unrouted(u).await })
-    });
     let (https, http) = (global.https_port, global.http_port);
     let reserved: crate::devenv_proxy::Reserved = {
         let routes = routes.clone();
@@ -2828,8 +2285,7 @@ fn start_proxy(
         });
     }
     tokio::spawn(async move {
-        if let Err(e) = proxy::serve(https, http, routes, devenv, ca, dash, ensure, fallback).await
-        {
+        if let Err(e) = proxy::serve(https, http, routes, devenv, ca, dash, ensure).await {
             error!("HTTPS proxy: {e:#}");
         }
     });
@@ -2844,8 +2300,7 @@ async fn lead(global: Global, project: Option<Project>, listener: UnixListener) 
     let ca = Arc::new(Ca::load_or_create(&config::home().join("ca"))?);
     // The HTTPS proxy and devenv's control socket come up before PostgreSQL (a RAM
     // disk and initdb): `devenv up` gives a proxy it starts five seconds.
-    let activity = history::Activity::default();
-    let routes = Routes::new(activity.clone());
+    let routes = Routes::default();
     let daemon: Arc<std::sync::OnceLock<std::sync::Weak<Daemon>>> = Default::default();
     start_proxy(&global, routes.clone(), ca, daemon.clone());
     // The real server: unix socket only, one port above the proxy's.
@@ -2871,14 +2326,9 @@ async fn lead(global: Global, project: Option<Project>, listener: UnixListener) 
         pg,
         create_lock: Default::default(),
         dev_locks: Default::default(),
-        redis: Arc::new(Redis::new(
-            crate::redis::dir(),
-            activity.clone(),
-            global.redis_server.clone(),
-        )),
+        redis: Arc::new(Redis::new(crate::redis::dir(), global.redis_server.clone())),
         servers: Default::default(),
         routes: routes.clone(),
-        activity,
         projects: Mutex::new(BTreeMap::new()),
         shutdown: Notify::new(),
         up_queue: Mutex::new(Vec::new()),
@@ -2920,21 +2370,6 @@ async fn lead(global: Global, project: Option<Project>, listener: UnixListener) 
             d.stop_idle().await;
             if let Some(t) = d.global.redis_idle_timeout {
                 d.redis.stop_idle(Duration::from_secs(t)).await;
-            }
-        }
-    });
-    // Idle previews.
-    let weak = Arc::downgrade(&d);
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(60)).await;
-            let Some(d) = weak.upgrade() else { break };
-            let projects: Vec<Arc<ProjectRt>> =
-                d.projects.lock().unwrap().values().cloned().collect();
-            for rt in projects {
-                if let Err(e) = d.close_idle_previews(&rt).await {
-                    warn!("{}: previews: {e:#}", rt.project.name);
-                }
             }
         }
     });
@@ -2990,7 +2425,7 @@ mod tests {
             serde_json::from_value(serde_json::json!({
                 "name": name, "port": 4000, "remote": "origin", "base": null,
                 "worktrees_dir": ".claude/worktrees", "migrate": null, "seed": null,
-                "setup": null, "services": {}, "preview_ttl_hours": 48,
+                "setup": null, "services": {},
                 "no_sync": false, "no_auto_remove": false
             }))
             .unwrap(),

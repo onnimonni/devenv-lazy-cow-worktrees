@@ -35,20 +35,17 @@ pub struct Redis {
     procs: Mutex<HashMap<String, Child>>,
     /// Open client connections per redis-server key, and when the last one ended.
     conns: std::sync::Mutex<HashMap<String, (usize, Instant)>>,
-    /// A connection counts as its checkout's activity.
-    activity: crate::history::Activity,
     /// `redis-server` to run (None: from PATH).
     server: Option<PathBuf>,
 }
 
 impl Redis {
-    pub fn new(dir: PathBuf, activity: crate::history::Activity, server: Option<PathBuf>) -> Self {
+    pub fn new(dir: PathBuf, server: Option<PathBuf>) -> Self {
         Self {
             dir,
             known: RwLock::default(),
             procs: Mutex::default(),
             conns: Default::default(),
-            activity,
             server,
         }
     }
@@ -311,7 +308,6 @@ impl Redis {
                     .await?;
                 continue;
             };
-            self.activity.touch(&id);
             break (backend, forward);
         };
 
@@ -533,7 +529,7 @@ mod tests {
     #[tokio::test]
     async fn shared_redis_outlives_one_checkout() {
         let d = tempfile::tempdir().unwrap();
-        let r = Redis::new(d.path().into(), Default::default(), None);
+        let r = Redis::new(d.path().into(), None);
         r.allow("app", "app+shared");
         r.allow("app--wt", "app+shared");
         r.allow("other", "other");
@@ -632,7 +628,7 @@ mod tests {
     #[tokio::test]
     async fn stale_pidfile_of_another_process_is_left_alone() {
         let dir = tempfile::TempDir::new().unwrap();
-        let r = Redis::new(dir.path().into(), crate::history::Activity::default(), None);
+        let r = Redis::new(dir.path().into(), None);
         let pidfile = dir.path().join("x.pid");
         let socket = dir.path().join("x.sock");
         // This test process: not a redis-server, so it survives.
@@ -649,7 +645,7 @@ mod tests {
             return;
         }
         let dir = tempfile::TempDir::new().unwrap();
-        let crashed = Redis::new(dir.path().into(), crate::history::Activity::default(), None);
+        let crashed = Redis::new(dir.path().into(), None);
         let socket = crashed.ensure("a").await.unwrap();
         let pidfile = crashed.stem("a").with_extension("pid");
         let mut pid = String::new();
@@ -663,7 +659,7 @@ mod tests {
         let pid: i32 = pid.trim().parse().unwrap();
         // The daemon dies without killing its child.
         std::mem::forget(crashed);
-        let next = Redis::new(dir.path().into(), crate::history::Activity::default(), None);
+        let next = Redis::new(dir.path().into(), None);
         next.kill_stale(&pidfile, &socket);
         let mut status = 0;
         assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);

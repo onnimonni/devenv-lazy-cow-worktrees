@@ -207,16 +207,19 @@ pub struct ProjectSettings {
     /// hostname, sharing the checkout's database and Redis.
     #[arg(long, env = "LAZY_COW_TREE_SERVICES", default_value = "{}")]
     pub services: Services,
-    /// Close a preview (a removed worktree recreated from its "gone" page) after this
-    /// many hours without requests or database / Redis connections; 0 keeps them.
-    #[arg(long, env = "LAZY_COW_TREE_PREVIEW_TTL_HOURS", default_value_t = 48)]
-    pub preview_ttl_hours: u64,
     /// Don't pull branches / merge the base branch into worktrees on pushes.
     #[arg(long, env = "LAZY_COW_TREE_NO_SYNC", value_parser = clap::builder::BoolishValueParser::new())]
     pub no_sync: bool,
     /// Don't remove worktrees whose PR merged.
     #[arg(long, env = "LAZY_COW_TREE_NO_AUTO_REMOVE", value_parser = clap::builder::BoolishValueParser::new())]
     pub no_auto_remove: bool,
+}
+
+/// Unix seconds.
+pub fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 pub fn home() -> PathBuf {
@@ -422,14 +425,6 @@ impl Project {
     /// `LAZY_COW_TREE_REDIS_INSTANCE=shared`: one redis-server for all its checkouts.
     pub fn redis_shared(&self) -> bool {
         self.env_var("LAZY_COW_TREE_REDIS_INSTANCE") == Some("shared")
-    }
-
-    /// `LAZY_COW_TREE_ENV_FILES`: checkout-relative files applied last to everything
-    /// run in a checkout (unset: none).
-    pub fn env_files(&self) -> Vec<String> {
-        self.env_var("LAZY_COW_TREE_ENV_FILES")
-            .and_then(|j| serde_json::from_str::<Vec<String>>(j).ok())
-            .unwrap_or_default()
     }
 
     pub fn worktrees_dir(&self) -> PathBuf {
@@ -1244,43 +1239,6 @@ pub fn rewrite_root(text: &str, from: &Path, to: &Path) -> String {
     out
 }
 
-/// Variables of a checkout's env files (`Project::env_files`, later files win),
-/// and the keys only the primary's copies set: in a worktree those came into the
-/// project env from the primary (devenv reads its dotenv there) and are removed.
-pub fn env_file_vars(
-    root: &Path,
-    checkout: &Path,
-    files: &[String],
-) -> (Vec<(String, String)>, Vec<String>) {
-    let read = |dir: &Path| -> BTreeMap<String, String> {
-        let mut vars = BTreeMap::new();
-        for f in files {
-            let Ok(iter) = dotenvy::from_path_iter(dir.join(f)) else {
-                continue;
-            };
-            for item in iter {
-                match item {
-                    Ok((k, v)) => {
-                        vars.insert(k, v);
-                    }
-                    Err(e) => tracing::warn!("{}: {e}", dir.join(f).display()),
-                }
-            }
-        }
-        vars
-    };
-    let own = read(checkout);
-    let primary_only = if checkout == root {
-        Vec::new()
-    } else {
-        read(root)
-            .into_keys()
-            .filter(|k| !own.contains_key(k))
-            .collect()
-    };
-    (own.into_iter().collect(), primary_only)
-}
-
 /// Primary checkout of the repository containing `path`.
 pub fn primary_root(path: &Path) -> Result<PathBuf> {
     let repo = Repository::discover(path)
@@ -1450,27 +1408,6 @@ mod tests {
     }
 
     #[test]
-    fn env_files_later_win_and_primary_only_keys() {
-        let d = tempfile::tempdir().unwrap();
-        let (root, wt) = (d.path().join("root"), d.path().join("wt"));
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::create_dir_all(&wt).unwrap();
-        std::fs::write(root.join(".env.local"), "A=1\nGONE=primary\n").unwrap();
-        std::fs::write(wt.join(".env.local"), "A=2\nB=x\n").unwrap();
-        std::fs::write(wt.join(".env.more"), "B=y\n").unwrap();
-        let files = vec![".env.local".to_string(), ".env.more".to_string()];
-        let (vars, primary_only) = env_file_vars(&root, &wt, &files);
-        let vars: BTreeMap<_, _> = vars.into_iter().collect();
-        assert_eq!(vars["A"], "2");
-        assert_eq!(vars["B"], "y");
-        assert_eq!(primary_only, ["GONE"]);
-        let (vars, primary_only) = env_file_vars(&root, &root, &files);
-        assert_eq!(vars.len(), 2);
-        assert!(primary_only.is_empty());
-        assert_eq!(env_file_vars(&root, &wt, &[]).0, vec![]);
-    }
-
-    #[test]
     fn project_settings_from_env() {
         let settings = ProjectSettings {
             name: Some("app".into()),
@@ -1482,7 +1419,6 @@ mod tests {
             seed: None,
             setup: None,
             services: Default::default(),
-            preview_ttl_hours: 48,
             no_sync: false,
             no_auto_remove: false,
         };
@@ -1490,21 +1426,18 @@ mod tests {
         assert!(p.copy_on_write());
         assert!(!p.template_refresh_manual() && !p.postgres_durable());
         assert!(!p.redis_shared() && !p.redis_start_up());
-        assert!(p.env_files().is_empty());
         p.env = [
             ("LAZY_COW_TREE_POSTGRES_COW", "0"),
             ("LAZY_COW_TREE_POSTGRES_TEMPLATE_REFRESH", "manual"),
             ("LAZY_COW_TREE_POSTGRES_DURABLE", "1"),
             ("LAZY_COW_TREE_REDIS_INSTANCE", "shared"),
             ("LAZY_COW_TREE_REDIS_START", "up"),
-            ("LAZY_COW_TREE_ENV_FILES", r#"[".env.local"]"#),
         ]
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .to_vec();
         assert!(!p.copy_on_write());
         assert!(p.template_refresh_manual() && p.postgres_durable());
         assert!(p.redis_shared() && p.redis_start_up());
-        assert_eq!(p.env_files(), [".env.local"]);
     }
 
     #[test]
