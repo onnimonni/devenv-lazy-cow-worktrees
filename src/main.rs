@@ -15,6 +15,7 @@
 mod client;
 mod config;
 mod daemon;
+mod devenv_proxy;
 mod github;
 mod history;
 mod lsp;
@@ -61,6 +62,17 @@ enum Cmd {
         /// Any checkout of the project.
         #[arg(long, default_value = ".")]
         path: PathBuf,
+    },
+    /// Stand-in for devenv's `devenv-proxy` (DEVENV_PROXY_BINARY): run the daemon on
+    /// the ports and control socket devenv asks for. Also runs as
+    /// `localforest-devenv-proxy [ARGS]`.
+    DevenvProxy {
+        #[arg(long)]
+        listen: std::net::SocketAddr,
+        #[arg(long)]
+        https_listen: Option<std::net::SocketAddr>,
+        #[arg(long)]
+        control_socket: PathBuf,
     },
     /// Print this checkout's environment (PORT, DATABASE_URL, REDIS_URL, ...) as
     /// shell exports: `eval "$(localforest env)"`.
@@ -255,6 +267,20 @@ fn print_status(s: &daemon::Status) {
     }
 }
 
+/// Invoked as `localforest-devenv-proxy` (a link for DEVENV_PROXY_BINARY, which
+/// takes one path): the `devenv-proxy` subcommand.
+fn devenv_proxy_args(args: impl Iterator<Item = std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<_> = args.collect();
+    let invoked = args
+        .first()
+        .and_then(|a| std::path::Path::new(a).file_name())
+        .is_some_and(|n| n == "localforest-devenv-proxy");
+    if invoked {
+        args.insert(1, "devenv-proxy".into());
+    }
+    args
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -265,13 +291,26 @@ async fn main() -> Result<()> {
         )
         .init();
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(devenv_proxy_args(std::env::args_os()));
     let cwd = std::env::current_dir()?;
 
     match cli.command {
         Cmd::Serve { project, path } => {
             let p = project_for(&path, project)?;
             daemon::serve(cli.global, Some(p)).await
+        }
+        Cmd::DevenvProxy {
+            listen,
+            https_listen,
+            control_socket,
+        } => {
+            let global = Global {
+                http_port: listen.port(),
+                https_port: https_listen.map_or(cli.global.https_port, |a| a.port()),
+                devenv_proxy_socket: Some(control_socket),
+                ..cli.global
+            };
+            daemon::serve(global, None).await
         }
         Cmd::Env {
             project,
@@ -482,5 +521,34 @@ mod tests {
         assert_eq!(rm_target(d.path(), "./wt").unwrap(), abs);
         assert_eq!(rm_target(Path::new("/"), &abs).unwrap(), abs);
         assert!(rm_target(d.path(), "./missing").is_err());
+    }
+
+    #[test]
+    fn parses_devenv_proxy_arguments_under_its_link_name() {
+        let args = [
+            "/nix/store/x/bin/localforest-devenv-proxy",
+            "--listen",
+            "127.0.0.1:80",
+            "--control-socket",
+            "/tmp/devenv-proxy-me.sock",
+            "--https-listen",
+            "127.0.0.1:443",
+        ]
+        .map(std::ffi::OsString::from);
+        let cli = Cli::try_parse_from(devenv_proxy_args(args.into_iter())).unwrap();
+        let Cmd::DevenvProxy {
+            listen,
+            https_listen,
+            control_socket,
+        } = cli.command
+        else {
+            panic!("not devenv-proxy");
+        };
+        assert_eq!(listen.port(), 80);
+        assert_eq!(https_listen.map(|a| a.port()), Some(443));
+        assert_eq!(control_socket, Path::new("/tmp/devenv-proxy-me.sock"));
+        // Under its own name the arguments are left alone.
+        let plain = devenv_proxy_args(["localforest", "status"].map(Into::into).into_iter());
+        assert_eq!(plain, ["localforest", "status"]);
     }
 }

@@ -1,6 +1,8 @@
 //! HTTPS reverse proxy: https://<worktree>.<project>.localhost -> 127.0.0.1:<port>,
 //! websockets included (LiveView, Vite HMR). Plain HTTP redirects to HTTPS.
 //! Browsers resolve *.localhost to loopback on their own; no /etc/hosts entries.
+//! Hosts that devenv projects register (devenv_proxy.rs) go through the same
+//! listeners, over HTTPS and plain HTTP like devenv's own proxy.
 
 use std::{
     collections::HashMap,
@@ -23,9 +25,15 @@ use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::{TokioExecutor, TokioIo},
 };
+use rustls::{
+    server::{ClientHello, ResolvesServerCert},
+    sign::CertifiedKey,
+};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
+
+use crate::devenv_proxy::{self, DevenvRoutes};
 
 type Body = BoxBody<Bytes, hyper::Error>;
 
@@ -65,6 +73,23 @@ impl Routes {
 
     pub fn remove(&self, host: &str) {
         self.map.write().unwrap().remove(host);
+    }
+
+    /// Whether a request for `host` would reach a checkout, without counting as
+    /// activity.
+    pub fn serves(&self, host: &str) -> bool {
+        let routes = self.map.read().unwrap();
+        if routes.contains_key(host) {
+            return true;
+        }
+        let mut h = host;
+        while let Some((_, parent)) = h.split_once('.') {
+            if let Some(r) = routes.get(parent) {
+                return r.subdomains;
+            }
+            h = parent;
+        }
+        false
     }
 
     /// Exact host, else the closest parent that serves subdomains (worktree hosts:
@@ -125,6 +150,7 @@ pub type Fallback = Arc<
 
 struct Shared {
     routes: Routes,
+    devenv: DevenvRoutes,
     client: Client<HttpConnector, Incoming>,
     dashboard: Dashboard,
     ensure: Ensure,
@@ -149,18 +175,42 @@ async fn bind(port: u16) -> Result<TcpListener> {
     Ok(TcpListener::bind(addr).await?)
 }
 
+/// A devenv route's own certificate (its project's mkcert CA), else a leaf from
+/// localforest's CA.
+#[derive(Debug)]
+struct Certificates {
+    ca: Arc<crate::tls::Ca>,
+    devenv: DevenvRoutes,
+}
+
+impl ResolvesServerCert for Certificates {
+    fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        if let Some(cert) = hello.server_name().and_then(|h| self.devenv.certificate(h)) {
+            return Some(cert);
+        }
+        self.ca.resolve(hello)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     https_port: u16,
     http_port: u16,
     routes: Routes,
+    devenv: DevenvRoutes,
     ca: Arc<crate::tls::Ca>,
     dashboard: Dashboard,
     ensure: Ensure,
     fallback: Fallback,
 ) -> Result<()> {
-    let tls = TlsAcceptor::from(Arc::new(crate::tls::server_config(ca)));
+    let certificates = Arc::new(Certificates {
+        ca,
+        devenv: devenv.clone(),
+    });
+    let tls = TlsAcceptor::from(Arc::new(crate::tls::server_config(certificates)));
     let shared = Arc::new(Shared {
         routes,
+        devenv,
         client: Client::builder(TokioExecutor::new()).build_http(),
         dashboard,
         ensure,
@@ -173,7 +223,7 @@ pub async fn serve(
     if http_port != 0 {
         match bind(http_port).await {
             Ok(l) => {
-                tokio::spawn(redirect_loop(l, https_port));
+                tokio::spawn(http_loop(l, https_port, shared.clone()));
             }
             Err(e) => warn!("HTTP redirect on port {http_port} disabled: {e}"),
         }
@@ -191,7 +241,7 @@ pub async fn serve(
                 Ok(s) => s,
                 Err(e) => return debug!("TLS handshake with {peer}: {e}"),
             };
-            let svc = service_fn(move |req| handle(shared.clone(), peer, req));
+            let svc = service_fn(move |req| handle(shared.clone(), peer, req, "https"));
             if let Err(e) = http1::Builder::new()
                 .serve_connection(TokioIo::new(stream), svc)
                 .with_upgrades()
@@ -203,7 +253,9 @@ pub async fn serve(
     }
 }
 
-async fn redirect_loop(listener: TcpListener, https_port: u16) {
+/// Plain HTTP: devenv's health probe and devenv routes are answered here, like
+/// devenv's own proxy; everything else redirects to HTTPS.
+async fn http_loop(listener: TcpListener, https_port: u16, shared: Arc<Shared>) {
     loop {
         let Ok((stream, peer)) = listener.accept().await else {
             continue;
@@ -211,33 +263,51 @@ async fn redirect_loop(listener: TcpListener, https_port: u16) {
         if !peer.ip().is_loopback() {
             continue;
         }
+        let shared = shared.clone();
         tokio::spawn(async move {
-            let svc = service_fn(move |req: Request<Incoming>| async move {
-                let host = req
-                    .headers()
-                    .get(header::HOST)
-                    .and_then(|h| h.to_str().ok())
-                    .unwrap_or("localhost");
-                let host = strip_port(host);
-                let port = if https_port == 443 {
-                    String::new()
-                } else {
-                    format!(":{https_port}")
-                };
-                let path = req.uri().path_and_query().map_or("/", |p| p.as_str());
-                Ok::<_, Infallible>(
-                    Response::builder()
-                        .status(StatusCode::PERMANENT_REDIRECT)
-                        .header(header::LOCATION, format!("https://{host}{port}{path}"))
-                        .body(Full::new(Bytes::new()))
-                        .unwrap(),
-                )
+            let svc = service_fn(move |req: Request<Incoming>| {
+                let shared = shared.clone();
+                async move {
+                    let host = request_host(&req);
+                    if host == devenv_proxy::HEALTH_HOSTNAME {
+                        return Ok(full(StatusCode::NO_CONTENT, "text/plain", Bytes::new()));
+                    }
+                    if shared.devenv.resolve(&host).is_some() {
+                        return handle(shared, peer, req, "http").await;
+                    }
+                    let port = if https_port == 443 {
+                        String::new()
+                    } else {
+                        format!(":{https_port}")
+                    };
+                    let path = req.uri().path_and_query().map_or("/", |p| p.as_str());
+                    let host = if host.is_empty() { "localhost" } else { &host };
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(StatusCode::PERMANENT_REDIRECT)
+                            .header(header::LOCATION, format!("https://{host}{port}{path}"))
+                            .body(Full::new(Bytes::new()).map_err(|n| match n {}).boxed())
+                            .unwrap(),
+                    )
+                }
             });
             let _ = http1::Builder::new()
                 .serve_connection(TokioIo::new(stream), svc)
+                .with_upgrades()
                 .await;
         });
     }
+}
+
+/// Lowercased Host header (else the URI's host) without its port.
+fn request_host(req: &Request<Incoming>) -> String {
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .or_else(|| req.uri().host())
+        .unwrap_or_default();
+    strip_port(host).to_ascii_lowercase()
 }
 
 /// Host header without its port; an IPv6 literal keeps its brackets (`[::1]:8443` ->
@@ -259,15 +329,10 @@ fn is_upgrade(req: &Request<Incoming>) -> bool {
 async fn handle(
     shared: Arc<Shared>,
     peer: SocketAddr,
-    mut req: Request<Incoming>,
+    req: Request<Incoming>,
+    scheme: &'static str,
 ) -> Result<Response<Body>, Infallible> {
-    let host = req
-        .headers()
-        .get(header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .or_else(|| req.uri().host())
-        .unwrap_or_default();
-    let host = strip_port(host).to_ascii_lowercase();
+    let host = request_host(&req);
     if host == "localforest.localhost" || host == "localhost" {
         return Ok(full(
             StatusCode::OK,
@@ -276,6 +341,18 @@ async fn handle(
         ));
     }
     let Some(port) = shared.routes.lookup(&host) else {
+        if let Some(upstream) = shared.devenv.resolve(&host) {
+            let upstream = devenv_proxy::reachable(upstream).await;
+            return Ok(forward(&shared, req, peer, &host, upstream, scheme)
+                .await
+                .unwrap_or_else(|e| {
+                    full(
+                        StatusCode::BAD_GATEWAY,
+                        "text/plain; charset=utf-8",
+                        format!("localforest: nothing answers for {host} on {upstream} ({e}); devenv registered it\n"),
+                    )
+                }));
+        }
         let unrouted = Unrouted {
             method: req.method().clone(),
             host: host.clone(),
@@ -318,14 +395,37 @@ async fn handle(
             ),
         ));
     }
+    let upstream = SocketAddr::from(([127, 0, 0, 1], port));
+    Ok(forward(&shared, req, peer, &host, upstream, scheme)
+        .await
+        .unwrap_or_else(|e| {
+            full(
+                StatusCode::BAD_GATEWAY,
+                "text/plain; charset=utf-8",
+                format!(
+                    "localforest: nothing answers for {host} on 127.0.0.1:{port} ({e}).\nSet localforest.server (devenv.nix) to start it on demand, or run it with PORT={port} (see `localforest env`); logs: `localforest server log <name>`.\n"
+                ),
+            )
+        }))
+}
+
+/// Proxy `req` to `upstream`, websockets included.
+async fn forward(
+    shared: &Shared,
+    mut req: Request<Incoming>,
+    peer: SocketAddr,
+    host: &str,
+    upstream: SocketAddr,
+    scheme: &'static str,
+) -> Result<Response<Body>, hyper_util::client::legacy::Error> {
     let path = req.uri().path_and_query().map_or("/", |p| p.as_str());
-    let Ok(uri) = format!("http://127.0.0.1:{port}{path}").parse() else {
+    let Ok(uri) = format!("http://{upstream}{path}").parse() else {
         return Ok(full(StatusCode::BAD_REQUEST, "text/plain", "bad uri\n"));
     };
     *req.uri_mut() = uri;
     let h = req.headers_mut();
-    h.insert("x-forwarded-proto", HeaderValue::from_static("https"));
-    if let Ok(v) = HeaderValue::from_str(&host) {
+    h.insert("x-forwarded-proto", HeaderValue::from_static(scheme));
+    if let Ok(v) = HeaderValue::from_str(host) {
         h.insert("x-forwarded-host", v);
     }
     if let Ok(v) = HeaderValue::from_str(&peer.ip().to_string()) {
@@ -334,18 +434,7 @@ async fn handle(
 
     let upgrade = is_upgrade(&req);
     let client_upgrade = upgrade.then(|| hyper::upgrade::on(&mut req));
-    let mut resp = match shared.client.request(req).await {
-        Ok(r) => r,
-        Err(e) => {
-            return Ok(full(
-                StatusCode::BAD_GATEWAY,
-                "text/plain; charset=utf-8",
-                format!(
-                    "localforest: nothing answers for {host} on 127.0.0.1:{port} ({e}).\nSet localforest.server (devenv.nix) to start it on demand, or run it with PORT={port} (see `localforest env`); logs: `localforest server log <name>`.\n"
-                ),
-            ));
-        }
-    };
+    let mut resp = shared.client.request(req).await?;
     if resp.status() == StatusCode::SWITCHING_PROTOCOLS
         && let Some(client_upgrade) = client_upgrade
     {

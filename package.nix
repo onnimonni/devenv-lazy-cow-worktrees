@@ -28,6 +28,11 @@ rustPlatform.buildRustPackage {
   # Tests create git repositories and worktrees; `cargo test` in devenv runs them.
   doCheck = false;
 
+  # DEVENV_PROXY_BINARY takes one path: this name runs `localforest devenv-proxy`.
+  postInstall = ''
+    ln -s localforest $out/bin/localforest-devenv-proxy
+  '';
+
   meta = {
     description = "Worktrees, databases, HTTPS hosts, Redis and LSP for parallel coding agents";
     mainProgram = "localforest";

@@ -106,6 +106,12 @@ pub struct Global {
     /// The `redis-server` to run [default: from PATH].
     #[arg(long, env = "LOCALFOREST_REDIS_SERVER", global = true)]
     pub redis_server: Option<PathBuf>,
+    /// Control socket where devenv projects (`process.proxy.enable`) register their
+    /// hostnames, as with devenv's own proxy; "off" disables [default: devenv's path,
+    /// $DEVENV_PROXY_SOCKET or $TMPDIR/devenv-proxy-<user>.sock].
+    #[arg(long, env = "LOCALFOREST_DEVENV_PROXY_SOCKET", global = true)]
+    #[serde(default)]
+    pub devenv_proxy_socket: Option<PathBuf>,
 }
 
 impl Global {
@@ -1389,6 +1395,7 @@ mod tests {
             ),
             redis_server: None,
             postgres_extensions: Some("postgis, vector  pg_trgm,".into()),
+            devenv_proxy_socket: None,
         }
     }
 

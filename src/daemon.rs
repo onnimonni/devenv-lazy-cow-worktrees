@@ -2603,6 +2603,66 @@ async fn shutdown_signal() {
     }
 }
 
+/// The HTTPS proxy and, when on, devenv's control socket. Requests before the
+/// daemon exists get plain 404s.
+fn start_proxy(
+    global: &Global,
+    routes: Routes,
+    ca: Arc<Ca>,
+    daemon: Arc<std::sync::OnceLock<std::sync::Weak<Daemon>>>,
+) {
+    let get = move || daemon.get().and_then(std::sync::Weak::upgrade);
+    let dash: proxy::Dashboard = {
+        let get = get.clone();
+        Arc::new(move || get().map(|d| dashboard(&d)).unwrap_or_default())
+    };
+    let ensure: proxy::Ensure = {
+        let get = get.clone();
+        Arc::new(move |host| {
+            let d = get();
+            Box::pin(async move {
+                let e = d?.ensure_server(&host).await.err()?;
+                warn!("{host}: {e:#}");
+                Some(format!("{e:#}"))
+            })
+        })
+    };
+    let fallback: proxy::Fallback = Arc::new(move |u| {
+        let d = get();
+        Box::pin(async move { d?.unrouted(u).await })
+    });
+    let (https, http) = (global.https_port, global.http_port);
+    let reserved: crate::devenv_proxy::Reserved = {
+        let routes = routes.clone();
+        Arc::new(move |host| routes.serves(host))
+    };
+    let devenv = crate::devenv_proxy::DevenvRoutes::new(
+        reserved,
+        Some(std::net::SocketAddr::from(([127, 0, 0, 1], https))),
+    );
+    // devenv checks its proxy through plain HTTP; without it `devenv up` starts its own.
+    let devenv_socket = match global.devenv_proxy_socket.as_deref() {
+        Some(p) if p.as_os_str() == "off" => None,
+        Some(p) => Some(p.to_path_buf()),
+        None if http != 0 => Some(crate::devenv_proxy::default_control_socket()),
+        None => None,
+    };
+    if let Some(socket) = devenv_socket {
+        let devenv = devenv.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::devenv_proxy::serve(&socket, devenv).await {
+                warn!("devenv projects keep their own proxy: {e:#}");
+            }
+        });
+    }
+    tokio::spawn(async move {
+        if let Err(e) = proxy::serve(https, http, routes, devenv, ca, dash, ensure, fallback).await
+        {
+            error!("HTTPS proxy: {e:#}");
+        }
+    });
+}
+
 async fn lead(global: Global, project: Option<Project>, listener: UnixListener) -> Result<()> {
     info!(
         "localforest daemon {} (state in {})",
@@ -2610,6 +2670,12 @@ async fn lead(global: Global, project: Option<Project>, listener: UnixListener) 
         config::home().display()
     );
     let ca = Arc::new(Ca::load_or_create(&config::home().join("ca"))?);
+    // The HTTPS proxy and devenv's control socket come up before PostgreSQL (a RAM
+    // disk and initdb): `devenv up` gives a proxy it starts five seconds.
+    let activity = history::Activity::default();
+    let routes = Routes::new(activity.clone());
+    let daemon: Arc<std::sync::OnceLock<std::sync::Weak<Daemon>>> = Default::default();
+    start_proxy(&global, routes.clone(), ca, daemon.clone());
     // The real server: unix socket only, one port above the proxy's.
     let pg = Postgres::start(
         config::pg_dir(),
@@ -2623,7 +2689,6 @@ async fn lead(global: Global, project: Option<Project>, listener: UnixListener) 
     pg.prepare_templates(&global.postgres_extensions())
         .await
         .context("preparing PostgreSQL")?;
-    let activity = history::Activity::default();
     let d = Arc::new(Daemon {
         global: global.clone(),
         pg,
@@ -2635,7 +2700,7 @@ async fn lead(global: Global, project: Option<Project>, listener: UnixListener) 
             global.redis_server.clone(),
         )),
         servers: Default::default(),
-        routes: Routes::new(activity.clone()),
+        routes: routes.clone(),
         activity,
         projects: Mutex::new(BTreeMap::new()),
         shutdown: Notify::new(),
@@ -2665,30 +2730,7 @@ async fn lead(global: Global, project: Option<Project>, listener: UnixListener) 
             error!("Redis: {e:#}");
         }
     });
-    let weak = Arc::downgrade(&d);
-    let dash: proxy::Dashboard =
-        Arc::new(move || weak.upgrade().map(|d| dashboard(&d)).unwrap_or_default());
-    let weak = Arc::downgrade(&d);
-    let ensure: proxy::Ensure = Arc::new(move |host| {
-        let weak = weak.clone();
-        Box::pin(async move {
-            let d = weak.upgrade()?;
-            let e = d.ensure_server(&host).await.err()?;
-            warn!("{host}: {e:#}");
-            Some(format!("{e:#}"))
-        })
-    });
-    let weak = Arc::downgrade(&d);
-    let fallback: proxy::Fallback = Arc::new(move |u| {
-        let weak = weak.clone();
-        Box::pin(async move { weak.upgrade()?.unrouted(u).await })
-    });
-    let (routes, https, http) = (d.routes.clone(), global.https_port, global.http_port);
-    tokio::spawn(async move {
-        if let Err(e) = proxy::serve(https, http, routes, ca, dash, ensure, fallback).await {
-            error!("HTTPS proxy: {e:#}");
-        }
-    });
+    let _ = daemon.set(Arc::downgrade(&d));
     // Services' `restart` policies.
     let weak = Arc::downgrade(&d);
     tokio::spawn(async move {

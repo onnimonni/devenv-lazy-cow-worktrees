@@ -390,6 +390,33 @@ localforest lsp -- <server> [args]
 All configurable (`--pg-port`, `--redis-port`, `--https-port`, `--http-port` or
 `LOCALFOREST_*`). State lives in `~/.local/state/localforest` (`LOCALFOREST_HOME`).
 
+## Projects that use devenv's own proxy
+
+A devenv project with `process.proxy.enable` normally starts devenv's shared
+`devenv-proxy` on ports 80 and 443, which localforest already holds. The daemon
+answers on devenv's control socket instead (`$DEVENV_PROXY_SOCKET`, else
+`$XDG_RUNTIME_DIR/devenv/proxy.sock`, else `$TMPDIR/devenv-proxy-<user>.sock`), so
+that project's `devenv up` finds a running proxy and registers its hostnames here:
+its processes are served over HTTPS with the project's own mkcert certificate and
+over plain HTTP, like with devenv's proxy. Nothing changes in that project.
+
+- To have `devenv up` start localforest when nothing runs yet, point devenv at it
+  instead of its own proxy: `DEVENV_PROXY_BINARY=<localforest>/bin/localforest-devenv-proxy`
+  (e.g. `home.sessionVariables` in home-manager). It runs the daemon with the ports
+  and socket devenv asks for, the proxy up before PostgreSQL. Without it, start
+  localforest first: a `devenv-proxy` that is already running keeps the socket,
+  and the daemon logs that devenv projects keep their own proxy.
+- Hostnames localforest serves can't be registered by a devenv project, and the
+  other way around.
+- devenv expects the proxy on `127.0.0.1:80` (plain HTTP, its health check) and
+  `127.0.0.1:443`. With other ports, set `DEVENV_PROXY_LISTEN` and
+  `DEVENV_PROXY_HTTPS_LISTEN` for devenv to match; with `--http-port 0` the socket
+  stays off.
+- `--devenv-proxy-socket <path>` (`LOCALFOREST_DEVENV_PROXY_SOCKET`) picks another
+  socket; `off` disables it.
+- Routes live in memory: after a daemon restart, run `devenv up` again in those
+  projects.
+
 ## Notes
 
 - The RAM disk is volatile: a reboot or `localforest down --eject` empties every
