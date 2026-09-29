@@ -34,6 +34,11 @@ use crate::config::{self, Checkout, Global, Project, Restart, Service};
 /// its paths into the primary move to the worktree (`config::rewrite_root`: env values,
 /// arguments, `cwd`, and a script whose text names the primary runs as a rewritten
 /// copy), and DEVENV_ROOT / _DOTFILE / _STATE / _RUNTIME are the worktree's.
+/// devenv's own postgres/redis state, exported into the captured project env even
+/// though localforest serves them (the module keeps `services.*.enable` readable): a
+/// process pointing at the primary's data directory would bypass localforest.
+const DEVENV_SERVICE_STATE: &[&str] = &["PGDATA", "REDISDATA"];
+
 pub fn command(
     project: &Project,
     checkout: &Path,
@@ -54,7 +59,7 @@ pub fn command(
     let base: Vec<(String, String)> = project
         .env
         .iter()
-        .filter(|(k, _)| !primary_only.contains(k))
+        .filter(|(k, _)| !primary_only.contains(k) && !DEVENV_SERVICE_STATE.contains(&k.as_str()))
         .map(|(k, v)| (k.clone(), rw(v)))
         .collect();
     let argv = shell_words::split(cmdline)?;
@@ -1097,6 +1102,8 @@ mod tests {
             ("DEVENV_ROOT".into(), r.clone()),
             ("FROM_PRIMARY".into(), "1".into()),
             ("LOCALFOREST_ENV_FILES".into(), r#"[".env.local"]"#.into()),
+            ("PGDATA".into(), format!("{r}/.devenv/state/postgres")),
+            ("REDISDATA".into(), format!("{r}/.devenv/state/redis")),
         ];
         let cmd = command(
             &project,
@@ -1126,6 +1133,8 @@ mod tests {
         assert_eq!(env["PORT"], "1");
         // Only the primary's file set it: gone in the worktree.
         assert!(!env.contains_key("FROM_PRIMARY"));
+        // devenv's own postgres/redis state never reaches what localforest runs.
+        assert!(!env.contains_key("PGDATA") && !env.contains_key("REDISDATA"));
 
         // The primary keeps its paths and its own file's values.
         let cmd = command(&project, &root, "echo hi", &root, vec![]).unwrap();

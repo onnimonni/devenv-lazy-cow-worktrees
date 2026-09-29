@@ -703,7 +703,19 @@ in
             );
           message = ''services.postgres: copyOnWrite clones databases inside one shared cluster; set copyOnWrite.enable = false or instance = "shared".'';
         }
+        {
+          # TODO: a PostgreSQL cluster per checkout (shares machinery with a cluster per
+          # durability setting).
+          assertion = !(pgCfg.enable && pgCfg.instance == "unique");
+          message = ''services.postgres.instance = "unique" isn't supported yet: every checkout shares localforest's cluster (with databases of its own). Remove it or set instance = "shared".'';
+        }
       ];
+
+    # Accepted so configs don't need changing later, but the daemon doesn't act on them yet.
+    warnings =
+      lib.optional (pgCfg.enable && pgCfg.start.on == "demand") ''services.postgres.start.on = "demand" isn't supported yet: localforest starts its PostgreSQL with the daemon.''
+      ++ lib.optional (pgCfg.enable && pgCfg.start.idleTimeout != null) "services.postgres.start.idleTimeout isn't supported yet: localforest's PostgreSQL runs until the daemon stops."
+      ++ lib.optional (pgCfg.enable && pgCfg.initialDatabases != [ ]) "services.postgres.initialDatabases: localforest gives every checkout <project>_dev and <project>_test (DATABASE_URL, TEST_DATABASE_URL) instead of these names for now.";
 
     cachix.pull = lib.mkIf cfg.cachix.enable [ "localforest" ];
 
