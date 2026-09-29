@@ -346,6 +346,13 @@ let
         else
           "${lib.toUpper (lib.replaceStrings [ "-" ] [ "_" ] port)}_PORT";
       extraPorts = lib.filter (port: port != httpPort) portNames;
+      # The http port's own variables (e.g. `env.SIM_PORT = toString ports.http.value`)
+      # follow PORT, the checkout's http port.
+      httpAliases =
+        if httpPort == null then
+          [ ]
+        else
+          lib.attrNames (lib.filterAttrs (_: v: v == value httpPort) p.env);
       # lazy-cow-tree sets PORT and each named port's variable per checkout.
       portValues = map value portNames;
       env = lib.filterAttrs (_: v: !(builtins.elem v portValues)) p.env;
@@ -370,7 +377,11 @@ let
     lib.warnIf (ignored != [ ])
       "lazy-cow-tree: processes.${name}.after: ${lib.concatStringsSep ", " ignored} ignored (only other processes lazy-cow-tree runs are started first)"
       {
-        exec = toString (pkgs.writeShellScript "lazy-cow-tree-${name}" p.exec);
+        exec = toString (
+          pkgs.writeShellScript "lazy-cow-tree-${name}" (
+            lib.concatMapStrings (v: "export ${v}=\"$PORT\"\n") httpAliases + p.exec
+          )
+        );
         inherit cwd env;
         http = httpPort != null;
         ports = lib.genAttrs extraPorts (port: {

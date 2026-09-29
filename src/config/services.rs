@@ -21,7 +21,7 @@ pub struct Service {
     /// without http run only as dependencies of others (workers).
     #[serde(default = "yes")]
     pub http: bool,
-    /// The service `lazy-cow-tree env` and `lazy-cow-tree service` pick without a name [default:
+    /// The service the shell hook (PORT) and `lazy-cow-tree service` pick without a name [default:
     /// `web`, else the first http service]. Every http service is served at
     /// <worktree>.<service>.<project>.localhost (<service>.<project>.localhost in the
     /// primary checkout).
@@ -235,7 +235,7 @@ impl Services {
 
     /// Place every port in the 10-port block: services at their `portOffset` (default:
     /// position by name), then their secondary ports at their `offset`, the rest from
-    /// the top down (9, 8, ...) by service and port name. Pure: `lazy-cow-tree env` and
+    /// the top down (9, 8, ...) by service and port name. Pure: the shell hook and
     /// the daemon agree.
     pub fn layout(&self) -> std::result::Result<Layout, String> {
         fn take(

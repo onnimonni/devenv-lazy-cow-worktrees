@@ -72,7 +72,7 @@ fn names_are_unique() {
     assert_ne!(a, b);
 
     // Same directory name elsewhere (plain `git worktree add`): git numbers the
-    // admin dir, and list and `lazy-cow-tree env` agree on the name.
+    // admin dir, and list and the shell hook agree on the name.
     let repo = Repository::open(&project.root).unwrap();
     let head = repo.head().unwrap().peel_to_commit().unwrap();
     for (admin, dir) in [("dup", "x"), ("dup1", "y")] {

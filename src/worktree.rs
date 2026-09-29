@@ -103,7 +103,7 @@ fn probe(project: &str, name: &str, used: &HashSet<u16>) -> u16 {
 }
 
 /// Base port of every worktree of `projects` (all registered ones: the daemon's, or
-/// `state.json` for `lazy-cow-tree env`), by path. Recorded ports hold; the others
+/// `state.json` for the shell hook), by path. Recorded ports hold; the others
 /// get, in order of (project root, name), the first slot from their hashed one that
 /// no primary, recorded or earlier worktree has. Pure: the daemon and `lazy-cow-tree
 /// env` get the same answer from the same projects and admin dirs.

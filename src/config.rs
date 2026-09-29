@@ -1,5 +1,5 @@
 //! Paths, settings and the naming scheme every part of the service shares. Names and
-//! ports are derived from a checkout's path alone, so `lazy-cow-tree env` in a worktree
+//! ports are derived from a checkout's path alone, so the shell hook in a worktree
 //! computes the same values as the daemon without asking it.
 
 use std::{
@@ -60,7 +60,7 @@ pub struct Global {
     )]
     pub pg_port: u16,
     /// Redis port on 127.0.0.1. The password picks the checkout: each has its own
-    /// redis-server behind it (REDIS_URL in `lazy-cow-tree env`).
+    /// redis-server behind it (REDIS_URL in the devenv shell).
     #[arg(
         long,
         env = "LAZY_COW_TREE_REDIS_PORT",
@@ -289,7 +289,7 @@ pub fn ca_cert_path() -> PathBuf {
 }
 
 /// Per-machine random secret that checkout passwords derive from, created on first
-/// use (0600), so `lazy-cow-tree env` and the daemon agree without talking.
+/// use (0600), so the shell hook and the daemon agree without talking.
 pub fn secret() -> Result<Vec<u8>> {
     secret_in(&home())
 }
