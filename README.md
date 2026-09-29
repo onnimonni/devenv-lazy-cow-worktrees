@@ -270,8 +270,9 @@ config :myapp, MyApp.Repo, url: System.fetch_env!("TEST_DATABASE_URL"), pool: Ec
   `git` wrapper makes it copy-on-write)
 
 **7. Work in a worktree without devenv.** Start the agent from the primary's
-`devenv shell` (`devenv shell -- claude`, `devenv shell -- codex`). Every bash and zsh
-started from it, including Claude Code's and Codex's tool shells and their subagents',
+`devenv shell` (`devenv shell -- claude`, `devenv shell -- codex`, `devenv shell -- pi`).
+Every bash and zsh started from it, including Claude Code's, Codex's and pi's tool
+shells and their subagents',
 gets the environment of the checkout it runs in, and again after `cd`/`pushd`/`popd`,
 with nothing to tell the agent:
 
