@@ -183,7 +183,8 @@ When to start them, per process and for PostgreSQL / Redis:
 
 ```nix
 processes.web.start = {
-  on = "demand";            # "up" | "demand" (default) | "manual"
+  on = "demand";            # "up" | "demand" | "manual"; default: "demand" with an http
+                            # port or another process's `after` on it, else "up"
   idleTimeout = "15m";      # stop after 15 min without open connections; null (default) = never
 };
 services.postgres.start = { on = "demand"; idleTimeout = null; };   # default on = "up"
