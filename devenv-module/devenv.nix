@@ -220,11 +220,24 @@ let
             }
           else
             null;
-        start = p.start.on;
+        start =
+          if p.start.on != null then
+            p.start.on
+          else if httpPort != null || dependedOn name then
+            "demand"
+          else
+            "up";
         idleTimeout = seconds p.start.idleTimeout;
         hostname = p.proxy.hostname;
         inherit (p.lazyCowTree) migrate restartOnPull;
       };
+
+  # Another process lists it in `after`: that process's start starts it.
+  dependedOn =
+    name:
+    lib.any (other: builtins.elem name (lib.filter (d: d != null) (map processDep other.after))) (
+      lib.attrValues (removeAttrs derivedProcs [ name ])
+    );
 
   derived = lib.mapAttrs deriveService derivedProcs;
 
@@ -237,12 +250,15 @@ let
           type = types.submodule {
             options = {
               on = mkOption {
-                type = types.enum [
-                  "up"
-                  "demand"
-                  "manual"
-                ];
-                default = "demand";
+                type = types.nullOr (
+                  types.enum [
+                    "up"
+                    "demand"
+                    "manual"
+                  ]
+                );
+                default = null;
+                defaultText = lib.literalMD "`demand` when a request or another process can start it (an http port, or another process's `after`), else `up`, as `devenv up` would";
                 description = "When lazy-cow-tree starts it: with its checkout (`up`), on the first request or as a dependency (`demand`), or only by `lazy-cow-tree service start` (`manual`).";
               };
               idleTimeout = mkOption {
@@ -686,7 +702,7 @@ in
     assertions =
       lib.mapAttrsToList (name: p: {
         assertion =
-          p.start.on != "demand"
+          derived.${name}.start != "demand"
           || derived.${name}.http
           || lib.any (other: builtins.elem name other.dependsOn) (
             lib.attrValues (removeAttrs derived [ name ])
