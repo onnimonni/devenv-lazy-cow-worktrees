@@ -17,6 +17,7 @@ fn settings() -> ProjectSettings {
         services: Default::default(),
         no_sync: false,
         no_auto_remove: false,
+        databases: Vec::new(),
     }
 }
 

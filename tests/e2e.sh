@@ -35,9 +35,12 @@ export LAZY_COW_TREE_HTTPS_PORT=8443 LAZY_COW_TREE_HTTP_PORT=0 LAZY_COW_TREE_RAM
 cat >"$home/migrate.sh" <<'EOF'
 [[ ${LAZY_COW_TREE_WORKTREE:-} == broken ]] && { echo "migration broke" >&2; exit 1; }
 grep -qx "${LAZY_COW_TREE_WORKTREE:-primary}" "$(dirname "$0")/setup.log" || { echo "setup did not run" >&2; exit 1; }
+psql -v ON_ERROR_STOP=1 -d "$CMS_DATABASE_URL" -c 'CREATE TABLE IF NOT EXISTS pages(x int); INSERT INTO pages VALUES (1)' >/dev/null
 exec psql -v ON_ERROR_STOP=1 -c 'CREATE TABLE IF NOT EXISTS seeds(x int); INSERT INTO seeds VALUES (1)'
 EOF
 export LAZY_COW_TREE_MIGRATE="bash $home/migrate.sh"
+# A second database per checkout (a CMS repo), cloned like the main one.
+export LAZY_COW_TREE_DATABASES=cms
 export LAZY_COW_TREE_SETUP="sh -c 'echo \"\${LAZY_COW_TREE_WORKTREE:-primary}\" >> $home/setup.log'"
 # Also serves on its named secondary port, like Phoenix's LiveDebugger; never binds `idle`.
 web="sh -c '$python -m http.server \"\$DEBUGGER_PORT\" --bind 127.0.0.1 & exec $python -m http.server \"\$PORT\" --bind 127.0.0.1'"
@@ -132,6 +135,11 @@ template_seeded || fail "template lost by the snapshot"
 pass "worktree database cloned from the template and migrated"
 if psql -d demo_dev -tAc "select 1" >/dev/null 2>&1; then fail "worktree could open the primary's database"; fi
 pass "other checkouts' databases refused"
+(( $(psql -d "$CMS_DATABASE_URL" -tAc "select count(*) from pages") >= 1 )) || fail "extra database not cloned from its template"
+[[ $CMS_DATABASE_URL == */demo_cms_dev_feat_a ]] || fail "CMS_DATABASE_URL=$CMS_DATABASE_URL"
+if psql -d demo_cms_dev -tAc "select 1" >/dev/null 2>&1; then fail "worktree could open the primary's cms database"; fi
+psql -d postgres -qc "CREATE DATABASE demo_cms_test_feat_a3" || fail "could not create a cms partition database"
+pass "extra database (cms): cloned from its template, partitions, others' refused"
 psql -d postgres -qc "CREATE DATABASE demo_test_feat_a2" || fail "could not create a partition database"
 [[ $(psql -d demo_test_feat_a2 -tAc "select 1") == 1 ]] || fail "MIX_TEST_PARTITION database <test db>2 refused"
 pass "MIX_TEST_PARTITION database opened"
@@ -158,6 +166,9 @@ base=$(env_of "$wt" PORT)
 [[ $LAZY_COW_TREE_WEB_DEBUGGER_URL == https://feat-a.debugger.demo.localhost:8443 ]] ||
   fail "LAZY_COW_TREE_WEB_DEBUGGER_URL=$LAZY_COW_TREE_WEB_DEBUGGER_URL"
 pass "named ports in env: DEBUGGER_PORT=$DEBUGGER_PORT TEST_PORT=$TEST_PORT"
+wt_root=$(DEVENV_ROOT=$(pwd -P) env_of "$wt" DEVENV_ROOT)
+[[ $wt_root == "$(cd "$wt" && pwd -P)" ]] || fail "shell hook in a worktree: DEVENV_ROOT=$wt_root"
+pass "shell hook in a worktree of the devenv project: its own DEVENV_ROOT"
 
 web_log=$(cd "$wt" && "$bin" service log -s web)
 out=$(curl_lf "https://feat-a.debugger.demo.localhost:8443/" 2>&1) || true
@@ -204,7 +215,7 @@ port=$(env_of "$wt" PORT)
 for p in "$port" "$((port + 9))"; do
   if curl -s --max-time 2 "http://127.0.0.1:$p/" >/dev/null; then fail "its server on $p survived"; fi
 done
-[[ -z $(admin_psql "select 1 from pg_database where datname in ('demo_dev_feat_a', 'demo_test_feat_a2')") ]] || fail "its databases survived"
+[[ -z $(admin_psql "select 1 from pg_database where datname in ('demo_dev_feat_a', 'demo_test_feat_a2', 'demo_cms_dev_feat_a', 'demo_cms_test_feat_a3')") ]] || fail "its databases survived"
 pass "rm killed its service and dropped its database"
 
 code=$(curl_lf -o /dev/null -w '%{http_code}' "https://feat-a.web.demo.localhost:8443/")

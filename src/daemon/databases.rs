@@ -5,8 +5,7 @@ use super::*;
 impl Daemon {
     /// Role, routes and Redis password; for the primary also its databases. A
     /// worktree's database is created when first connected to (`resolve_pg`).
-    /// Worktrees also get their environment in `.env`. Ok(true) when the primary's
-    /// dev database was just created (to be seeded).
+    /// Ok(true) when the primary's dev database was just created (to be seeded).
     pub(super) async fn provision(&self, c: &Checkout) -> Result<bool> {
         if let Err(e) = self.migrate_role(c).await {
             warn!("{}: taking over its old role: {e:#}", c.id());
@@ -15,7 +14,11 @@ impl Daemon {
         let mut created = false;
         if c.worktree.is_none() {
             let extensions = self.global.postgres_extensions();
-            for db in [c.dev_db(), c.test_db()] {
+            let dbs: Vec<String> = c
+                .db_kinds()
+                .flat_map(|k| [c.dev_db_of(k), c.test_db_of(k)])
+                .collect();
+            for db in dbs {
                 if !self.pg.exists(&db).await? {
                     self.pg.create(&db, None, Some(&c.id())).await?;
                     info!("{db}: created empty");
@@ -170,11 +173,23 @@ impl Daemon {
         result
     }
 
-    /// Create a worktree's dev database if missing: a copy-on-write clone of the
-    /// template, or of the primary's while there's no template and it's idle.
-    /// Ok(true) when it was created.
-    pub(super) async fn ensure_dev_db(&self, rt: &ProjectRt, c: &Checkout) -> Result<bool> {
-        let dev = c.dev_db();
+    /// Create a worktree's dev databases (main and extra) where missing.
+    pub(super) async fn ensure_dev_db(&self, rt: &ProjectRt, c: &Checkout) -> Result<()> {
+        for kind in c.db_kinds() {
+            self.ensure_dev_db_of(rt, c, kind).await?;
+        }
+        Ok(())
+    }
+
+    /// Create one of a worktree's dev databases if missing: a copy-on-write clone of
+    /// its template, or of the primary's while there's no template and it's idle.
+    async fn ensure_dev_db_of(
+        &self,
+        rt: &ProjectRt,
+        c: &Checkout,
+        kind: Option<&str>,
+    ) -> Result<()> {
+        let dev = c.dev_db_of(kind);
         // This database's connects wait until it's cloned and adopted; others only
         // for the clone itself (create_lock), not for `adopt`'s object locks.
         let lock = self
@@ -185,11 +200,11 @@ impl Daemon {
             .clone();
         let _dev = lock.lock().await;
         if self.pg.exists(&dev).await? {
-            return Ok(false);
+            return Ok(());
         }
         let create = self.create_lock.lock().await;
-        let template = c.template_db();
-        let primary = rt.primary().dev_db();
+        let template = c.template_db_of(kind);
+        let primary = rt.primary().dev_db_of(kind);
         // LAZY_COW_TREE_POSTGRES_COW=0: empty, then migrated and seeded like a new
         // primary database.
         let source = if !rt.project.copy_on_write() {
@@ -206,7 +221,7 @@ impl Daemon {
             .create(&dev, source.as_deref(), Some(&c.id()))
             .await?;
         drop(create);
-        if let Err(e) = self.adopt_dev_db(c).await {
+        if let Err(e) = self.adopt_db(c, kind).await {
             // Cloned objects its role can't migrate: better none at all.
             let _ = self.pg.drop(&dev).await;
             return Err(e);
@@ -218,7 +233,7 @@ impl Daemon {
             }
             None => info!("{dev}: created empty (no template yet)"),
         }
-        Ok(true)
+        Ok(())
     }
 
     /// Migrate a worktree's dev database (creating it first if missing) unless it
@@ -239,6 +254,11 @@ impl Daemon {
         }
         let lock = rt.migrate_lock(c);
         let _g = lock.lock().await;
+        // Removed meanwhile (`remove_locked` holds this lock while it drops the databases):
+        // nothing to migrate, and a clone now would outlive the worktree.
+        if c.worktree.is_some() && !c.path.join(".git").exists() {
+            return Ok(());
+        }
         // Its changed files restart its services after migrating, not during.
         let _hold = self.servers.hold(&c.path);
         if !force && let Some(f) = rt.migrate_failure(c).filter(MigrateFailure::backing_off) {
@@ -313,13 +333,23 @@ impl Daemon {
     /// template's owner role, or by the primary's role (cloned from its database, or
     /// before templates had their own).
     pub(super) async fn adopt_dev_db(&self, c: &Checkout) -> Result<()> {
+        for kind in c.db_kinds() {
+            if self.pg.exists(&c.dev_db_of(kind)).await? {
+                self.adopt_db(c, kind).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `adopt_dev_db` for one of its dev databases.
+    async fn adopt_db(&self, c: &Checkout, kind: Option<&str>) -> Result<()> {
         let primary = Checkout {
             worktree: None,
             ..c.clone()
         };
         if c.worktree.is_some() {
-            for from in [c.template_db(), primary.id()] {
-                self.pg.adopt(&c.dev_db(), &from, &c.id()).await?;
+            for from in [c.template_db_of(kind), primary.id()] {
+                self.pg.adopt(&c.dev_db_of(kind), &from, &c.id()).await?;
             }
         }
         Ok(())
@@ -347,10 +377,8 @@ impl Daemon {
             self.pg.adopt(db, &old, &c.id()).await?;
             info!("{db}: handed from {old} to {}", c.id());
         }
-        // A new worktree has no dev database yet: `ensure_dev_db` adopts it once cloned.
-        if dbs.contains(&c.dev_db()) {
-            self.adopt_dev_db(c).await?;
-        }
+        // A new worktree has no dev databases yet: `ensure_dev_db` adopts them once cloned.
+        self.adopt_dev_db(c).await?;
         Ok(())
     }
 

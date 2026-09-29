@@ -8,6 +8,7 @@ fn co(wt: Option<&str>) -> Checkout {
         path: "/x".into(),
         port: 20000,
         services: Services::default(),
+        extra_dbs: Vec::new(),
     }
 }
 
@@ -119,6 +120,7 @@ fn project_settings_from_env() {
         services: Default::default(),
         no_sync: false,
         no_auto_remove: false,
+        databases: Vec::new(),
     };
     let mut p = Project::new("/src/app".into(), settings);
     assert!(p.copy_on_write());
@@ -628,4 +630,46 @@ fn partition_owner() {
     };
     assert_eq!(db_owner("shop_dev_dev_x", [&a, &b]), None);
     assert_eq!(db_owner("shop_dev_dev_x", [&a]), Some(&a));
+}
+
+#[test]
+fn extra_databases_per_checkout() {
+    let with = |wt: Option<&str>| Checkout {
+        extra_dbs: vec!["cms".into()],
+        ..co(wt)
+    };
+    let (primary, wt) = (with(None), with(Some("feat-x")));
+    assert_eq!(primary.dev_dbs(), ["my_app_dev", "my_app_cms_dev"]);
+    assert_eq!(wt.dev_dbs(), ["my_app_dev_feat_x", "my_app_cms_dev_feat_x"]);
+    assert_eq!(wt.template_db_of(Some("cms")), "my_app_cms_template");
+    // Test databases and MIX_TEST_PARTITION ones of each kind are its own.
+    for db in [
+        "my_app_cms_test_feat_x",
+        "my_app_cms_test_feat_x3",
+        "my_app_cms_test2_feat_x",
+        "my_app_test_feat_x3",
+    ] {
+        assert!(wt.owns_db(db), "{db}");
+        assert!(!primary.owns_db(db), "{db}");
+    }
+    assert!(primary.owns_db("my_app_cms_test4"));
+    assert!(!wt.owns_db("my_app_cms_dev") && !co(Some("feat-x")).owns_db("my_app_cms_dev_feat_x"));
+    // An exact name beats a partition, as for the main databases.
+    let x2 = with(Some("x2"));
+    assert_eq!(
+        db_owner("my_app_cms_test_x2", [&with(Some("x")), &x2]).map(|c| c.id()),
+        Some(x2.id())
+    );
+    let env: BTreeMap<_, _> = wt.env(&global()).into_iter().collect();
+    assert!(env["CMS_DATABASE_URL"].ends_with("/my_app_cms_dev_feat_x"));
+    assert!(env["CMS_TEST_DATABASE_URL"].ends_with("/my_app_cms_test_feat_x"));
+    assert!(env["DATABASE_URL"].ends_with("/my_app_dev_feat_x"));
+    // Names fit PostgreSQL's 63 bytes with the extra name's length counted.
+    let long = with(Some(&"w".repeat(60)));
+    for kind in long.db_kinds() {
+        assert!(long.test_db_of(kind).len() + "_p9999".len() <= PG_NAME_MAX);
+    }
+    assert!(
+        parse_db_name("cms").is_ok() && parse_db_name("Cms").is_err() && parse_db_name("").is_err()
+    );
 }

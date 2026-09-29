@@ -106,18 +106,17 @@ impl Daemon {
             .await?;
         }
         if let Some(head) = head {
-            let dev = primary.dev_db();
             // LAZY_COW_TREE_POSTGRES_TEMPLATE_REFRESH=manual: `lazy-cow-tree snapshot` only.
-            if !rt.project.template_refresh_manual() && self.pg.exists(&dev).await? {
-                let t = std::time::Instant::now();
-                self.pg
-                    .snapshot(&dev, &primary.template_db(), &self.create_lock)
-                    .await?;
-                info!(
-                    "{} refreshed from {dev} in {:?}",
-                    primary.template_db(),
-                    t.elapsed()
-                );
+            if !rt.project.template_refresh_manual() {
+                for kind in primary.db_kinds() {
+                    let (dev, template) = (primary.dev_db_of(kind), primary.template_db_of(kind));
+                    if !self.pg.exists(&dev).await? {
+                        continue;
+                    }
+                    let t = std::time::Instant::now();
+                    self.pg.snapshot(&dev, &template, &self.create_lock).await?;
+                    info!("{template} refreshed from {dev} in {:?}", t.elapsed());
+                }
             }
             // Not at startup: only when the base branch moved while we watched.
             let pulled = rt.last_migrated.lock().replace(head).is_some();

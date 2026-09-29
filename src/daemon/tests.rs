@@ -67,6 +67,7 @@ fn co(wt: Option<&str>) -> Checkout {
         path: "/x".into(),
         port: 20000,
         services: Default::default(),
+        extra_dbs: Vec::new(),
     }
 }
 

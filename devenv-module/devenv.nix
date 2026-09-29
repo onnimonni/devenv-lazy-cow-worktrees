@@ -720,6 +720,12 @@ in
         example = lib.literalExpression "extensions: [ extensions.postgis extensions.pgvector ]";
         description = "Extensions to install, as in devenv's services.postgres.extensions (`package.withPackages`). Checkout roles aren't superusers: they can CREATE EXTENSION trusted ones (pgcrypto, citext, ...); list the others in createExtensions.";
       };
+      databases = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        example = [ "cms" ];
+        description = "More databases every checkout gets next to its main one, e.g. for a second Ecto repo: `<project>_<name>_dev`, `_test` and test partitions per checkout (worktrees' cloned from `<project>_<name>_template`, refreshed with the main template), in `<NAME>_DATABASE_URL` and `<NAME>_TEST_DATABASE_URL`.";
+      };
       createExtensions = mkOption {
         type = types.listOf types.str;
         default = [ ];
@@ -793,6 +799,12 @@ in
       default = null;
       example = "mix phx.server";
       description = "Shorthand for `lazyCowTree.services.web.exec`.";
+    };
+    worktreesDir = mkOption {
+      type = types.str;
+      default = ".claude/worktrees";
+      example = "../myapp-worktrees";
+      description = "Where `lazy-cow-tree worktree new` and Claude Code's WorktreeCreate hook put worktrees, relative to the primary checkout. Outside it (`../<name>`), language servers and indexers of the primary don't see the worktrees' files.";
     };
     autoRemoveMerged = mkOption {
       type = types.bool;
@@ -949,6 +961,7 @@ in
       LAZY_COW_TREE_PORT = toString cfg.port;
       LAZY_COW_TREE_SERVICES = builtins.toJSON cfg.services;
       LAZY_COW_TREE_NO_AUTO_REMOVE = lib.boolToString (!cfg.autoRemoveMerged);
+      LAZY_COW_TREE_WORKTREES_DIR = cfg.worktreesDir;
       LAZY_COW_TREE_RAMDISK_MB = toString cfg.postgres.ramdiskMB;
       LAZY_COW_TREE_POSTGRES_BIN = "${postgres}/bin";
       LAZY_COW_TREE_POSTGRES_SETTINGS = builtins.toJSON cfg.postgres.settings;
@@ -973,6 +986,9 @@ in
       LAZY_COW_TREE_POSTGRES_INITIAL_DATABASES = builtins.toJSON (map (d: d.name) pgCfg.initialDatabases);
     }
     // lib.optionalAttrs config.devenv.isTesting { LAZY_COW_TREE_NO_SYNC = "1"; }
+    // lib.optionalAttrs (cfg.postgres.databases != [ ]) {
+      LAZY_COW_TREE_DATABASES = lib.concatStringsSep "," cfg.postgres.databases;
+    }
     // lib.optionalAttrs (cfg.httpsPort != null) { LAZY_COW_TREE_HTTPS_PORT = toString cfg.httpsPort; }
     // lib.optionalAttrs (cfg.httpPort != null) { LAZY_COW_TREE_HTTP_PORT = toString cfg.httpPort; }
     // lib.optionalAttrs (cfg.project != null) { LAZY_COW_TREE_PROJECT = cfg.project; }

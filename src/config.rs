@@ -217,6 +217,13 @@ pub struct ProjectSettings {
     /// Don't remove worktrees whose PR merged.
     #[arg(long, env = "LAZY_COW_TREE_NO_AUTO_REMOVE", value_parser = clap::builder::BoolishValueParser::new())]
     pub no_auto_remove: bool,
+    /// More databases every checkout gets, next to its main one (e.g. `cms`: a second
+    /// Ecto repo): `<prefix>_<name>_dev`, `_test` and test partitions per checkout,
+    /// worktrees' cloned from `<prefix>_<name>_template`, in `<NAME>_DATABASE_URL` and
+    /// `<NAME>_TEST_DATABASE_URL`. Names: lowercase letters, digits and `_`.
+    #[arg(long, env = "LAZY_COW_TREE_DATABASES", value_delimiter = ',', value_parser = parse_db_name)]
+    #[serde(default)]
+    pub databases: Vec<String>,
 }
 
 /// Unix seconds.
@@ -349,6 +356,22 @@ pub fn worktree_label(name: &str) -> String {
     format!("{}-{hash}", base.trim_end_matches('-'))
 }
 
+/// `ProjectSettings::databases` entry: part of database names and variable names.
+fn parse_db_name(s: &str) -> std::result::Result<String, String> {
+    if !s.is_empty()
+        && s.len() <= 20
+        && s.starts_with(|c: char| c.is_ascii_lowercase())
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    {
+        Ok(s.to_string())
+    } else {
+        Err(format!(
+            "{s:?}: lowercase letters, digits and _, starting with a letter, at most 20"
+        ))
+    }
+}
+
 pub fn valid_label(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 32
@@ -456,6 +479,7 @@ impl Project {
             path,
             port,
             services: self.settings.services.clone(),
+            extra_dbs: self.settings.databases.clone(),
         }
     }
 }
@@ -538,6 +562,9 @@ pub struct Checkout {
     pub port: u16,
     #[serde(default)]
     pub services: Services,
+    /// Names of its databases besides the main one (`ProjectSettings::databases`).
+    #[serde(default)]
+    pub extra_dbs: Vec<String>,
 }
 
 impl Checkout {
@@ -551,13 +578,21 @@ impl Checkout {
     /// `_<worktree>` of its database names, shortened (with a hash of the worktree)
     /// where the longest name built from it, a `<prefix>_test_p<NNNN>_<wt>` partition,
     /// would pass PostgreSQL's 63 bytes: its truncation would cut the end, where
-    /// worktrees differ.
+    /// worktrees differ. Extra databases' `_<name>` counts too; without them names
+    /// are as before.
     fn suffix(&self) -> String {
         let Some(w) = self.worktree.as_deref() else {
             return String::new();
         };
         let full = format!("_{}", w.replace('-', "_"));
-        let room = PG_NAME_MAX.saturating_sub(self.db_prefix.len() + LONGEST_DB_INFIX.len());
+        let longest_extra = self
+            .extra_dbs
+            .iter()
+            .map(|n| n.len() + 1)
+            .max()
+            .unwrap_or(0);
+        let room = PG_NAME_MAX
+            .saturating_sub(self.db_prefix.len() + longest_extra + LONGEST_DB_INFIX.len());
         if full.len() <= room {
             return full;
         }
@@ -622,40 +657,81 @@ impl Checkout {
         }
     }
 
+    /// `<prefix>` of the main databases, `<prefix>_<name>` of extra database `name`.
+    fn kind_prefix(&self, kind: Option<&str>) -> String {
+        match kind {
+            None => self.db_prefix.clone(),
+            Some(k) => format!("{}_{k}", self.db_prefix),
+        }
+    }
+
+    /// The main database (None) and each extra one (`ProjectSettings::databases`).
+    pub fn db_kinds(&self) -> impl Iterator<Item = Option<&str>> {
+        std::iter::once(None).chain(self.extra_dbs.iter().map(|k| Some(k.as_str())))
+    }
+
     pub fn dev_db(&self) -> String {
-        pg_name(&format!("{}_dev{}", self.db_prefix, self.suffix()))
+        self.dev_db_of(None)
     }
 
     pub fn test_db(&self) -> String {
-        pg_name(&format!("{}_test{}", self.db_prefix, self.suffix()))
+        self.test_db_of(None)
     }
 
-    /// The project's template database, which worktrees' dev databases are cloned from.
-    pub fn template_db(&self) -> String {
-        pg_name(&format!("{}_template", self.db_prefix))
+    pub fn dev_db_of(&self, kind: Option<&str>) -> String {
+        pg_name(&format!("{}_dev{}", self.kind_prefix(kind), self.suffix()))
     }
 
-    /// Databases this checkout may own: dev, test, and MIX_TEST_PARTITION ones,
-    /// `<test db><N>` (Ecto's usual `"..._test#{partition}"` on TEST_DATABASE_URL) or
+    pub fn test_db_of(&self, kind: Option<&str>) -> String {
+        pg_name(&format!("{}_test{}", self.kind_prefix(kind), self.suffix()))
+    }
+
+    /// The project's template database of `kind`, which worktrees' dev databases of
+    /// that kind are cloned from.
+    pub fn template_db_of(&self, kind: Option<&str>) -> String {
+        pg_name(&format!("{}_template", self.kind_prefix(kind)))
+    }
+
+    /// Its dev databases, the main one first.
+    pub fn dev_dbs(&self) -> Vec<String> {
+        self.db_kinds().map(|k| self.dev_db_of(k)).collect()
+    }
+
+    /// Databases this checkout may own: `owns_db`.
+    pub fn owns_db(&self, db: &str) -> bool {
+        self.db_claim(db).is_some()
+    }
+
+    /// Whether this checkout may own `db`, and how closely: (an exact dev or test
+    /// name, length of the test database a partition extends) for `db_owner`. Per
+    /// kind (main and extra): dev, test, and MIX_TEST_PARTITION ones, `<test db><N>`
+    /// (Ecto's usual `"..._test#{partition}"` on TEST_DATABASE_URL) or
     /// `<prefix>_test<N>_<worktree>`. No other form: `<prefix>_test_<N>_<wt>` and
     /// `<prefix>_test_p<N>_<wt>` are test databases of worktrees `<N>-<wt>` and
     /// `p<N>-<wt>`. `<test db><N>` still overlaps worktrees named like this one plus
     /// digits (`x` + 2 vs worktree `x2`): `db_owner` settles those.
-    pub fn owns_db(&self, db: &str) -> bool {
-        if db == self.dev_db() || db == self.test_db() {
-            return true;
-        }
+    pub fn db_claim(&self, db: &str) -> Option<(bool, usize)> {
         let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-        if db.strip_prefix(&self.test_db()).is_some_and(digits) {
-            return true;
-        }
-        // Worktrees only: for the primary it's `<test db><N>` again.
         let suffix = self.suffix();
-        !suffix.is_empty()
-            && db
-                .strip_prefix(&format!("{}_test", self.db_prefix))
-                .and_then(|rest| rest.strip_suffix(&suffix))
-                .is_some_and(digits)
+        self.db_kinds()
+            .filter_map(|kind| {
+                let (dev, test) = (self.dev_db_of(kind), self.test_db_of(kind));
+                if db == dev || db == test {
+                    return Some((true, test.len()));
+                }
+                if db.strip_prefix(&test).is_some_and(digits)
+                    // Worktrees only: for the primary it's `<test db><N>` again.
+                    || (!suffix.is_empty()
+                        && db
+                            .strip_prefix(&format!("{}_test", self.kind_prefix(kind)))
+                            .and_then(|rest| rest.strip_suffix(&suffix))
+                            .is_some_and(digits))
+                {
+                    return Some((false, test.len()));
+                }
+                None
+            })
+            .max()
     }
 
     /// The same checkout (project and worktree), whatever its settings.
@@ -800,6 +876,12 @@ impl Checkout {
                 ca_cert_path().display().to_string(),
             ),
         ];
+        for kind in &self.extra_dbs {
+            let var = env_var_name(kind);
+            let (dev, test) = (self.dev_db_of(Some(kind)), self.test_db_of(Some(kind)));
+            env.push((format!("{var}_DATABASE_URL"), pg_url(&dev)));
+            env.push((format!("{var}_TEST_DATABASE_URL"), pg_url(&test)));
+        }
         for (n, s) in &self.services.0 {
             let var = env_var_name(n);
             env.push((
@@ -938,7 +1020,7 @@ pub fn db_owner<'a>(
     db: &str,
     checkouts: impl IntoIterator<Item = &'a Checkout>,
 ) -> Option<&'a Checkout> {
-    let key = |c: &Checkout| (db == c.dev_db() || db == c.test_db(), c.test_db().len());
+    let key = |c: &Checkout| c.db_claim(db);
     let mut best: Vec<&Checkout> = Vec::new();
     for c in checkouts.into_iter().filter(|c| c.owns_db(db)) {
         match best.first().map(|b| key(b).cmp(&key(c))) {
