@@ -800,6 +800,12 @@ in
       example = "mix phx.server";
       description = "Shorthand for `lazyCowTree.services.web.exec`.";
     };
+    worktreesDir = mkOption {
+      type = types.str;
+      default = ".claude/worktrees";
+      example = "../myapp-worktrees";
+      description = "Where `lazy-cow-tree worktree new` and Claude Code's WorktreeCreate hook put worktrees, relative to the primary checkout. Outside it (`../<name>`), language servers and indexers of the primary don't see the worktrees' files.";
+    };
     autoRemoveMerged = mkOption {
       type = types.bool;
       default = true;
@@ -955,6 +961,7 @@ in
       LAZY_COW_TREE_PORT = toString cfg.port;
       LAZY_COW_TREE_SERVICES = builtins.toJSON cfg.services;
       LAZY_COW_TREE_NO_AUTO_REMOVE = lib.boolToString (!cfg.autoRemoveMerged);
+      LAZY_COW_TREE_WORKTREES_DIR = cfg.worktreesDir;
       LAZY_COW_TREE_RAMDISK_MB = toString cfg.postgres.ramdiskMB;
       LAZY_COW_TREE_POSTGRES_BIN = "${postgres}/bin";
       LAZY_COW_TREE_POSTGRES_SETTINGS = builtins.toJSON cfg.postgres.settings;

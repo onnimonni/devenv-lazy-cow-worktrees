@@ -344,6 +344,7 @@ FIXME: other language servers. devenv's `languages.*.lsp` has only `enable` and
 | `lazyCowTree.setup` | none | runs once in every new checkout (lazy-cow-tree, `git worktree add`, Claude Code), e.g. `mix deps.get`; in the primary checkout too (a fresh clone has no `deps/`), before its first migrate, seed or service start. Done is a `lazy-cow-tree-setup` marker in the checkout's git dir; a failure in the primary shows in `lazy-cow-tree status` and is retried with the migrations' backoff; again before a `restartOnChange` restart for changed dependency files, so keep it idempotent |
 | `lazyCowTree.services.<name>` | none | see below |
 | `lazyCowTree.server` | none | shorthand for `lazyCowTree.services.web.exec` |
+| `lazyCowTree.worktreesDir` | `.claude/worktrees` | where new worktrees go, relative to the primary; `../myapp-worktrees` keeps them out of the primary's language servers and indexers |
 | `lazyCowTree.autoRemoveMerged` | `true` | remove worktrees whose GitHub PR merged (see GitHub above) |
 | `lazyCowTree.httpsPort` | `null` | HTTPS proxy port; unset: 443 where unprivileged processes may bind it, else 8443 |
 | `lazyCowTree.httpPort` | `null` | HTTP port redirecting to HTTPS, 0 disables; unset: 80 where unprivileged processes may bind it, else off |
