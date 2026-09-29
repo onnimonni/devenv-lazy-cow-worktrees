@@ -71,7 +71,7 @@ primary checkout's, nor unchanged since setup finished are printed as warnings.
 
 ## Install
 
-Binaries for macOS (arm64) and Linux (x86_64) are on the
+Binaries (`lazy-cow-tree` and `lazy-cow-tree-cow`) for macOS (arm64) and Linux (x86_64,\narm64) are on the
 [releases page](https://github.com/onnimonni/devenv-lazy-cow-worktrees/releases); or
 `nix profile install github:onnimonni/devenv-lazy-cow-worktrees`, or
 `cargo install --git https://github.com/onnimonni/devenv-lazy-cow-worktrees`. lazy-cow-tree runs

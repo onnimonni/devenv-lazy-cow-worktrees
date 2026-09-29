@@ -56,4 +56,4 @@ jobs:
           name: lazy-cow-tree
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
       - run: nix build .#lazy-cow-tree -L
-      - run: ./result/bin/lazy-cow-tree --version
+      - run: ./result/bin/lazy-cow-tree --version && ./result/bin/lazy-cow-tree-cow --version

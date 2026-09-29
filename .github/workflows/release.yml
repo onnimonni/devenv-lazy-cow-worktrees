@@ -3,6 +3,9 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Builds and packages without publishing, to check a change to this workflow.
+  pull_request:
+    paths: [.github/workflows/release.yml]
 
 permissions:
   contents: write
@@ -17,6 +20,9 @@ jobs:
             target: aarch64-apple-darwin
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+          # No ubuntu-latest-arm label: https://github.com/orgs/community/discussions/148648
+          - os: ubuntu-26.04-arm
+            target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -28,12 +34,14 @@ jobs:
       - run: cargo build --release --locked --features vendored-openssl --target ${{ matrix.target }}
       - name: Package
         run: |
-          name=lazy-cow-tree-${GITHUB_REF_NAME}-${{ matrix.target }}
+          name=lazy-cow-tree-${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}-${{ matrix.target }}
           mkdir "$name"
-          cp target/${{ matrix.target }}/release/lazy-cow-tree README.md LICENSE "$name/"
+          cp target/${{ matrix.target }}/release/lazy-cow-tree target/${{ matrix.target }}/release/lazy-cow-tree-cow README.md LICENSE "$name/"
           tar czf "$name.tar.gz" "$name"
+          tar tzf "$name.tar.gz"
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
-      - uses: softprops/action-gh-release@v3
+      - if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             lazy-cow-tree-*.tar.gz
