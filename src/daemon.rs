@@ -2684,8 +2684,33 @@ async fn lead(global: Global, project: Option<Project>, listener: UnixListener) 
         Box::pin(async move { weak.upgrade()?.unrouted(u).await })
     });
     let (routes, https, http) = (d.routes.clone(), global.https_port, global.http_port);
+    let reserved: crate::devenv_proxy::Reserved = {
+        let routes = routes.clone();
+        Arc::new(move |host| routes.serves(host))
+    };
+    let devenv = crate::devenv_proxy::DevenvRoutes::new(
+        reserved,
+        Some(std::net::SocketAddr::from(([127, 0, 0, 1], https))),
+    );
+    // devenv checks its proxy through plain HTTP on port 80; without it `devenv up`
+    // would start its own.
+    let devenv_socket = match global.devenv_proxy_socket.as_deref() {
+        Some(p) if p.as_os_str() == "off" => None,
+        Some(p) => Some(p.to_path_buf()),
+        None if http != 0 => Some(crate::devenv_proxy::default_control_socket()),
+        None => None,
+    };
+    if let Some(socket) = devenv_socket {
+        let devenv = devenv.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::devenv_proxy::serve(&socket, devenv).await {
+                warn!("devenv projects keep their own proxy: {e:#}");
+            }
+        });
+    }
     tokio::spawn(async move {
-        if let Err(e) = proxy::serve(https, http, routes, ca, dash, ensure, fallback).await {
+        if let Err(e) = proxy::serve(https, http, routes, devenv, ca, dash, ensure, fallback).await
+        {
             error!("HTTPS proxy: {e:#}");
         }
     });

@@ -156,10 +156,10 @@ impl ResolvesServerCert for Ca {
     }
 }
 
-pub fn server_config(ca: Arc<Ca>) -> rustls::ServerConfig {
+pub fn server_config(certificates: Arc<dyn ResolvesServerCert>) -> rustls::ServerConfig {
     let mut cfg = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_cert_resolver(ca);
+        .with_cert_resolver(certificates);
     cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
     cfg
 }

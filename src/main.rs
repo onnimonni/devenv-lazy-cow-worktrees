@@ -15,6 +15,7 @@
 mod client;
 mod config;
 mod daemon;
+mod devenv_proxy;
 mod github;
 mod history;
 mod lsp;
