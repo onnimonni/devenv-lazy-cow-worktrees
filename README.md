@@ -53,7 +53,7 @@ get the environment of the worktree they're in.
 | **Services** | Every checkout runs the project's services (`lazyCowTree.services`), each with its own port and `https://<worktree>.<service>.<project>.localhost` (`<service>.<project>.localhost` in the primary). The first request to a service starts it, after the services it depends on; workers without http run as dependencies. |
 | **PostgreSQL** | One PostgreSQL 18 on an APFS RAM disk, `fsync=off`. lazy-cow-tree is a proxy in front of it: the user in the connection picks the checkout, a database is created on first connect as a copy-on-write clone of its template (always `SET file_copy_method = clone` + `STRATEGY FILE_COPY`: 200 MB in ~40 ms instead of ~450 ms), and a checkout can only open its own databases; users that are no checkout's role are refused. Every checkout has its own role and password. |
 | **Redis** | One port; the password picks the checkout's own `redis-server`, on a private unix socket, started on first use and killed with the worktree. Real Redis: pub/sub, Lua, streams, `FLUSHALL` only touch that one. |
-| **HTTPS** | Local CA, websockets included. `https://lazy-cow-tree.localhost` lists everything. |
+| **HTTPS** | Local CA, websockets included. `https://lazy-cow-tree.localhost` lists everything. Or [your own domain](#trusted-certificates-on-your-own-domain) with a Let's Encrypt certificate from [trusted-https-certificate-to-artifacts-action](https://github.com/onnimonni/trusted-https-certificate-to-artifacts-action). |
 | **GitHub** | Webhook websocket (polling without repo admin rights): pushes pull every branch and merge the base branch into worktrees (conflict-free merges only, dirty worktrees skipped). A worktree whose PR merged is removed unless it has newer work or wasn't made at least 5 minutes before the merge (a new task reusing the branch name; `worktree rm` without `--force` refuses it too); `lazyCowTree.autoRemoveMerged = false` keeps them. |
 | **Migrations** | When the base branch moves: the migrate commands run in the primary checkout, then the template is refreshed from its database; they also run in every worktree the base branch was merged into, and once in each new worktree after its database is cloned (its branch may carry migrations the template lacks; done is recorded per database, so one recreated after a reboot is migrated again). A worktree's services start only once its migrations succeeded; a failure shows in `lazy-cow-tree status` and on its 502 page and is retried with a growing backoff. Migrations don't block creating, syncing or removing other worktrees. A freshly created primary database (first start, after a reboot) is migrated and seeded whatever branch the primary is on, but the template is only made from an up-to-date base branch. Until it exists, worktrees clone the primary's database instead, so they do get the primary's feature-branch migrations (then their own on top). |
 | **LSP proxy** | `lazy-cow-tree lsp -- <server>` runs one language server per worktree, routes each request by file, and drops results from other worktrees. Wrapped in the devenv shell and given to Claude Code, Codex and pi (dexter, typescript-language-server, pyright and rust-analyzer for now). |
@@ -507,6 +507,40 @@ Nothing watches the filesystem: a worktree made or deleted outside the wrapper (
 git elsewhere, `rm -rf`) is picked up by the daemon within a minute, and one made by
 plain git has no caches.
 
+## Trusted certificates on your own domain
+
+Instead of `.localhost` names and the local CA, a project can use a domain of its
+own with a Let's Encrypt certificate: no `lazy-cow-tree trust`, and every browser,
+phone simulator, Node, curl and CI job accepts it.
+
+```nix
+lazyCowTree.tls.domain = "dev.example.com";   # hostnames: <worktree>.<service>.<project>.dev.example.com
+```
+
+Set up [onnimonni/trusted-https-certificate-to-artifacts-action](https://github.com/onnimonni/trusted-https-certificate-to-artifacts-action)
+in the project's GitHub repository; lazy-cow-tree serves the certificates it keeps
+there (the newest `https-certificate` artifact, a zip with one `.pem` per domain, e.g. `_._.app.example-dev.com.pem`):
+
+- It downloads them with the token `gh` has, only from a private (or internal)
+  repository, keeps them in memory only and looks for newer ones every hour. Made
+  public later, it stops serving them.
+- A host gets the certificate naming it, else one covering it by a wildcard; expired
+  ones are skipped. A file whose certificate isn't for its key is refused, and the
+  ones read before stay in use.
+- Until a certificate covers a name, or while none can be read, the local CA serves
+  it. Hostnames set with `processes.<name>.proxy.hostname` stay as they are
+  (`.localhost`, local CA).
+
+The certificate should name, per http service, `<service>.<project>.<domain>` and
+`*.<service>.<project>.<domain>` (its worktrees'): one certificate covers every
+worktree, and no branch name ends up in the public Certificate Transparency logs.
+Also `<project>.<domain>` and common service names whether the project has them or
+not (`lazyCowTree.tls.services`, default app, web, www, api, backend, frontend,
+admin, dashboard, auth, docs, storybook, simulator, mobile, cms, mail, assets, vite,
+ws; at most 500 names in all, 100 per certificate), so a new service rarely needs a new certificate.
+`lazy-cow-tree cert show` lists what the certificate has and lacks, and prints the
+`gh variable set HTTPS_CERTIFICATE_DOMAINS …` command for the action's names.
+
 ## Commands
 
 ```sh
@@ -519,6 +553,7 @@ lazy-cow-tree status                       # projects, worktrees, services, data
 lazy-cow-tree sync                         # pull, merge, remove merged, migrate now
 lazy-cow-tree snapshot                     # template := the primary's dev database
 lazy-cow-tree trust                        # trust the local CA
+lazy-cow-tree cert show                    # lazyCowTree.tls.domain's certificate: names, expiry, what it lacks
 lazy-cow-tree down [--eject]               # stop the daemon; --eject drops the RAM disk
 lazy-cow-tree lsp -- <server> [args]
 ```

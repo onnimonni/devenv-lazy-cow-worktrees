@@ -9,6 +9,7 @@ fn co(wt: Option<&str>) -> Checkout {
         port: 20000,
         services: Services::default(),
         extra_dbs: Vec::new(),
+        domain: None,
     }
 }
 
@@ -121,6 +122,8 @@ fn project_settings_from_env() {
         no_sync: false,
         no_auto_remove: false,
         databases: Vec::new(),
+        tls_domain: None,
+        tls_services: Vec::new(),
     };
     let mut p = Project::new("/src/app".into(), settings);
     assert!(p.copy_on_write());
@@ -699,4 +702,45 @@ fn a_services_own_port_variable_reaches_every_environment() {
             .to_string();
         assert!(e.contains(why), "{e}");
     }
+}
+
+#[test]
+fn domain_hosts_and_certificate_names() {
+    let c = Checkout {
+        domain: Some("dev.example.com".into()),
+        ..with_services(r#"{"web": {"exec": "a"}, "worker": {"exec": "b", "http": false}}"#)
+    };
+    assert_eq!(c.service_host("web"), "wt.web.my-app.dev.example.com");
+    assert_eq!(c.host(), "wt.my-app.dev.example.com");
+    assert_eq!(co(None).host(), "my-app.localhost");
+
+    let mut settings: ProjectSettings = serde_json::from_value(serde_json::json!({
+        "name": "app", "port": 4000, "remote": "origin", "base": null,
+        "worktrees_dir": ".claude/worktrees", "migrate": null, "seed": null,
+        "setup": null, "services": {}, "no_sync": false, "no_auto_remove": false,
+    }))
+    .unwrap();
+    let p = Project::new("/src/app".into(), settings.clone());
+    assert!(p.tls_names().is_empty());
+    assert!(settings.tls_services.contains(&"simulator".to_string()));
+    settings.tls_domain = Some("dev.example.com".into());
+    settings.tls_services = vec!["web".into(), "simulator".into(), "Bad_".into()];
+    settings.services = r#"{"web": {"exec": "a"}, "api": {"exec": "b"},
+        "admin": {"exec": "c", "hostname": "admin.localhost"}}"#
+        .parse()
+        .unwrap();
+    let p = Project::new("/src/app".into(), settings);
+    assert_eq!(
+        p.tls_names(),
+        // `*.app.dev.example.com` covers api., simulator. and web.
+        [
+            "*.api.app.dev.example.com",
+            "*.app.dev.example.com",
+            "*.simulator.app.dev.example.com",
+            "*.web.app.dev.example.com",
+            "app.dev.example.com",
+        ]
+    );
+    assert!(parse_domain("Dev.Example.com.").is_ok_and(|d| d == "dev.example.com"));
+    assert!(parse_domain("localhost").is_err());
 }

@@ -12,9 +12,15 @@ use git2::Repository;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+mod env;
 mod services;
+mod state;
+mod tls;
 
+pub use self::env::*;
 pub use self::services::*;
+pub use self::state::*;
+pub use self::tls::*;
 
 /// Lowest port an unprivileged process may bind: 0 on macOS (for all interfaces),
 /// `net.ipv4.ip_unprivileged_port_start` on Linux (1024 unless lowered, e.g.
@@ -224,106 +230,23 @@ pub struct ProjectSettings {
     #[arg(long, env = "LAZY_COW_TREE_DATABASES", value_delimiter = ',', value_parser = parse_db_name)]
     #[serde(default)]
     pub databases: Vec<String>,
-}
-
-/// Unix seconds.
-pub fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
-pub fn home() -> PathBuf {
-    if let Some(h) = std::env::var_os("LAZY_COW_TREE_HOME") {
-        return PathBuf::from(h);
-    }
-    // Tests never see (or move) the user's real state.
-    if cfg!(test) {
-        return std::env::temp_dir().join(format!("lazy-cow-tree-test-{}", std::process::id()));
-    }
-    static HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    HOME.get_or_init(|| {
-        let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
-        state_dir(&home.join(".local/state"))
-    })
-    .clone()
-}
-
-/// `<state>/lazy-cow-tree`, moved there from the former `<state>/localforest` (CA,
-/// secret, databases) the first time; where moving fails (a RAM disk mounted inside,
-/// say) the old one stays in use.
-fn state_dir(state: &Path) -> PathBuf {
-    let new = state.join("lazy-cow-tree");
-    let old = state.join("localforest");
-    if new.exists() || !old.exists() {
-        return new;
-    }
-    match std::fs::rename(&old, &new) {
-        Ok(()) => {
-            tracing::info!("moved {} to {}", old.display(), new.display());
-            new
-        }
-        Err(e) => {
-            tracing::warn!("keeping state in {} (moving it failed: {e})", old.display());
-            old
-        }
-    }
-}
-
-pub fn socket_path() -> PathBuf {
-    home().join("lazy-cow-tree.sock")
-}
-
-/// RAM disk mount point; also PostgreSQL's unix socket directory.
-pub fn pg_dir() -> PathBuf {
-    home().join("pg")
-}
-
-/// Data and socket directory of a durable cluster (`Global::postgres_durable`).
-pub fn pg_durable_dir() -> PathBuf {
-    home().join("pg-durable")
-}
-
-pub fn ca_cert_path() -> PathBuf {
-    home().join("ca/ca.pem")
-}
-
-/// Per-machine random secret that checkout passwords derive from, created on first
-/// use (0600), so the shell hook and the daemon agree without talking.
-pub fn secret() -> Result<Vec<u8>> {
-    secret_in(&home())
-}
-
-fn secret_in(dir: &Path) -> Result<Vec<u8>> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let path = dir.join("secret");
-    if let Ok(s) = std::fs::read(&path)
-        && s.len() >= 32
-    {
-        return Ok(s);
-    }
-    std::fs::create_dir_all(dir)?;
-    let mut s = vec![0u8; 32];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut s))
-        .context("reading /dev/urandom")?;
-    // Written in full, then linked into place: a racing reader never sees it partial.
-    let tmp = dir.join(format!("secret.{}.tmp", hex::encode(&s[..8])));
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)?
-        .write_all(&s)?;
-    let linked = std::fs::hard_link(&tmp, &path);
-    let _ = std::fs::remove_file(&tmp);
-    match linked {
-        Ok(()) => Ok(s),
-        // Another process won the race.
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(std::fs::read(&path)?),
-        Err(e) => Err(e.into()),
-    }
+    /// Serve hostnames under this domain (`<worktree>.<service>.<project>.<domain>`,
+    /// its `*` A record pointing at 127.0.0.1) with the certificate in the GitHub
+    /// repository's variables (`tls::trusted`), instead of `.localhost` ones with the
+    /// local CA.
+    #[arg(long, env = "LAZY_COW_TREE_TLS_DOMAIN", value_parser = parse_domain)]
+    #[serde(default)]
+    pub tls_domain: Option<String>,
+    /// Service names the certificate covers besides the project's own services, so
+    /// adding one of them needs no new certificate.
+    #[arg(
+        long,
+        env = "LAZY_COW_TREE_TLS_SERVICES",
+        value_delimiter = ',',
+        default_value = TLS_SERVICES
+    )]
+    #[serde(default = "default_tls_services")]
+    pub tls_services: Vec<String>,
 }
 
 /// Lowercase DNS label of at most 32 characters (also fits database names).
@@ -482,6 +405,7 @@ impl Project {
             port,
             services: self.settings.services.clone(),
             extra_dbs: self.settings.databases.clone(),
+            domain: self.settings.tls_domain.clone(),
         }
     }
 }
@@ -585,13 +509,22 @@ pub struct Checkout {
     /// Names of its databases besides the main one (`ProjectSettings::databases`).
     #[serde(default)]
     pub extra_dbs: Vec<String>,
+    /// Hostnames end in it instead of `localhost` (`ProjectSettings::tls_domain`).
+    #[serde(default)]
+    pub domain: Option<String>,
 }
 
 impl Checkout {
+    /// `localhost`, or the project's own domain.
+    pub fn domain(&self) -> &str {
+        self.domain.as_deref().unwrap_or("localhost")
+    }
+
     pub fn host(&self) -> String {
+        let d = self.domain();
         match &self.worktree {
-            Some(w) => format!("{w}.{}.localhost", self.project),
-            None => format!("{}.localhost", self.project),
+            Some(w) => format!("{w}.{}.{d}", self.project),
+            None => format!("{}.{d}", self.project),
         }
     }
 
@@ -631,12 +564,12 @@ impl Checkout {
     }
 
     /// `<worktree>.<service>.<project>.localhost`, `<service>.<project>.localhost` in
-    /// the primary checkout.
+    /// the primary checkout (the project's domain instead of `localhost` when set).
     pub fn service_host(&self, name: &str) -> String {
         let base = self
             .service(name)
             .and_then(|s| s.hostname.clone())
-            .unwrap_or_else(|| format!("{name}.{}.localhost", self.project));
+            .unwrap_or_else(|| format!("{name}.{}.{}", self.project, self.domain()));
         match &self.worktree {
             Some(w) => format!("{w}.{base}"),
             None => base,
@@ -956,66 +889,6 @@ impl Checkout {
         }
         env
     }
-}
-
-/// Variables that make the framework of the app in `dir` accept its
-/// https://…localhost hostname, detected from its manifests:
-/// Phoenix (`PHX_HOST`), Rails (`RAILS_DEVELOPMENT_HOSTS`, host authorization) and
-/// Vite (`__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS`, allowed-hosts check).
-pub fn framework_env(dir: &Path, host: &str) -> Vec<(String, String)> {
-    let read = |p: PathBuf| std::fs::read_to_string(p).unwrap_or_default();
-    let mut env = Vec::new();
-    // Umbrella projects declare Phoenix in apps/*/mix.exs.
-    let mut mix = read(dir.join("mix.exs"));
-    if let Ok(apps) = std::fs::read_dir(dir.join("apps")) {
-        for app in apps.flatten() {
-            mix += &read(app.path().join("mix.exs"));
-        }
-    }
-    if mix.contains("{:phoenix,") {
-        env.push(("PHX_HOST".into(), host.into()));
-    }
-    let gemfile = read(dir.join("Gemfile"));
-    if gemfile.contains("gem \"rails\"") || gemfile.contains("gem 'rails'") {
-        env.push(("RAILS_DEVELOPMENT_HOSTS".into(), host.into()));
-    }
-    if read(dir.join("package.json")).contains("\"vite\"") {
-        env.push(("__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS".into(), host.into()));
-    }
-    env
-}
-
-/// `text` with each path starting with `from` (the primary checkout) moved to `to`
-/// (a worktree): an occurrence counts at a path boundary (start, `:`, `=`, space,
-/// quote) followed by the end, `/`, `:`, space or quote. One already under `to` (a
-/// worktree inside the primary) is left alone.
-pub fn rewrite_root(text: &str, from: &Path, to: &Path) -> String {
-    let (from, to) = (from.to_string_lossy(), to.to_string_lossy());
-    if from.is_empty() || from == to || !text.contains(from.as_ref()) {
-        return text.to_string();
-    }
-    let rest_of_to = to.strip_prefix(from.as_ref());
-    let starts = |c: char| matches!(c, ':' | '=' | ' ' | '"' | '\'' | '\n' | '\t');
-    let ends = |c: char| matches!(c, '/' | ':' | ' ' | '"' | '\'' | '\n' | '\t' | ';');
-    let mut out = String::with_capacity(text.len());
-    let mut i = 0;
-    while let Some(pos) = text[i..].find(from.as_ref()) {
-        let at = i + pos;
-        let after = at + from.len();
-        let before_ok = text[..at].chars().next_back().is_none_or(starts);
-        let tail = &text[after..];
-        let after_ok = tail.chars().next().is_none_or(ends);
-        let already = rest_of_to.is_some_and(|r| !r.is_empty() && tail.starts_with(r));
-        out.push_str(&text[i..at]);
-        if before_ok && after_ok && !already {
-            out.push_str(&to);
-        } else {
-            out.push_str(&from);
-        }
-        i = after;
-    }
-    out.push_str(&text[i..]);
-    out
 }
 
 /// Primary checkout of the repository containing `path`.

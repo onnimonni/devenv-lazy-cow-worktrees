@@ -18,6 +18,8 @@ fn settings() -> ProjectSettings {
         no_sync: false,
         no_auto_remove: false,
         databases: Vec::new(),
+        tls_domain: None,
+        tls_services: Vec::new(),
     }
 }
 

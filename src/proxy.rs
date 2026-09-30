@@ -29,7 +29,10 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
-use crate::devenv_proxy::{self, DevenvRoutes};
+use crate::{
+    devenv_proxy::{self, DevenvRoutes},
+    tls::trusted::Trusted,
+};
 
 type Body = BoxBody<Bytes, hyper::Error>;
 
@@ -198,18 +201,31 @@ async fn bind(port: u16) -> Result<TcpListener> {
     Ok(TcpListener::bind(addr).await?)
 }
 
-/// A devenv route's own certificate (its project's mkcert CA), else a leaf from
-/// lazy-cow-tree's CA.
+/// A devenv route's own certificate (its project's mkcert CA), else a project
+/// domain's Let's Encrypt one, else a leaf from lazy-cow-tree's CA (also for domain
+/// names the certificate doesn't cover yet).
 #[derive(Debug)]
 struct Certificates {
     ca: Arc<crate::tls::Ca>,
+    trusted: Arc<Trusted>,
     devenv: DevenvRoutes,
 }
 
 impl ResolvesServerCert for Certificates {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        if let Some(cert) = hello.server_name().and_then(|h| self.devenv.certificate(h)) {
-            return Some(cert);
+        if let Some(name) = hello.server_name() {
+            if let Some(cert) = self.devenv.certificate(name) {
+                return Some(cert);
+            }
+            let host = name.to_ascii_lowercase();
+            if self.trusted.owns(&host) {
+                return self.trusted.resolve(&host).or_else(|| {
+                    self.ca
+                        .leaf(&host)
+                        .map_err(|e| warn!("certificate for {host}: {e:#}"))
+                        .ok()
+                });
+            }
         }
         self.ca.resolve(hello)
     }
@@ -222,11 +238,13 @@ pub async fn serve(
     routes: Routes,
     devenv: DevenvRoutes,
     ca: Arc<crate::tls::Ca>,
+    trusted: Arc<Trusted>,
     dashboard: Dashboard,
     ensure: Ensure,
 ) -> Result<()> {
     let certificates = Arc::new(Certificates {
         ca,
+        trusted,
         devenv: devenv.clone(),
     });
     let tls = TlsAcceptor::from(Arc::new(crate::tls::server_config(certificates)));
