@@ -1035,7 +1035,12 @@ in
       LAZY_COW_TREE_SETUP = cfg.setup;
     };
 
-    processes.lazy-cow-tree.exec = "${exe} serve";
+    # A daemon started in the background can't read gh's token from the macOS keychain
+    # (only `security`, which gh uses, may); gh can. It registers with the project, so the
+    # daemon uses each project's own token, whichever project started it.
+    processes.lazy-cow-tree.exec = ''
+      GH_TOKEN="''${GH_TOKEN:-$(${lib.getExe pkgs.gh} auth token 2>/dev/null)}" exec ${exe} serve
+    '';
 
     enterShell =
       if cfg.shellHook.enable then

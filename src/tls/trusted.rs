@@ -7,7 +7,7 @@
 //! private. The daemon keeps the certificates in memory; names none of them covers
 //! get a leaf of the local CA.
 
-use std::{collections::HashMap, io::Read, path::Path, sync::Arc};
+use std::{collections::HashMap, io::Read, sync::Arc};
 
 use anyhow::{Context, Result, anyhow, bail};
 use parking_lot::Mutex;
@@ -104,9 +104,10 @@ pub fn leaf(der: &[u8]) -> Result<Leaf> {
     })
 }
 
-/// The GitHub repository of the checkout's `remote`, with the token gh has.
-pub fn repo_client(root: &Path, remote: &str) -> Result<github::Client> {
-    let repo = git2::Repository::open(root)?
+/// The GitHub repository of the project's remote, with its token.
+pub fn repo_client(project: &crate::config::Project) -> Result<github::Client> {
+    let remote = &project.settings.remote;
+    let repo = git2::Repository::open(&project.root)?
         .find_remote(remote)?
         .url()
         .ok()
@@ -116,7 +117,7 @@ pub fn repo_client(root: &Path, remote: &str) -> Result<github::Client> {
                 "the certificate lives in a GitHub repository's artifacts: no GitHub remote {remote}"
             )
         })?;
-    let token = github::auth_token(&repo.host)?;
+    let token = github::auth_token(&repo.host, &project.env)?;
     github::Client::new(repo, token)
 }
 

@@ -253,6 +253,7 @@ impl Daemon {
         }
         Ok(Status {
             pid: std::process::id(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
             projects: out,
             pg_port: self.global.pg_port,
             redis_port: self.global.redis_port,
