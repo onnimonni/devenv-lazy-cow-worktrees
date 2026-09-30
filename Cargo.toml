@@ -1,6 +1,6 @@
 [package]
 name = "lazy-cow-tree"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 description = "Worktrees, databases, HTTPS hosts, Redis and LSP for parallel coding agents"
 license = "MIT"

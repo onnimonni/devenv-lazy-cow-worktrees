@@ -30,6 +30,10 @@ pub struct Service {
     /// Port = the checkout's base port + this (0-9) [default: position by name].
     #[serde(default)]
     pub port_offset: Option<u16>,
+    /// A variable of its own holding its port (e.g. `WEB_PORT`), besides PORT and
+    /// LAZY_COW_TREE_<SERVICE>_PORT, exported to every environment of the checkout.
+    #[serde(default)]
+    pub port_env: Option<String>,
     // FIXME: every service of a checkout shares its one DATABASE_URL and REDIS_URL.
     // Support services with databases / redis-servers of their own (e.g. `postgres` /
     // `redis` flags: <project>_<service>_dev_<worktree> cloned from
@@ -270,6 +274,20 @@ impl Services {
             generated.insert(env_var_name(name), format!("service {name}"));
         }
         let mut hosts: BTreeMap<&str, &str> = BTreeMap::new();
+        for (svc, s) in &self.0 {
+            if let Some(env) = &s.port_env {
+                let what = format!("service {svc}");
+                if !valid_env_name(env) {
+                    return Err(format!("{what}: port env {env} is not [A-Z_][A-Z0-9_]*"));
+                }
+                if RESERVED_ENV.contains(&env.as_str()) || env.starts_with("LAZY_COW_TREE_") {
+                    return Err(format!("{what}: port env {env} is set by lazy-cow-tree"));
+                }
+                if let Some(other) = envs.insert(env.clone(), what.clone()) {
+                    return Err(format!("{other} and {what} share env {env}"));
+                }
+            }
+        }
         for (svc, s) in &self.0 {
             for (name, p) in &s.ports {
                 let what = format!("port {svc}.{name}");

@@ -673,3 +673,30 @@ fn extra_databases_per_checkout() {
         parse_db_name("cms").is_ok() && parse_db_name("Cms").is_err() && parse_db_name("").is_err()
     );
 }
+
+#[test]
+fn a_services_own_port_variable_reaches_every_environment() {
+    let c = with_services(
+        r#"{"care": {"exec": "mix phx.server", "default": true},
+            "web": {"exec": "pnpm dev", "portEnv": "WEB_PORT"}}"#,
+    );
+    let (care_port, web_port) = (
+        c.service_port("care").to_string(),
+        c.service_port("web").to_string(),
+    );
+    let shell: BTreeMap<_, _> = c.env(&global()).into_iter().collect();
+    assert_eq!(
+        (&shell["PORT"], &shell["WEB_PORT"]),
+        (&care_port, &web_port)
+    );
+    let care: BTreeMap<_, _> = c.service_env(&global(), Some("care")).into_iter().collect();
+    assert_eq!(care["WEB_PORT"], web_port);
+
+    for (env, why) in [("PORT", "set by lazy-cow-tree"), ("web-port", "is not")] {
+        let e = format!(r#"{{"web": {{"exec": "x", "portEnv": "{env}"}}}}"#)
+            .parse::<Services>()
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains(why), "{e}");
+    }
+}

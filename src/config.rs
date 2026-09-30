@@ -922,6 +922,9 @@ impl Checkout {
                 format!("LAZY_COW_TREE_{var}_PORT"),
                 self.service_port(n).to_string(),
             ));
+            if let Some(own) = &s.port_env {
+                env.push((own.clone(), self.service_port(n).to_string()));
+            }
             if s.http {
                 env.push((
                     format!("LAZY_COW_TREE_{var}_URL"),
