@@ -346,8 +346,8 @@ let
         else
           "${lib.toUpper (lib.replaceStrings [ "-" ] [ "_" ] port)}_PORT";
       extraPorts = lib.filter (port: port != httpPort) portNames;
-      # The http port's own variables (e.g. `env.SIM_PORT = toString ports.http.value`)
-      # follow PORT, the checkout's http port.
+      # The http port's own variable (e.g. `env.WEB_PORT = toString ports.http.value`),
+      # set per checkout like PORT, in its shells too.
       httpAliases =
         if httpPort == null then
           [ ]
@@ -377,11 +377,8 @@ let
     lib.warnIf (ignored != [ ])
       "lazy-cow-tree: processes.${name}.after: ${lib.concatStringsSep ", " ignored} ignored (only other processes lazy-cow-tree runs are started first)"
       {
-        exec = toString (
-          pkgs.writeShellScript "lazy-cow-tree-${name}" (
-            lib.concatMapStrings (v: "export ${v}=\"$PORT\"\n") httpAliases + p.exec
-          )
-        );
+        exec = toString (pkgs.writeShellScript "lazy-cow-tree-${name}" p.exec);
+        portEnv = if httpAliases == [ ] then null else builtins.head httpAliases;
         inherit cwd env;
         http = httpPort != null;
         ports = lib.genAttrs extraPorts (port: {
@@ -529,12 +526,18 @@ let
       default = mkOption {
         type = types.bool;
         default = false;
-        description = "The service `lazy-cow-tree env` and `lazy-cow-tree service` pick without a name (default: `web`, else the first http service).";
+        description = "The service whose PORT the shells get and `lazy-cow-tree service` picks without a name (default: `web`, else the first http service).";
       };
       portOffset = mkOption {
         type = types.nullOr (types.ints.between 0 9);
         default = null;
         description = "PORT = the checkout's base port + this (default: position by name).";
+      };
+      portEnv = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "WEB_PORT";
+        description = "A variable of its own holding its port, besides PORT, in every environment of the checkout (shells too). Derived from a process's `env.<NAME> = toString ports.http.value`.";
       };
       # FIXME: all services of a checkout share its DATABASE_URL and REDIS_URL. Add
       # `postgres` / `redis` options for a database / redis-server of their own.

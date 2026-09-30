@@ -379,6 +379,7 @@ Service options:
 | `http` | `true` | listens on `$PORT`, gets a hostname, started by its first request; `false`: only started as a dependency |
 | `default` | `web`, else first http service | what the shell hook and `lazy-cow-tree service` pick without a name |
 | `portOffset` | position by name | `PORT` = checkout base port + offset (0–9) |
+| `portEnv` | a process's `env.<NAME> = toString ports.http.value` | a variable of its own holding its port (e.g. `WEB_PORT`), set like `PORT` per checkout in every shell and service, so it reaches its port when `PORT` is another service's |
 | `migrate` | none | migrate/seed command for the checkout's database, run in its `cwd` after `lazyCowTree.migrate` |
 | `dependsOn` | `[]` | started first |
 | `env` | `{}` | extra environment |
