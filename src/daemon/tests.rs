@@ -148,3 +148,31 @@ fn pg_access_fails_closed() {
     assert!(pg_access("shop-dev-x", Some(&a), "shop_dev_dev_x", &both).is_err());
     assert!(pg_access("shop-dev-x", Some(&b), "shop_dev_dev_x", &both).is_err());
 }
+
+#[test]
+fn newer_versions_take_over() {
+    assert!(older("", "0.4.1"));
+    assert!(older("0.1.0", "0.4.1"));
+    assert!(older("0.4.0", "0.4.1"));
+    assert!(older("0.9.9", "0.10.0"));
+    assert!(!older("0.4.1", "0.4.1"));
+    assert!(!older("0.5.0", "0.4.1"));
+}
+
+#[test]
+fn state_is_written_for_its_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("state.json");
+    std::fs::write(&path, "{}").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    write_private(&path, b"{\"projects\": []}").unwrap();
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "{\"projects\": []}"
+    );
+}

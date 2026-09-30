@@ -52,15 +52,18 @@ pub fn parse_remote_url(url: &str) -> Option<RepoId> {
 }
 
 /// Same lookup order as go-gh: env vars, the keyring entry `gh` writes, then its
-/// hosts.yml (where gh keeps the token without a keyring, e.g. on Linux).
-pub fn auth_token(host: &str) -> Result<String> {
+/// hosts.yml (where gh keeps the token without a keyring, e.g. on Linux). `env` (a
+/// registering project's environment) comes before the daemon's own: each project uses
+/// its own token, whichever project started the daemon.
+pub fn auth_token(host: &str, env: &[(String, String)]) -> Result<String> {
     let env_vars: &[&str] = if host == "github.com" {
         &["GH_TOKEN", "GITHUB_TOKEN"]
     } else {
         &["GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"]
     };
     for var in env_vars {
-        if let Ok(t) = std::env::var(var)
+        let own = env.iter().find(|(k, _)| k == var).map(|(_, v)| v.clone());
+        if let Some(t) = own.or_else(|| std::env::var(var).ok())
             && !t.trim().is_empty()
         {
             return Ok(t.trim().to_string());

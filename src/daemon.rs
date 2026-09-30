@@ -235,6 +235,21 @@ fn state_file() -> PathBuf {
     config::home().join("state.json")
 }
 
+/// Written for its owner only (0600, also when it existed): the registered projects'
+/// environments hold their secrets, GH_TOKEN included.
+fn write_private(path: &Path, data: &[u8]) -> Result<()> {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt, os::unix::fs::PermissionsExt};
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    f.write_all(data)?;
+    Ok(())
+}
+
 fn load_saved() -> Saved {
     std::fs::read(state_file())
         .ok()
@@ -296,6 +311,9 @@ pub struct ProjectStatus {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Status {
     pub pid: u32,
+    /// Its lazy-cow-tree version (empty from daemons before 0.4.1).
+    #[serde(default)]
+    pub version: String,
     pub projects: Vec<ProjectStatus>,
     pub pg_port: u16,
     pub redis_port: u16,
@@ -365,7 +383,7 @@ impl Daemon {
         };
         if let Err(e) = serde_json::to_vec_pretty(&saved)
             .map_err(anyhow::Error::from)
-            .and_then(|b| Ok(std::fs::write(state_file(), b)?))
+            .and_then(|b| write_private(&state_file(), &b))
         {
             warn!("saving state: {e:#}");
         }
@@ -491,7 +509,7 @@ fn github_client(project: &Project) -> Result<(github::Client, String)> {
         .unwrap_or_default();
     let repo =
         github::parse_remote_url(&url).ok_or_else(|| anyhow!("{url:?} is not a GitHub remote"))?;
-    let token = github::auth_token(&repo.host)?;
+    let token = github::auth_token(&repo.host, &project.env)?;
     Ok((github::Client::new(repo, token.clone())?, token))
 }
 
@@ -566,7 +584,7 @@ async fn domain_certificate(trusted: Arc<Trusted>, rt: Arc<ProjectRt>) {
     let mut current: Option<Vec<u8>> = None;
     loop {
         let run = async {
-            let gh = tls::trusted::repo_client(&p.root, &p.settings.remote)?;
+            let gh = tls::trusted::repo_client(p)?;
             if !gh.is_private().await? {
                 trusted.clear(&domain);
                 current = None;
@@ -820,9 +838,21 @@ fn redis_key(project: &Project, c: &Checkout) -> String {
 }
 
 async fn daemon_alive() -> bool {
-    crate::client::get::<serde_json::Value>("/status")
+    running_version().await.is_some()
+}
+
+/// The running daemon's version ("" before 0.4.1), None when none runs.
+async fn running_version() -> Option<String> {
+    let status = crate::client::get::<serde_json::Value>("/status")
         .await
-        .is_ok()
+        .ok()?;
+    Some(status["version"].as_str().unwrap_or_default().to_string())
+}
+
+/// `version` (`major.minor.patch`, "" for unknown) is older than `than`.
+fn older(version: &str, than: &str) -> bool {
+    let parse = |v: &str| -> Vec<u64> { v.split('.').map(|n| n.parse().unwrap_or(0)).collect() };
+    parse(version) < parse(than)
 }
 
 /// `lazy-cow-tree serve`: become the daemon, or register with the running one and take
@@ -831,6 +861,29 @@ pub async fn serve(global: Global, project: Option<Project>) -> Result<()> {
     std::fs::create_dir_all(config::home())?;
     let mut registered = false;
     loop {
+        if let Some(running) = running_version().await
+            && older(&running, env!("CARGO_PKG_VERSION"))
+        {
+            // Projects of other repositories may run an older lazy-cow-tree: the newest
+            // serves all of them (they're saved, and come back with it), so features of
+            // a newer one don't silently go missing.
+            info!(
+                "taking over from the lazy-cow-tree {} daemon",
+                if running.is_empty() {
+                    "older"
+                } else {
+                    &running
+                }
+            );
+            let _ = crate::client::post::<serde_json::Value>("/shutdown", &()).await;
+            for _ in 0..300 {
+                if !daemon_alive().await {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            registered = false;
+        }
         if daemon_alive().await {
             if let Some(p) = &project
                 && !registered
