@@ -780,6 +780,20 @@ in
       default = null;
       description = "Project name (hostnames, database prefix); default: the checkout's directory name.";
     };
+    tls = {
+      domain = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "dev.example.com";
+        description = "Domain whose `*` A record points at 127.0.0.1: hostnames become https://<worktree>.<service>.<project>.<domain> with the Let's Encrypt certificate github.com/onnimonni/trusted-https-certificate-to-artifacts-action keeps as the GitHub repository's https-certificate Actions artifact (read only while the repository is private), instead of .localhost ones with the local CA. Until it has one, the local CA serves them. `lazy-cow-tree cert show` prints the names it needs.";
+      };
+      services = mkOption {
+        type = types.nullOr (types.listOf types.str);
+        default = null;
+        example = [ "web" "api" ];
+        description = "Service names the certificate covers (`<name>.<project>.<domain>` and its worktrees') besides the project's own http services, so adding one needs no new certificate. Default: common ones (app, web, www, api, backend, frontend, admin, dashboard, auth, docs, storybook, simulator, mobile, cms, mail, assets, vite, ws).";
+      };
+    };
     port = mkOption {
       type = types.port;
       default = 4000;
@@ -1006,6 +1020,12 @@ in
     // lib.optionalAttrs (cfg.httpsPort != null) { LAZY_COW_TREE_HTTPS_PORT = toString cfg.httpsPort; }
     // lib.optionalAttrs (cfg.httpPort != null) { LAZY_COW_TREE_HTTP_PORT = toString cfg.httpPort; }
     // lib.optionalAttrs (cfg.project != null) { LAZY_COW_TREE_PROJECT = cfg.project; }
+    // lib.optionalAttrs (cfg.tls.domain != null) {
+      LAZY_COW_TREE_TLS_DOMAIN = cfg.tls.domain;
+    }
+    // lib.optionalAttrs (cfg.tls.domain != null && cfg.tls.services != null) {
+      LAZY_COW_TREE_TLS_SERVICES = lib.concatStringsSep "," cfg.tls.services;
+    }
     # Under `devenv test` the checkout under test migrates itself.
     // lib.optionalAttrs (cfg.migrate != null && !config.devenv.isTesting) {
       LAZY_COW_TREE_MIGRATE = cfg.migrate;

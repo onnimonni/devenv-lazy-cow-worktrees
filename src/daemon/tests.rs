@@ -68,6 +68,7 @@ fn co(wt: Option<&str>) -> Checkout {
         port: 20000,
         services: Default::default(),
         extra_dbs: Vec::new(),
+        domain: None,
     }
 }
 

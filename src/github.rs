@@ -8,7 +8,7 @@ use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest, http::HeaderValue};
 use tracing::{debug, info, warn};
 
@@ -155,6 +155,78 @@ impl Client {
             .bearer_auth(&self.token)
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
+    }
+
+    fn repo_url(&self) -> String {
+        format!("{}/repos/{}/{}", self.api, self.repo.owner, self.repo.name)
+    }
+
+    /// Whether the repository is private (or internal): what's only for its
+    /// collaborators (an artifact holding a key, say) must not come from a public one,
+    /// whose artifacts anyone can download.
+    pub async fn is_private(&self) -> Result<bool> {
+        let repo: Value = self
+            .req(reqwest::Method::GET, &self.repo_url())
+            .send()
+            .await?
+            .error_for_status()
+            .with_context(|| format!("reading {}", self.repo))?
+            .json()
+            .await?;
+        repo["private"]
+            .as_bool()
+            .ok_or_else(|| anyhow!("{}: no visibility in {repo}", self.repo))
+    }
+
+    /// The newest unexpired Actions artifact called `name` (a zip), at most `max`
+    /// bytes. Collaborators can read them.
+    pub async fn artifact(&self, name: &str, max: usize) -> Result<Option<Vec<u8>>> {
+        let list: Value = self
+            .req(
+                reqwest::Method::GET,
+                &format!("{}/actions/artifacts", self.repo_url()),
+            )
+            .query(&[("name", name), ("per_page", "100")])
+            .send()
+            .await?
+            .error_for_status()
+            .with_context(|| format!("listing artifacts of {}", self.repo))?
+            .json()
+            .await?;
+        let newest = list["artifacts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|a| a["expired"] == false)
+            .max_by_key(|a| a["created_at"].as_str().unwrap_or_default().to_string());
+        let Some(id) = newest.and_then(|a| a["id"].as_u64()) else {
+            return Ok(None);
+        };
+        if newest
+            .and_then(|a| a["size_in_bytes"].as_u64())
+            .unwrap_or(0)
+            > max as u64
+        {
+            bail!("artifact {name} of {} is over {max} bytes", self.repo);
+        }
+        // Redirects to blob storage; reqwest drops the token on the way.
+        let mut resp = self
+            .req(
+                reqwest::Method::GET,
+                &format!("{}/actions/artifacts/{id}/zip", self.repo_url()),
+            )
+            .send()
+            .await?
+            .error_for_status()
+            .with_context(|| format!("downloading artifact {name} of {}", self.repo))?;
+        let mut body = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            body.extend_from_slice(&chunk);
+            if body.len() > max {
+                bail!("artifact {name} of {} is over {max} bytes", self.repo);
+            }
+        }
+        Ok(Some(body))
     }
 
     fn hooks_url(&self) -> String {

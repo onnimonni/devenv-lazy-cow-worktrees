@@ -49,7 +49,7 @@ use crate::{
     redis::Redis,
     server::Servers,
     sync::Syncer,
-    tls::Ca,
+    tls::{self, Ca, trusted::Trusted},
     worktree::{self, Safety},
 };
 
@@ -71,6 +71,8 @@ pub struct Daemon {
     redis: Arc<Redis>,
     servers: Arc<Servers>,
     routes: Routes,
+    /// Projects' domain certificates, served by the proxy.
+    trusted: Arc<Trusted>,
     projects: Mutex<BTreeMap<PathBuf, Arc<ProjectRt>>>,
     shutdown: Notify,
     /// Checkouts (by project root) whose `start = "up"` services to start, drained
@@ -467,6 +469,13 @@ impl Daemon {
         if let Some(gh) = rt.gh.clone() {
             tasks.push(tokio::spawn(watch_github(rt.clone(), gh)));
         }
+        if let Some(domain) = &rt.project.settings.tls_domain {
+            self.trusted.register(domain);
+            tasks.push(tokio::spawn(domain_certificate(
+                self.trusted.clone(),
+                rt.clone(),
+            )));
+        }
         rt.tasks.lock().extend(tasks);
         rt.trigger(&rt.pending.migrate);
         rt.trigger(&rt.pending.merged);
@@ -543,6 +552,84 @@ async fn ticker(rt: Arc<ProjectRt>) {
             rt.pending.merged.store(true, Ordering::SeqCst);
             rt.trigger(&rt.pending.sync);
         }
+    }
+}
+
+/// Its domain's certificate and key, from the GitHub repository's artifact (only
+/// while it's private), for the proxy: read now and every hour, so a renewal by the
+/// repository's workflow reaches the proxy within one.
+async fn domain_certificate(trusted: Arc<Trusted>, rt: Arc<ProjectRt>) {
+    let p = &rt.project;
+    let Some(domain) = p.settings.tls_domain.clone() else {
+        return;
+    };
+    let mut current: Option<Vec<u8>> = None;
+    loop {
+        let run = async {
+            let gh = tls::trusted::repo_client(&p.root, &p.settings.remote)?;
+            if !gh.is_private().await? {
+                trusted.clear(&domain);
+                current = None;
+                anyhow::bail!(
+                    "{} is public: stopped serving its certificates and won't read them",
+                    gh.repo
+                );
+            }
+            let Some(zip) = gh
+                .artifact(tls::trusted::ARTIFACT, tls::trusted::MAX_ARTIFACT_BYTES)
+                .await?
+            else {
+                anyhow::bail!(
+                    "no {} artifact in {} yet: set up github.com/onnimonni/trusted-https-certificate-to-artifacts-action there",
+                    tls::trusted::ARTIFACT,
+                    gh.repo
+                );
+            };
+            if current.as_ref() == Some(&zip) {
+                return Ok(());
+            }
+            let certs = tls::trusted::certificates(&zip)
+                .with_context(|| format!("{} of {}", tls::trusted::ARTIFACT, gh.repo))?;
+            let now = tls::trusted::now();
+            let missing: Vec<_> = p
+                .tls_names()
+                .into_iter()
+                .filter(|n| {
+                    !certs
+                        .iter()
+                        .any(|c| c.leaf.valid_at(now) && c.leaf.covers(n))
+                })
+                .collect();
+            if !missing.is_empty() {
+                warn!(
+                    "{}: the certificates lack {} (the local CA serves them): `lazy-cow-tree cert show`",
+                    p.name,
+                    missing.join(", ")
+                );
+            }
+            for c in &certs {
+                info!(
+                    "{}: {} for {} until {}",
+                    p.name,
+                    c.file,
+                    c.leaf.names.join(", "),
+                    time::OffsetDateTime::from_unix_timestamp(c.leaf.not_after)
+                        .map(|t| t.date().to_string())
+                        .unwrap_or_default()
+                );
+            }
+            trusted.set(&domain, certs);
+            current = Some(zip);
+            anyhow::Ok(())
+        };
+        let minutes = match run.await {
+            Ok(()) => 60,
+            Err(e) => {
+                warn!("{}: {domain} certificate: {e:#}", p.name);
+                10
+            }
+        };
+        tokio::time::sleep(Duration::from_secs(minutes * 60)).await;
     }
 }
 
@@ -764,10 +851,14 @@ pub async fn serve(global: Global, project: Option<Project>) -> Result<()> {
         let _ = std::fs::remove_file(&socket);
         let listener = match UnixListener::bind(&socket) {
             Ok(l) => l,
-            Err(e) => {
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                 debug!("another daemon is starting ({e}); waiting");
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 continue;
+            }
+            // A path over the socket limit (104 bytes on macOS), a missing directory: waiting won't help.
+            Err(e) => {
+                return Err(e).with_context(|| format!("control socket {}", socket.display()));
             }
         };
         return lead(global, project, listener).await;
@@ -789,6 +880,7 @@ fn start_proxy(
     global: &Global,
     routes: Routes,
     ca: Arc<Ca>,
+    trusted: Arc<Trusted>,
     daemon: Arc<std::sync::OnceLock<std::sync::Weak<Daemon>>>,
 ) {
     let get = move || daemon.get().and_then(std::sync::Weak::upgrade);
@@ -832,7 +924,7 @@ fn start_proxy(
         });
     }
     tokio::spawn(async move {
-        if let Err(e) = proxy::serve(https, http, routes, devenv, ca, dash, ensure).await {
+        if let Err(e) = proxy::serve(https, http, routes, devenv, ca, trusted, dash, ensure).await {
             error!("HTTPS proxy: {e:#}");
         }
     });
@@ -849,7 +941,8 @@ async fn lead(global: Global, project: Option<Project>, listener: UnixListener) 
     // disk and initdb): `devenv up` gives a proxy it starts five seconds.
     let routes = Routes::default();
     let daemon: Arc<std::sync::OnceLock<std::sync::Weak<Daemon>>> = Default::default();
-    start_proxy(&global, routes.clone(), ca, daemon.clone());
+    let trusted = Arc::new(Trusted::default());
+    start_proxy(&global, routes.clone(), ca, trusted.clone(), daemon.clone());
     // The real server: unix socket only, one port above the proxy's.
     let pg = Postgres::start(
         if global.postgres_durable {
@@ -876,6 +969,7 @@ async fn lead(global: Global, project: Option<Project>, listener: UnixListener) 
         redis: Arc::new(Redis::new(crate::redis::dir(), global.redis_server.clone())),
         servers: Default::default(),
         routes: routes.clone(),
+        trusted,
         projects: Mutex::new(BTreeMap::new()),
         shutdown: Notify::new(),
         up_queue: Mutex::new(Vec::new()),

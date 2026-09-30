@@ -133,6 +133,7 @@ fn dependencies_first() {
             .parse::<Services>()
             .unwrap(),
         extra_dbs: Vec::new(),
+        domain: None,
     };
     let mut order = Vec::new();
     visit(&c, "web", &mut BTreeSet::new(), &mut order).unwrap();

@@ -1,5 +1,6 @@
 //! Local certificate authority for https://*.localhost. The CA is created once in
 //! the state directory; leaf certificates are issued in memory per SNI name.
+//! Projects with a domain get a Let's Encrypt certificate instead (`trusted`).
 
 use std::{collections::HashMap, path::Path, sync::Arc};
 
@@ -15,6 +16,8 @@ use rustls::{
     sign::CertifiedKey,
 };
 use time::{Duration, OffsetDateTime};
+
+pub mod trusted;
 
 pub struct Ca {
     issuer: Issuer<'static, KeyPair>,
@@ -95,7 +98,7 @@ impl Ca {
         &self.cert_der
     }
 
-    fn leaf(&self, host: &str) -> Result<Arc<CertifiedKey>> {
+    pub fn leaf(&self, host: &str) -> Result<Arc<CertifiedKey>> {
         if let Some(k) = self.leaves.lock().get(host) {
             return Ok(k.clone());
         }

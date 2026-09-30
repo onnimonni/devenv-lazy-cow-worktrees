@@ -115,6 +115,9 @@ enum Cmd {
     },
     /// Trust the local CA for https://*.localhost (macOS keychain; asks for your password).
     Trust,
+    /// The Let's Encrypt certificate of the project's domain (`lazyCowTree.tls`).
+    #[command(subcommand)]
+    Cert(CertCmd),
     /// Stop the daemon; --eject also drops the RAM disk with every database.
     Down {
         #[arg(long)]
@@ -153,6 +156,20 @@ enum WorktreeCmd {
     },
     /// List worktrees.
     List,
+}
+
+#[derive(Subcommand)]
+enum CertCmd {
+    /// The certificates of the project's domain, the GitHub repository's newest
+    /// https-certificate artifact (only read while the repository is private):
+    /// their names and expiry, the names the project needs, and the
+    /// HTTPS_CERTIFICATE_DOMAINS value for the repository's certificate workflow.
+    Show {
+        #[command(flatten)]
+        project: ProjectSettings,
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -556,6 +573,54 @@ async fn main() -> Result<()> {
             eprintln!("trusted {}", config::ca_cert_path().display());
             eprintln!(
                 "Firefox and Node use their own stores: NODE_EXTRA_CA_CERTS is in the devenv shell."
+            );
+            Ok(())
+        }
+        Cmd::Cert(CertCmd::Show { project, path }) => {
+            let p = project_for(&path, project)?;
+            let wanted = p.tls_names();
+            if wanted.is_empty() {
+                anyhow::bail!("no lazyCowTree.tls.domain (LAZY_COW_TREE_TLS_DOMAIN)");
+            }
+            let gh = tls::trusted::repo_client(&p.root, &p.settings.remote)?;
+            let now = tls::trusted::now();
+            let mut have = Vec::new();
+            match tls::trusted::fetch(&gh).await? {
+                Some(zip) => {
+                    for c in tls::trusted::certificates(&zip)? {
+                        let expires = time::OffsetDateTime::from_unix_timestamp(c.leaf.not_after)?;
+                        let state = if c.leaf.valid_at(now) {
+                            "expires"
+                        } else {
+                            "EXPIRED"
+                        };
+                        println!(
+                            "{}: {} names, {state} {expires}",
+                            c.file,
+                            c.leaf.names.len()
+                        );
+                        if c.leaf.valid_at(now) {
+                            have.push(c.leaf);
+                        }
+                    }
+                }
+                None => println!("no {} artifact in {} yet", tls::trusted::ARTIFACT, gh.repo),
+            }
+            let missing: Vec<_> = wanted
+                .iter()
+                .filter(|n| !have.iter().any(|leaf| leaf.covers(n)))
+                .collect();
+            if !missing.is_empty() {
+                println!("missing:");
+                for n in missing {
+                    println!("  {n}");
+                }
+            }
+            println!(
+                "\ngh variable set {} --repo {} --body '{}'",
+                tls::trusted::DOMAINS_VARIABLE,
+                gh.repo,
+                tls::trusted::brace_names(&wanted).join(",")
             );
             Ok(())
         }
