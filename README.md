@@ -340,7 +340,7 @@ FIXME: other language servers. devenv's `languages.*.lsp` has only `enable` and
 | option | default | |
 |---|---|---|
 | `lazyCowTree.project` | directory name | hostnames, database prefix, role name |
-| `lazyCowTree.port` | `4000` | base port of the primary checkout's services |
+| `lazyCowTree.port` | `4000` | base port of the primary checkout's services; taken by another project or process, the next free block of 10 above it (recorded in `.git/lazy-cow-tree-primary-port`), or an error with devenv's `strict_ports: true` |
 | `lazyCowTree.migrate` | none | migrate command: primary when the base branch moves (then the template is refreshed) or its database was just created, new worktrees once, worktrees the base branch was merged into |
 | `lazyCowTree.seed` | none | seed command: primary, after `migrate`, when its database was just created; worktrees get seeded data via the template |
 | `lazyCowTree.setup` | none | runs once in every new checkout (lazy-cow-tree, `git worktree add`, Claude Code), e.g. `mix deps.get`; in the primary checkout too (a fresh clone has no `deps/`), before its first migrate, seed or service start. Done is a `lazy-cow-tree-setup` marker in the checkout's git dir; a failure in the primary shows in `lazy-cow-tree status` and is retried with the migrations' backoff; again before a `restartOnChange` restart for changed dependency files, so keep it idempotent |
@@ -441,7 +441,7 @@ needed), e.g. for services `web` (default), `api` and `worker`:
 
 | | primary | worktree `fix-login` |
 |---|---|---|
-| `PORT` | base (`lazyCowTree.port`) + offset | base (20000–28990: hashed from the name, else the next slot no other worktree has; recorded in its git admin dir as `lazy-cow-tree-port`) + offset |
+| `PORT` | base (`lazyCowTree.port`, else the next free block of 10) + offset | base (20000–28990: hashed from the name, else the next slot no other worktree or process has; recorded in its git admin dir as `lazy-cow-tree-port`) + offset |
 | `LAZY_COW_TREE_URL` | `web.myapp.localhost` | `fix-login.web.myapp.localhost` |
 | `DATABASE_URL`, `PG*` | `myapp_dev` as role `myapp` | `myapp_dev_fix_login` as role `myapp--fix-login` |
 | `TEST_DATABASE_URL` | `myapp_test` | `myapp_test_fix_login` |
