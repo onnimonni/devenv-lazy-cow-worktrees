@@ -395,6 +395,20 @@ impl Daemon {
                 other.project.root.display()
             );
         }
+        // A checkout already registered may be running its services on its ports.
+        let fresh = !self.projects.lock().contains_key(&root);
+        let others: Vec<Project> = self
+            .projects
+            .lock()
+            .values()
+            .filter(|p| p.project.root != root)
+            .map(|p| p.project.clone())
+            .collect();
+        let (p, strict) = (project.clone(), config::strict_ports(&root));
+        tokio::task::spawn_blocking(move || {
+            worktree::assign_primary_port(&p, &others, fresh, strict)
+        })
+        .await??;
         let base = project
             .settings
             .base

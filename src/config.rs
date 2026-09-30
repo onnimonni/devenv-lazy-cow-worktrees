@@ -1,5 +1,5 @@
 //! Paths, settings and the naming scheme every part of the service shares. Names and
-//! ports are derived from a checkout's path alone, so `lazy-cow-tree env` in a worktree
+//! ports are derived from a checkout's path alone, so the shell hook in a worktree
 //! computes the same values as the daemon without asking it.
 
 use std::{
@@ -60,7 +60,7 @@ pub struct Global {
     )]
     pub pg_port: u16,
     /// Redis port on 127.0.0.1. The password picks the checkout: each has its own
-    /// redis-server behind it (REDIS_URL in `lazy-cow-tree env`).
+    /// redis-server behind it (REDIS_URL in the devenv shell).
     #[arg(
         long,
         env = "LAZY_COW_TREE_REDIS_PORT",
@@ -289,7 +289,7 @@ pub fn ca_cert_path() -> PathBuf {
 }
 
 /// Per-machine random secret that checkout passwords derive from, created on first
-/// use (0600), so `lazy-cow-tree env` and the daemon agree without talking.
+/// use (0600), so the shell hook and the daemon agree without talking.
 pub fn secret() -> Result<Vec<u8>> {
     secret_in(&home())
 }
@@ -459,11 +459,13 @@ impl Project {
     }
 
     /// A worktree's port is the one recorded in its git admin dir (the daemon records
-    /// them, `worktree::assign_ports`), else its hashed slot. Reads only: `lazy-cow-tree
-    /// env` computes an unrecorded one with `worktree::plan_ports` first.
+    /// them, `worktree::assign_ports`), else its hashed slot; the primary's is the one
+    /// the daemon recorded for its setting (`worktree::assign_primary_port`), else the
+    /// setting. Reads only: the shell hook computes an unrecorded worktree's with
+    /// `worktree::plan_ports` first.
     pub fn checkout(&self, worktree: Option<&str>, path: PathBuf) -> Checkout {
         let port = match worktree {
-            None => self.settings.port,
+            None => crate::worktree::primary_port(&self.root, self.settings.port),
             Some(w) => crate::worktree::recorded_port(&path)
                 .unwrap_or_else(|| worktree_port(&self.name, w)),
         };
@@ -482,6 +484,24 @@ impl Project {
             extra_dbs: self.settings.databases.clone(),
         }
     }
+}
+
+/// devenv's `strict_ports` (top level of devenv.yaml; devenv.local.yaml wins): a taken
+/// port is an error instead of a move to the next free one.
+pub fn strict_ports(root: &Path) -> bool {
+    ["devenv.yaml", "devenv.local.yaml"]
+        .iter()
+        .fold(false, |acc, f| {
+            std::fs::read_to_string(root.join(f))
+                .ok()
+                .and_then(|t| {
+                    t.lines().find_map(|l| {
+                        l.strip_prefix("strict_ports:")
+                            .map(|v| v.split('#').next().unwrap_or("").trim() == "true")
+                    })
+                })
+                .unwrap_or(acc)
+        })
 }
 
 /// Worktree base ports: 900 slots of 10 (a worktree's services use its base port and
@@ -642,6 +662,20 @@ impl Checkout {
                 )
             }))
             .collect()
+    }
+
+    /// Every port the checkout listens on: its services' and their secondary ports
+    /// (the base port alone without services).
+    pub fn used_ports(&self) -> Vec<u16> {
+        match self.services.layout() {
+            Ok(l) if !l.services.is_empty() => l
+                .services
+                .values()
+                .chain(l.ports.iter().map(|p| &p.offset))
+                .map(|o| self.port + o)
+                .collect(),
+            _ => vec![self.port],
+        }
     }
 
     /// The services' secondary ports.

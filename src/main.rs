@@ -555,7 +555,7 @@ async fn main() -> Result<()> {
             tls::trust(&ca)?;
             eprintln!("trusted {}", config::ca_cert_path().display());
             eprintln!(
-                "Firefox and Node use their own stores: NODE_EXTRA_CA_CERTS is in `lazy-cow-tree env`."
+                "Firefox and Node use their own stores: NODE_EXTRA_CA_CERTS is in the devenv shell."
             );
             Ok(())
         }

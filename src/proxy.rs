@@ -427,7 +427,7 @@ async fn handle(
                 StatusCode::BAD_GATEWAY,
                 "text/plain; charset=utf-8",
                 format!(
-                    "lazy-cow-tree: nothing answers for {host} on 127.0.0.1:{port} ({e}).\nSet lazy-cow-tree.server (devenv.nix) to start it on demand, or run it with PORT={port} (see `lazy-cow-tree env`); logs: `lazy-cow-tree server log <name>`.\n"
+                    "lazy-cow-tree: nothing answers for {host} on 127.0.0.1:{port} ({e}).\nGive it a process in devenv.nix to start it on demand, or run it with PORT={port}; logs: `lazy-cow-tree service log -s <name>`.\n"
                 ),
             )
         }))

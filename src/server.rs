@@ -39,6 +39,34 @@ use crate::config::{self, Checkout, Global, Project, Restart, Service};
 /// process pointing at the primary's data directory would bypass lazy-cow-tree.
 const DEVENV_SERVICE_STATE: &[&str] = &["PGDATA", "REDISDATA"];
 
+/// The shell hook's variables in the captured project env. A service's bash would
+/// source the hook (BASH_ENV) and take the shell's view of the checkout (PORT of the
+/// default service); the user's own BASH_ENV / ZDOTDIR, kept aside by the hook, come back.
+fn without_shell_hook(env: Vec<(String, String)>) -> Vec<(String, String)> {
+    let saved = |k: &str| {
+        env.iter()
+            .find(|(n, _)| n == k)
+            .map(|(_, v)| v.clone())
+            .filter(|v| !v.is_empty())
+    };
+    let (bash_env, zdotdir) = (
+        saved("LAZY_COW_TREE_BASH_ENV"),
+        saved("LAZY_COW_TREE_ZDOTDIR"),
+    );
+    let hook = [
+        "BASH_ENV",
+        "ZDOTDIR",
+        "LAZY_COW_TREE_BASH_ENV",
+        "LAZY_COW_TREE_ZDOTDIR",
+        "LAZY_COW_TREE_SHELL",
+    ];
+    env.into_iter()
+        .filter(|(k, _)| !hook.contains(&k.as_str()))
+        .chain(bash_env.map(|v| ("BASH_ENV".to_string(), v)))
+        .chain(zdotdir.map(|v| ("ZDOTDIR".to_string(), v)))
+        .collect()
+}
+
 pub fn command(
     project: &Project,
     checkout: &Path,
@@ -55,12 +83,14 @@ pub fn command(
             s.to_string()
         }
     };
-    let base: Vec<(String, String)> = project
-        .env
-        .iter()
-        .filter(|(k, _)| !DEVENV_SERVICE_STATE.contains(&k.as_str()))
-        .map(|(k, v)| (k.clone(), rw(v)))
-        .collect();
+    let base: Vec<(String, String)> = without_shell_hook(
+        project
+            .env
+            .iter()
+            .filter(|(k, _)| !DEVENV_SERVICE_STATE.contains(&k.as_str()))
+            .map(|(k, v)| (k.clone(), rw(v)))
+            .collect(),
+    );
     let argv = shell_words::split(cmdline)?;
     let (prog, args) = argv.split_first().context("empty command")?;
     let prog = rw(prog);

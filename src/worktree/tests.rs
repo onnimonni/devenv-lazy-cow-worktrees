@@ -72,7 +72,7 @@ fn names_are_unique() {
     assert_ne!(a, b);
 
     // Same directory name elsewhere (plain `git worktree add`): git numbers the
-    // admin dir, and list and `lazy-cow-tree env` agree on the name.
+    // admin dir, and list and the shell hook agree on the name.
     let repo = Repository::open(&project.root).unwrap();
     let head = repo.head().unwrap().peel_to_commit().unwrap();
     for (admin, dir) in [("dup", "x"), ("dup1", "y")] {
@@ -554,4 +554,88 @@ fn copies_trees_keeping_mtimes_modes_and_links() {
         std::fs::read_link(dst.join("link")).unwrap(),
         Path::new("lib/a.beam")
     );
+}
+
+/// A listener on 127.0.0.1 (another process's port) below 60000.
+fn foreign_listener() -> (std::net::TcpListener, u16) {
+    loop {
+        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = l.local_addr().unwrap().port();
+        if port < 60000 {
+            return (l, port);
+        }
+    }
+}
+
+fn primary_at(dir: &TempDir, name: &str, port: u16) -> Project {
+    let root = dir.path().join(name);
+    Repository::init(&root).unwrap();
+    let mut s = settings();
+    s.name = Some(name.into());
+    s.port = port;
+    Project::new(root, s)
+}
+
+#[test]
+fn a_taken_primary_port_moves_to_the_next_block_and_stays() {
+    let dir = TempDir::new().unwrap();
+    let (_l, port) = foreign_listener();
+    let p = primary_at(&dir, "app", port);
+    assert_eq!(
+        assign_primary_port(&p, &[], true, false).unwrap(),
+        port + 10
+    );
+    assert_eq!(p.checkout(None, p.root.clone()).port, port + 10);
+    // Registered again while its services run: recorded, so kept.
+    assert_eq!(
+        assign_primary_port(&p, &[], false, false).unwrap(),
+        port + 10
+    );
+    // Another setting ignores the record.
+    assert_eq!(primary_port(&p.root, port + 1), port + 1);
+}
+
+#[test]
+fn another_projects_port_is_taken_without_listening() {
+    let dir = TempDir::new().unwrap();
+    let (l, port) = foreign_listener();
+    drop(l);
+    let other = primary_at(&dir, "other", port);
+    let p = primary_at(&dir, "app", port);
+    assert_eq!(
+        assign_primary_port(&p, &[other], false, false).unwrap(),
+        port + 10
+    );
+    // Free again: it stays where it moved (its ports don't change under it).
+    assert_eq!(
+        assign_primary_port(&p, &[], true, false).unwrap(),
+        port + 10
+    );
+}
+
+#[test]
+fn strict_ports_refuses_to_move() {
+    let dir = TempDir::new().unwrap();
+    let (_l, port) = foreign_listener();
+    let p = primary_at(&dir, "app", port);
+    let e = assign_primary_port(&p, &[], true, true)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("strict_ports") && e.contains(&format!("port {port} is in use")),
+        "{e}"
+    );
+}
+
+#[test]
+fn strict_ports_is_read_from_devenv_yaml() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    assert!(!config::strict_ports(root));
+    std::fs::write(root.join("devenv.yaml"), "inputs:\n  strict_ports: true\n").unwrap();
+    assert!(!config::strict_ports(root), "only the top level");
+    std::fs::write(root.join("devenv.yaml"), "strict_ports: true # pinned\n").unwrap();
+    assert!(config::strict_ports(root));
+    std::fs::write(root.join("devenv.local.yaml"), "strict_ports: false\n").unwrap();
+    assert!(!config::strict_ports(root));
 }
