@@ -12,6 +12,7 @@ set -euo pipefail
 
 bin=$(realpath "${1:-target/debug/lazy-cow-tree}")
 cow=$(dirname "$bin")/lazy-cow-tree-cow
+src=$(cd "$(dirname "$0")/.." && pwd)
 for tool in postgres initdb psql redis-server redis-cli git curl jq; do
   command -v "$tool" >/dev/null || { echo "missing $tool in PATH" >&2; exit 1; }
 done
@@ -252,6 +253,21 @@ FORCE_KILL_PROCESSES=1 wgit worktree remove procs || fail "FORCE_KILL_PROCESSES=
 gone() { ! pgrep -f 'sleep 4242$' >/dev/null; }
 eventually 5 gone || fail "detached process survived"
 pass "git wrapper: worktree remove lists, then kills, what a shell there started"
+
+# macOS: python's subprocess closes inherited fds in its children; the devenv module's
+# library (process-marker.c, DYLD_INSERT_LIBRARIES) keeps the marker there.
+if [[ $(uname -s) == Darwin ]] && command -v cc >/dev/null; then
+  cc -dynamiclib -O2 -o "$home/process-marker.dylib" "$src/devenv-module/process-marker.c"
+  wgit worktree add -q -b shim .claude/worktrees/shim
+  (cd .claude/worktrees/shim && bash -c 'eval "$("$1" shell-hook)"; export DYLD_INSERT_LIBRARIES=$2
+    '"$python"' -c "import subprocess as s; s.Popen([\"sleep\", \"4343\"], cwd=\"/\", start_new_session=True, stdin=s.DEVNULL, stdout=s.DEVNULL, stderr=s.DEVNULL)"' \
+    _ "$bin" "$home/process-marker.dylib")
+  eventually 5 pgrep -f 'sleep 4343$' || fail "python's child did not start"
+  out=$("$bin" worktree procs .claude/worktrees/shim)
+  [[ $out == *'"sleep 4343"'* ]] || fail "python's detached child not found with the library: $out"
+  FORCE_KILL_PROCESSES=1 wgit worktree remove shim 2>/dev/null || fail "FORCE_KILL_PROCESSES=1 did not remove"
+  pass "macOS: python subprocess's detached child found through the process-marker library"
+fi
 
 mix_starts() { [[ $(wc -l <"$home/mix-starts.log") -eq $1 ]]; }
 setups() { [[ $(wc -l <"$home/setup.log") -eq $1 ]]; }

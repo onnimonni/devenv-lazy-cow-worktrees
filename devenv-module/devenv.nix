@@ -59,11 +59,30 @@ let
   envHome = builtins.getEnv "LAZY_COW_TREE_HOME";
   userHome = builtins.getEnv "HOME";
   inherit (lib) mkOption types;
+  # macOS: keeps the worktree process marker (`git worktree remove` lists what a shell in
+  # a worktree started) open in what node, bun, python and erlang start; see
+  # process-marker.c. SIP's /bin/sh, /bin/bash, /bin/zsh and /usr/bin/env drop DYLD_*:
+  # every shell hook puts it back (WORKTREE_PROCESS_SHIM keeps the path).
+  shim = cfg.processMarkerShim.enable && pkgs.stdenv.hostPlatform.isDarwin;
+  processMarkerShim = pkgs.runCommandCC "lazy-cow-tree-process-marker" { } ''
+    mkdir -p $out/lib
+    $CC -dynamiclib -O2 \
+      -DSH_PATH='"${pkgs.bash}/bin/sh"' -DENV_PATH='"${pkgs.coreutils}/bin/env"' \
+      -o $out/lib/liblazy-cow-tree-process-marker.dylib ${./process-marker.c}
+  '';
+  shimEnv = lib.optionalString shim ''
+    export WORKTREE_PROCESS_SHIM=${processMarkerShim}/lib/liblazy-cow-tree-process-marker.dylib
+    case ":''${DYLD_INSERT_LIBRARIES:-}:" in
+      *":$WORKTREE_PROCESS_SHIM:"*) ;;
+      *) export DYLD_INSERT_LIBRARIES="$WORKTREE_PROCESS_SHIM''${DYLD_INSERT_LIBRARIES:+:$DYLD_INSERT_LIBRARIES}" ;;
+    esac
+  '';
   # Sourced by every bash (BASH_ENV) and zsh (ZDOTDIR) started from the devenv shell, so
   # agents' tool shells (Claude Code: bash -c, Codex: zsh -lc) get the checkout they run
   # in: its env again after each cd/pushd/popd (`cd .claude/worktrees/x && cmd`).
   # Shell functions aren't inherited, env vars are.
   shellHook = pkgs.writeText "lazy-cow-tree-shell-hook.sh" ''
+    ${shimEnv}
     if [ -n "''${BASH_VERSION:-}" ] && [ -n "''${LAZY_COW_TREE_BASH_ENV:-}" ]; then
       . "$LAZY_COW_TREE_BASH_ENV"
     fi
@@ -870,6 +889,11 @@ in
       default = true;
       description = "Give every bash and zsh started from the devenv shell (Claude Code's and Codex's tool shells, their subagents') the environment of the checkout it runs in (DATABASE_URL, REDIS_URL, PORT, PHX_HOST, ...), again after cd/pushd/popd; restored or unset outside the project. Sets BASH_ENV and ZDOTDIR (your own files still run).";
     };
+    processMarkerShim.enable = mkOption {
+      type = types.bool;
+      default = true;
+      description = "macOS: load a small library (DYLD_INSERT_LIBRARIES) into what the devenv shell starts that keeps the worktree process marker open in children of node, bun, python and erlang, which close inherited fds, so `git worktree remove` lists (and FORCE_KILL_PROCESSES=1 kills) them too. Only acts in processes started in a worktree. Ignored by hardened-runtime binaries (python.org's Python, notarized apps). Linux reads DEVENV_ROOT from /proc instead.";
+    };
     git.enable = mkOption {
       type = types.bool;
       default = true;
@@ -1054,6 +1078,7 @@ in
         ''
       else
         ''
+          ${shimEnv}
           eval "$(${exe} shell-hook)"
         '';
 
