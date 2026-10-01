@@ -40,8 +40,8 @@ stdenv.mkDerivation {
 
   installPhase = ''
     runHook preInstall
-    install -Dm755 -t $out/bin lazy-cow-tree lazy-cow-tree-cow
-    ln -s lazy-cow-tree $out/bin/lazy-cow-tree-devenv-proxy
+    install -Dm755 -t "$out"/bin lazy-cow-tree lazy-cow-tree-cow
+    ln -s lazy-cow-tree "$out"/bin/lazy-cow-tree-devenv-proxy
     runHook postInstall
   '';
 

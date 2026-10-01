@@ -22,6 +22,18 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
+  statix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      # The statix the git hook runs (devenv.lock), its release binary; shellcheck and
+      # ruff for the scripts in Nix strings.
+      - run: |
+          rev=$(jq -r .nodes.statix.locked.rev devenv.lock)
+          nix shell "github:onnimonni/statix/$rev#prebuilt" nixpkgs#shellcheck nixpkgs#ruff \
+            --command statix check .
+
   e2e:
     strategy:
       fail-fast: false

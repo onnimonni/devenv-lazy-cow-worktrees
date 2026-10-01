@@ -65,12 +65,12 @@ let
   # every shell hook puts it back (WORKTREE_PROCESS_SHIM keeps the path).
   shim = cfg.processMarkerShim.enable && pkgs.stdenv.hostPlatform.isDarwin;
   processMarkerShim = pkgs.runCommandCC "lazy-cow-tree-process-marker" { } ''
-    mkdir -p $out/lib
+    mkdir -p "$out"/lib
     # Universal: arm64e (Apple's own binaries, when SIP is off they honor DYLD_*) and
     # x86_64 (Rosetta) processes would be killed by an arm64-only library.
     $CC -dynamiclib -O2 -arch arm64 -arch arm64e -arch x86_64 \
       -DSH_PATH='"${pkgs.bash}/bin/sh"' -DENV_PATH='"${pkgs.coreutils}/bin/env"' \
-      -o $out/lib/liblazy-cow-tree-process-marker.dylib ${./process-marker.c}
+      -o "$out"/lib/liblazy-cow-tree-process-marker.dylib ${./process-marker.c}
   '';
   # dyld kills every process whose DYLD_INSERT_LIBRARIES names a missing library: only
   # while it is there (a garbage-collected store path is dropped from the list instead).
@@ -109,10 +109,10 @@ let
   # captured, so it stays this dir: each startup file runs the user's own one (from
   # their ZDOTDIR, or $HOME) and notes where a file of theirs moved ZDOTDIR to.
   zdotdir = pkgs.runCommand "lazy-cow-tree-zdotdir" { } ''
-    mkdir $out
-    echo ". ${shellHook}" > $out/.zshenv
+    mkdir "$out"
+    echo ". ${shellHook}" > "$out"/.zshenv
     for f in .zshenv .zprofile .zshrc .zlogin .zlogout; do
-      cat >> $out/$f <<EOF
+      cat >> "$out"/$f <<EOF
     ZDOTDIR=\''${LAZY_COW_TREE_ZDOTDIR:-\$HOME}
     [ -f "\$ZDOTDIR/$f" ] && . "\$ZDOTDIR/$f"
     LAZY_COW_TREE_ZDOTDIR=\$ZDOTDIR ZDOTDIR=$out
@@ -668,312 +668,317 @@ in
   # Merged into devenv's own options: `processes.<name>.start.{on,idleTimeout}`,
   # `processes.<name>.lazyCowTree.*`, and new `services.postgres` / `services.redis`
   # settings. lazy-cow-tree derives its services and database settings from them.
-  options.processes = mkOption { type = types.attrsOf processExtension; };
+  options = {
+    processes = mkOption { type = types.attrsOf processExtension; };
 
-  options.services.postgres = {
-    instance = mkOption {
-      type = types.enum [
-        "shared"
-        "unique"
-      ];
-      default = "shared";
-      description = "One cluster with databases per checkout (`shared`, needed for copyOnWrite), or a cluster of its own per checkout (`unique`).";
-    };
-    start = startOptions "up";
-    copyOnWrite = {
-      enable = mkOption {
-        type = types.bool;
-        default = pgCfg.instance == "shared";
-        defaultText = lib.literalExpression ''services.postgres.instance == "shared"'';
-        description = "Worktree databases are copy-on-write clones of a template (milliseconds, near-zero disk); false: created empty, then migrated and seeded.";
-      };
-      template = mkOption {
-        type = types.enum [ "primary" ];
-        default = "primary";
-        description = "What worktree databases are cloned from: the primary checkout's databases.";
-      };
-      refresh = mkOption {
+    services.postgres = {
+      instance = mkOption {
         type = types.enum [
-          "on-base-change"
-          "manual"
+          "shared"
+          "unique"
         ];
-        default = "on-base-change";
-        description = "Refresh the template from the primary when the base branch moves (after migrations), or only with `lazy-cow-tree snapshot`.";
+        default = "shared";
+        description = "One cluster with databases per checkout (`shared`, needed for copyOnWrite), or a cluster of its own per checkout (`unique`).";
+      };
+      start = startOptions "up";
+      copyOnWrite = {
+        enable = mkOption {
+          type = types.bool;
+          default = pgCfg.instance == "shared";
+          defaultText = lib.literalExpression ''services.postgres.instance == "shared"'';
+          description = "Worktree databases are copy-on-write clones of a template (milliseconds, near-zero disk); false: created empty, then migrated and seeded.";
+        };
+        template = mkOption {
+          type = types.enum [ "primary" ];
+          default = "primary";
+          description = "What worktree databases are cloned from: the primary checkout's databases.";
+        };
+        refresh = mkOption {
+          type = types.enum [
+            "on-base-change"
+            "manual"
+          ];
+          default = "on-base-change";
+          description = "Refresh the template from the primary when the base branch moves (after migrations), or only with `lazy-cow-tree snapshot`.";
+        };
+      };
+      dangerouslyDisableDurabilityForSpeed = {
+        enable = mkOption {
+          type = types.bool;
+          default = false;
+          description = ''
+            Run PostgreSQL on a RAM disk with fsync, synchronous_commit and
+            full_page_writes off. Every database is lost on reboot, on a crash (which
+            can also corrupt the cluster) and on `lazy-cow-tree down --eject`. For
+            disposable development and test data only.
+          '';
+        };
+        ramdiskSize = mkOption {
+          type = types.either types.ints.positive types.str;
+          default = "4G";
+          example = "8G";
+          description = "RAM disk size (512M, 4G, or MB); memory is only used as it fills.";
+        };
       };
     };
-    dangerouslyDisableDurabilityForSpeed = {
+
+    services.redis = {
+      instance = mkOption {
+        type = types.enum [
+          "unique"
+          "shared"
+        ];
+        default = "unique";
+        description = "A redis-server of its own per checkout (`unique`), or one for every checkout of the project (`shared`).";
+      };
+      start = startOptions "demand";
+    };
+
+    lazyCowTree = {
       enable = mkOption {
         type = types.bool;
-        default = false;
-        description = ''
-          Run PostgreSQL on a RAM disk with fsync, synchronous_commit and
-          full_page_writes off. Every database is lost on reboot, on a crash (which
-          can also corrupt the cluster) and on `lazy-cow-tree down --eject`. For
-          disposable development and test data only.
-        '';
+        default = true;
+        description = "Run and use the lazy-cow-tree daemon.";
       };
-      ramdiskSize = mkOption {
-        type = types.either types.ints.positive types.str;
-        default = "4G";
-        example = "8G";
-        description = "RAM disk size (512M, 4G, or MB); memory is only used as it fills.";
-      };
-    };
-  };
-
-  options.services.redis = {
-    instance = mkOption {
-      type = types.enum [
-        "unique"
-        "shared"
-      ];
-      default = "unique";
-      description = "A redis-server of its own per checkout (`unique`), or one for every checkout of the project (`shared`).";
-    };
-    start = startOptions "demand";
-  };
-
-  options.lazyCowTree = {
-    enable = mkOption {
-      type = types.bool;
-      default = true;
-      description = "Run and use the lazy-cow-tree daemon.";
-    };
-    package = mkOption {
-      type = types.package;
-      default = pinnedPkgs.callPackage ../package.nix { };
-      defaultText = lib.literalMD "built with lazy-cow-tree's pinned nixpkgs (flake.lock), substituted from lazy-cow-tree.cachix.org";
-      example = lib.literalExpression "pkgs.callPackage (inputs.lazy-cow-tree + \"/package.nix\") { }";
-      description = "The lazy-cow-tree package. The default is the one lazy-cow-tree's CI builds and pushes to lazy-cow-tree.cachix.org; a package built with other nixpkgs is compiled locally.";
-    };
-    cachix.enable = mkOption {
-      type = types.bool;
-      default = true;
-      description = "Pull the default package from lazy-cow-tree.cachix.org (`cachix.pull`). A multi-user Nix only uses it for trusted users, or when it's in the daemon's own substituters.";
-    };
-    # Daemon-wide, like the ports: the project whose `devenv up` starts the daemon
-    # decides; the others share its PostgreSQL.
-    postgres = {
       package = mkOption {
         type = types.package;
-        default = pkgs.postgresql_18;
-        defaultText = lib.literalExpression "pkgs.postgresql_18";
-        description = "PostgreSQL the daemon runs (18+ for copy-on-write CREATE DATABASE).";
+        default = pinnedPkgs.callPackage ../package.nix { };
+        defaultText = lib.literalMD "built with lazy-cow-tree's pinned nixpkgs (flake.lock), substituted from lazy-cow-tree.cachix.org";
+        example = lib.literalExpression "pkgs.callPackage (inputs.lazy-cow-tree + \"/package.nix\") { }";
+        description = "The lazy-cow-tree package. The default is the one lazy-cow-tree's CI builds and pushes to lazy-cow-tree.cachix.org; a package built with other nixpkgs is compiled locally.";
       };
-      extensions = mkOption {
-        type = types.nullOr (types.functionTo (types.listOf types.package));
-        default = null;
-        example = lib.literalExpression "extensions: [ extensions.postgis extensions.pgvector ]";
-        description = "Extensions to install, as in devenv's services.postgres.extensions (`package.withPackages`). Checkout roles aren't superusers: they can CREATE EXTENSION trusted ones (pgcrypto, citext, ...); list the others in createExtensions.";
+      cachix.enable = mkOption {
+        type = types.bool;
+        default = true;
+        description = "Pull the default package from lazy-cow-tree.cachix.org (`cachix.pull`). A multi-user Nix only uses it for trusted users, or when it's in the daemon's own substituters.";
       };
-      databases = mkOption {
-        type = types.listOf types.str;
-        default = [ ];
-        example = [ "cms" ];
-        description = "More databases every checkout gets next to its main one, e.g. for a second Ecto repo: `<project>_<name>_dev`, `_test` and test partitions per checkout (worktrees' cloned from `<project>_<name>_template`, refreshed with the main template), in `<NAME>_DATABASE_URL` and `<NAME>_TEST_DATABASE_URL`.";
-      };
-      createExtensions = mkOption {
-        type = types.listOf types.str;
-        default = [ ];
-        example = [
-          "postgis"
-          "vector"
-        ];
-        description = "Extensions the daemon creates as superuser in template1 (so in every database made afterwards) and the primaries' databases: the untrusted ones checkout roles can't create. Migrations' CREATE EXTENSION IF NOT EXISTS is then a no-op.";
-      };
-      settings = mkOption {
-        type = types.attrsOf (
-          types.oneOf [
-            types.bool
-            types.int
-            types.str
-          ]
-        );
-        default = { };
-        example = {
-          shared_preload_libraries = "pg_stat_statements";
-          log_min_duration_statement = 250;
+      # Daemon-wide, like the ports: the project whose `devenv up` starts the daemon
+      # decides; the others share its PostgreSQL.
+      postgres = {
+        package = mkOption {
+          type = types.package;
+          default = pkgs.postgresql_18;
+          defaultText = lib.literalExpression "pkgs.postgresql_18";
+          description = "PostgreSQL the daemon runs (18+ for copy-on-write CREATE DATABASE).";
         };
-        description = "Extra postgresql.conf settings (passed as `-c name=value`), as in devenv's services.postgres.settings.";
+        extensions = mkOption {
+          type = types.nullOr (types.functionTo (types.listOf types.package));
+          default = null;
+          example = lib.literalExpression "extensions: [ extensions.postgis extensions.pgvector ]";
+          description = "Extensions to install, as in devenv's services.postgres.extensions (`package.withPackages`). Checkout roles aren't superusers: they can CREATE EXTENSION trusted ones (pgcrypto, citext, ...); list the others in createExtensions.";
+        };
+        databases = mkOption {
+          type = types.listOf types.str;
+          default = [ ];
+          example = [ "cms" ];
+          description = "More databases every checkout gets next to its main one, e.g. for a second Ecto repo: `<project>_<name>_dev`, `_test` and test partitions per checkout (worktrees' cloned from `<project>_<name>_template`, refreshed with the main template), in `<NAME>_DATABASE_URL` and `<NAME>_TEST_DATABASE_URL`.";
+        };
+        createExtensions = mkOption {
+          type = types.listOf types.str;
+          default = [ ];
+          example = [
+            "postgis"
+            "vector"
+          ];
+          description = "Extensions the daemon creates as superuser in template1 (so in every database made afterwards) and the primaries' databases: the untrusted ones checkout roles can't create. Migrations' CREATE EXTENSION IF NOT EXISTS is then a no-op.";
+        };
+        settings = mkOption {
+          type = types.attrsOf (
+            types.oneOf [
+              types.bool
+              types.int
+              types.str
+            ]
+          );
+          default = { };
+          example = {
+            shared_preload_libraries = "pg_stat_statements";
+            log_min_duration_statement = 250;
+          };
+          description = "Extra postgresql.conf settings (passed as `-c name=value`), as in devenv's services.postgres.settings.";
+        };
+        ramdiskMB = mkOption {
+          type = types.ints.positive;
+          default = 4096;
+          description = "Size of the APFS RAM disk PostgreSQL runs on, in MB (memory is only used as it fills). The daemon that creates the RAM disk sizes it; `lazy-cow-tree down --eject` and a restart apply a new size (and empty every database).";
+        };
       };
-      ramdiskMB = mkOption {
-        type = types.ints.positive;
-        default = 4096;
-        description = "Size of the APFS RAM disk PostgreSQL runs on, in MB (memory is only used as it fills). The daemon that creates the RAM disk sizes it; `lazy-cow-tree down --eject` and a restart apply a new size (and empty every database).";
+      redis = mkOption {
+        type = types.package;
+        default = pkgs.redis;
+        description = "Redis the daemon runs, one redis-server per checkout.";
       };
-    };
-    redis = mkOption {
-      type = types.package;
-      default = pkgs.redis;
-      description = "Redis the daemon runs, one redis-server per checkout.";
-    };
-    project = mkOption {
-      type = types.nullOr types.str;
-      default = null;
-      description = "Project name (hostnames, database prefix); default: the checkout's directory name.";
-    };
-    tls = {
-      domain = mkOption {
+      project = mkOption {
         type = types.nullOr types.str;
         default = null;
-        example = "dev.example.com";
-        description = "Domain whose `*` A record points at 127.0.0.1: hostnames become https://<worktree>.<service>.<project>.<domain> with the Let's Encrypt certificate github.com/onnimonni/trusted-https-certificate-to-artifacts-action keeps as the GitHub repository's https-certificate Actions artifact (read only while the repository is private), instead of .localhost ones with the local CA. Until it has one, the local CA serves them. `lazy-cow-tree cert show` prints the names it needs.";
+        description = "Project name (hostnames, database prefix); default: the checkout's directory name.";
+      };
+      tls = {
+        domain = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          example = "dev.example.com";
+          description = "Domain whose `*` A record points at 127.0.0.1: hostnames become https://<worktree>.<service>.<project>.<domain> with the Let's Encrypt certificate github.com/onnimonni/trusted-https-certificate-to-artifacts-action keeps as the GitHub repository's https-certificate Actions artifact (read only while the repository is private), instead of .localhost ones with the local CA. Until it has one, the local CA serves them. `lazy-cow-tree cert show` prints the names it needs.";
+        };
+        services = mkOption {
+          type = types.nullOr (types.listOf types.str);
+          default = null;
+          example = [ "web" "api" ];
+          description = "Service names the certificate covers (`<name>.<project>.<domain>` and its worktrees') besides the project's own http services, so adding one needs no new certificate. Default: common ones (app, web, www, api, backend, frontend, admin, dashboard, auth, docs, storybook, simulator, mobile, cms, mail, assets, vite, ws).";
+        };
+      };
+      port = mkOption {
+        type = types.port;
+        default = 4000;
+        description = "Base port of the primary checkout's services (worktrees get 20000-28990 by hash); each service adds its offset.";
+      };
+      migrate = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "mix do ecto.migrate + run priv/repo/seeds.exs";
+        description = "Migrate command for the checkout's database: run in the primary checkout whenever the base branch moves (then the template database is refreshed from it) and in every worktree the base branch was merged into.";
+      };
+      seed = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "mix run priv/repo/seeds.exs";
+        description = "Seed command: run in the primary checkout after `migrate` when its database was just created (a fresh RAM disk); worktrees get the seeded data through the template.";
+      };
+      setup = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "mix deps.get";
+        description = "Setup command run once in every new checkout (made by lazy-cow-tree, git, git-cow or Claude Code), with its env, before its services start; again before a restartOnChange restart when dependency files changed, so keep it idempotent (mix deps.get, not an alias that seeds).";
       };
       services = mkOption {
-        type = types.nullOr (types.listOf types.str);
-        default = null;
-        example = [ "web" "api" ];
-        description = "Service names the certificate covers (`<name>.<project>.<domain>` and its worktrees') besides the project's own http services, so adding one needs no new certificate. Default: common ones (app, web, www, api, backend, frontend, admin, dashboard, auth, docs, storybook, simulator, mobile, cms, mail, assets, vite, ws).";
+        type = types.attrsOf service;
+        default = { };
+        description = "Processes of every checkout, started on demand. Names become hostnames: https://<worktree>.<service>.<project>.localhost.";
       };
-    };
-    port = mkOption {
-      type = types.port;
-      default = 4000;
-      description = "Base port of the primary checkout's services (worktrees get 20000-28990 by hash); each service adds its offset.";
-    };
-    migrate = mkOption {
-      type = types.nullOr types.str;
-      default = null;
-      example = "mix do ecto.migrate + run priv/repo/seeds.exs";
-      description = "Migrate command for the checkout's database: run in the primary checkout whenever the base branch moves (then the template database is refreshed from it) and in every worktree the base branch was merged into.";
-    };
-    seed = mkOption {
-      type = types.nullOr types.str;
-      default = null;
-      example = "mix run priv/repo/seeds.exs";
-      description = "Seed command: run in the primary checkout after `migrate` when its database was just created (a fresh RAM disk); worktrees get the seeded data through the template.";
-    };
-    setup = mkOption {
-      type = types.nullOr types.str;
-      default = null;
-      example = "mix deps.get";
-      description = "Setup command run once in every new checkout (made by lazy-cow-tree, git, git-cow or Claude Code), with its env, before its services start; again before a restartOnChange restart when dependency files changed, so keep it idempotent (mix deps.get, not an alias that seeds).";
-    };
-    services = mkOption {
-      type = types.attrsOf service;
-      default = { };
-      description = "Processes of every checkout, started on demand. Names become hostnames: https://<worktree>.<service>.<project>.localhost.";
-    };
-    server = mkOption {
-      type = types.nullOr types.str;
-      default = null;
-      example = "mix phx.server";
-      description = "Shorthand for `lazyCowTree.services.web.exec`.";
-    };
-    worktreesDir = mkOption {
-      type = types.str;
-      default = ".claude/worktrees";
-      example = "../myapp-worktrees";
-      description = "Where `lazy-cow-tree worktree new` and Claude Code's WorktreeCreate hook put worktrees, relative to the primary checkout. Outside it (`../<name>`), language servers and indexers of the primary don't see the worktrees' files.";
-    };
-    autoRemoveMerged = mkOption {
-      type = types.bool;
-      default = true;
-      description = "Remove a worktree (under the worktrees dir, unlocked, clean) once its branch's GitHub pull request merged with nothing newer in it.";
-    };
-    httpsPort = mkOption {
-      type = types.nullOr types.port;
-      default = null;
-      example = 8443;
-      description = "HTTPS proxy port (default: 443 where unprivileged processes may bind it, i.e. macOS or Linux with net.ipv4.ip_unprivileged_port_start <= 443, else 8443).";
-    };
-    httpPort = mkOption {
-      type = types.nullOr types.port;
-      default = null;
-      example = 0;
-      description = "Plain HTTP port that redirects to HTTPS; 0 disables (default: 80 where unprivileged processes may bind it, else off).";
-    };
-    home = mkOption {
-      type = types.nullOr types.str;
-      default =
-        config.env.LAZY_COW_TREE_HOME or (
-          if envHome != "" then
-            envHome
-          else if userHome != "" then
-            "${userHome}/.local/state/lazy-cow-tree"
-          else
-            null
-        );
-      defaultText = lib.literalExpression ''env.LAZY_COW_TREE_HOME, else $LAZY_COW_TREE_HOME, else "$HOME/.local/state/lazy-cow-tree"'';
-      description = "The daemon's state directory (absolute), where its CA lives (`<home>/ca/ca.pem`); only read here, set LAZY_COW_TREE_HOME to move it.";
-    };
-    shellHook.enable = mkOption {
-      type = types.bool;
-      default = true;
-      description = "Give every bash and zsh started from the devenv shell (Claude Code's and Codex's tool shells, their subagents') the environment of the checkout it runs in (DATABASE_URL, REDIS_URL, PORT, PHX_HOST, ...), again after cd/pushd/popd; restored or unset outside the project. Sets BASH_ENV and ZDOTDIR (your own files still run).";
-    };
-    processMarkerShim.enable = mkOption {
-      type = types.bool;
-      default = true;
-      description = "macOS: load a small library (DYLD_INSERT_LIBRARIES) into what the devenv shell starts that keeps the worktree process marker open in children of node, bun, python and erlang, which close inherited fds, so `git worktree remove` lists (and FORCE_KILL_PROCESSES=1 kills) them too. Only acts in processes started in a worktree. Ignored by hardened-runtime binaries that don't allow DYLD environment variables (most notarized apps). Linux reads DEVENV_ROOT from /proc instead.";
-    };
-    git.enable = mkOption {
-      type = types.bool;
-      default = true;
-      description = "Replace `git` in the shell with a wrapper whose `git worktree add` (by you, scripts or agents) fills the worktree like `lazy-cow-tree worktree new`: copy-on-write clones of the primary checkout, build caches included. Everything else is the real git. Replaces git-cow's devenv module (don't import both).";
-    };
-    git.package = mkOption {
-      type = types.package;
-      default = pkgs.git;
-      defaultText = lib.literalExpression "pkgs.git";
-      description = "The real git the wrapper runs.";
-    };
-    codex.lsp = mkOption {
-      type = types.bool;
-      default = true;
-      description = "Give Codex (which has no LSP client) each supported language server of the enabled `languages.*` (dexter, typescript-language-server, pyright, rust-analyzer) as an MCP server `lsp-<name>` in the project's `.codex/config.toml` (read for trusted projects): mcp-language-server (definition, references, diagnostics, hover, rename, edit tools) on the server's wrapper, so it runs behind `lazy-cow-tree lsp` too. Add your own Codex settings through `files.\".codex/config.toml\".toml`.";
-    };
-    codex.mcpLanguageServer = mkOption {
-      type = types.package;
-      default = pkgs.mcp-language-server;
-      defaultText = lib.literalExpression "pkgs.mcp-language-server";
-      description = "The LSP-to-MCP bridge `codex.lsp` and `pi.lsp` use (isaacphi/mcp-language-server).";
-    };
-    pi.lsp = mkOption {
-      type = types.bool;
-      default = true;
-      description = "Give pi (which has no LSP client) each supported language server of the enabled `languages.*` (dexter, typescript-language-server, pyright, rust-analyzer) as an MCP server `lsp-<name>` in the project's `.pi/mcp.json` (read once the project is trusted): mcp-language-server on the server's wrapper, so it runs behind `lazy-cow-tree lsp` too. Add your own pi servers through `files.\".pi/mcp.json\".json.mcpServers`.";
-    };
-    codex.noDaemon = mkOption {
-      type = types.bool;
-      default = true;
-      description = "Wrap `codex` to run with --no-daemon: a shared `codex app-server` started elsewhere runs commands with its own environment, not this shell's.";
-    };
-    claude.lsp = mkOption {
-      type = types.bool;
-      default = true;
-      description = "Give Claude Code the supported language servers of the enabled `languages.*` (dexter, typescript-language-server, pyright, rust-analyzer) as plugin `lazy-cow-tree-lsp`, from a local marketplace set up in `.claude/settings.local.json`, each behind `lazy-cow-tree lsp`.";
-    };
-    claude.trustCa = mkOption {
-      type = types.bool;
-      default = true;
-      description = "Set NODE_EXTRA_CA_CERTS to the local CA in `.claude/settings.local.json`, so Claude Code reaches MCP servers on https://*.localhost. Node reads one file only: to trust other CAs too, set `files.\".claude/settings.local.json\".json.env.NODE_EXTRA_CA_CERTS` to a bundle yourself.";
+      server = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "mix phx.server";
+        description = "Shorthand for `lazyCowTree.services.web.exec`.";
+      };
+      worktreesDir = mkOption {
+        type = types.str;
+        default = ".claude/worktrees";
+        example = "../myapp-worktrees";
+        description = "Where `lazy-cow-tree worktree new` and Claude Code's WorktreeCreate hook put worktrees, relative to the primary checkout. Outside it (`../<name>`), language servers and indexers of the primary don't see the worktrees' files.";
+      };
+      autoRemoveMerged = mkOption {
+        type = types.bool;
+        default = true;
+        description = "Remove a worktree (under the worktrees dir, unlocked, clean) once its branch's GitHub pull request merged with nothing newer in it.";
+      };
+      httpsPort = mkOption {
+        type = types.nullOr types.port;
+        default = null;
+        example = 8443;
+        description = "HTTPS proxy port (default: 443 where unprivileged processes may bind it, i.e. macOS or Linux with net.ipv4.ip_unprivileged_port_start <= 443, else 8443).";
+      };
+      httpPort = mkOption {
+        type = types.nullOr types.port;
+        default = null;
+        example = 0;
+        description = "Plain HTTP port that redirects to HTTPS; 0 disables (default: 80 where unprivileged processes may bind it, else off).";
+      };
+      home = mkOption {
+        type = types.nullOr types.str;
+        default =
+          config.env.LAZY_COW_TREE_HOME or (
+            if envHome != "" then
+              envHome
+            else if userHome != "" then
+              "${userHome}/.local/state/lazy-cow-tree"
+            else
+              null
+          );
+        defaultText = lib.literalExpression ''env.LAZY_COW_TREE_HOME, else $LAZY_COW_TREE_HOME, else "$HOME/.local/state/lazy-cow-tree"'';
+        description = "The daemon's state directory (absolute), where its CA lives (`<home>/ca/ca.pem`); only read here, set LAZY_COW_TREE_HOME to move it.";
+      };
+      shellHook.enable = mkOption {
+        type = types.bool;
+        default = true;
+        description = "Give every bash and zsh started from the devenv shell (Claude Code's and Codex's tool shells, their subagents') the environment of the checkout it runs in (DATABASE_URL, REDIS_URL, PORT, PHX_HOST, ...), again after cd/pushd/popd; restored or unset outside the project. Sets BASH_ENV and ZDOTDIR (your own files still run).";
+      };
+      processMarkerShim.enable = mkOption {
+        type = types.bool;
+        default = true;
+        description = "macOS: load a small library (DYLD_INSERT_LIBRARIES) into what the devenv shell starts that keeps the worktree process marker open in children of node, bun, python and erlang, which close inherited fds, so `git worktree remove` lists (and FORCE_KILL_PROCESSES=1 kills) them too. Only acts in processes started in a worktree. Ignored by hardened-runtime binaries that don't allow DYLD environment variables (most notarized apps). Linux reads DEVENV_ROOT from /proc instead.";
+      };
+      git.enable = mkOption {
+        type = types.bool;
+        default = true;
+        description = "Replace `git` in the shell with a wrapper whose `git worktree add` (by you, scripts or agents) fills the worktree like `lazy-cow-tree worktree new`: copy-on-write clones of the primary checkout, build caches included. Everything else is the real git. Replaces git-cow's devenv module (don't import both).";
+      };
+      git.package = mkOption {
+        type = types.package;
+        default = pkgs.git;
+        defaultText = lib.literalExpression "pkgs.git";
+        description = "The real git the wrapper runs.";
+      };
+      codex = {
+        lsp = mkOption {
+          type = types.bool;
+          default = true;
+          description = "Give Codex (which has no LSP client) each supported language server of the enabled `languages.*` (dexter, typescript-language-server, pyright, rust-analyzer) as an MCP server `lsp-<name>` in the project's `.codex/config.toml` (read for trusted projects): mcp-language-server (definition, references, diagnostics, hover, rename, edit tools) on the server's wrapper, so it runs behind `lazy-cow-tree lsp` too. Add your own Codex settings through `files.\".codex/config.toml\".toml`.";
+        };
+        mcpLanguageServer = mkOption {
+          type = types.package;
+          default = pkgs.mcp-language-server;
+          defaultText = lib.literalExpression "pkgs.mcp-language-server";
+          description = "The LSP-to-MCP bridge `codex.lsp` and `pi.lsp` use (isaacphi/mcp-language-server).";
+        };
+        noDaemon = mkOption {
+          type = types.bool;
+          default = true;
+          description = "Wrap `codex` to run with --no-daemon: a shared `codex app-server` started elsewhere runs commands with its own environment, not this shell's.";
+        };
+      };
+      pi.lsp = mkOption {
+        type = types.bool;
+        default = true;
+        description = "Give pi (which has no LSP client) each supported language server of the enabled `languages.*` (dexter, typescript-language-server, pyright, rust-analyzer) as an MCP server `lsp-<name>` in the project's `.pi/mcp.json` (read once the project is trusted): mcp-language-server on the server's wrapper, so it runs behind `lazy-cow-tree lsp` too. Add your own pi servers through `files.\".pi/mcp.json\".json.mcpServers`.";
+      };
+      claude.lsp = mkOption {
+        type = types.bool;
+        default = true;
+        description = "Give Claude Code the supported language servers of the enabled `languages.*` (dexter, typescript-language-server, pyright, rust-analyzer) as plugin `lazy-cow-tree-lsp`, from a local marketplace set up in `.claude/settings.local.json`, each behind `lazy-cow-tree lsp`.";
+      };
+      claude.trustCa = mkOption {
+        type = types.bool;
+        default = true;
+        description = "Set NODE_EXTRA_CA_CERTS to the local CA in `.claude/settings.local.json`, so Claude Code reaches MCP servers on https://*.localhost. Node reads one file only: to trust other CAs too, set `files.\".claude/settings.local.json\".json.env.NODE_EXTRA_CA_CERTS` to a bundle yourself.";
+      };
     };
   };
 
   config = lib.mkIf cfg.enable {
-    lazyCowTree.services = lib.mkMerge [
-      (lib.mkIf (cfg.server != null) { web.exec = lib.mkDefault cfg.server; })
-      # Each field a default, so an explicit lazyCowTree.services.<name> wins.
-      (lib.mapAttrs (_: lib.mapAttrs (_: lib.mkDefault)) derived)
-    ];
+    lazyCowTree = {
+      services = lib.mkMerge [
+        (lib.mkIf (cfg.server != null) { web.exec = lib.mkDefault cfg.server; })
+        # Each field a default, so an explicit lazyCowTree.services.<name> wins.
+        (lib.mapAttrs (_: lib.mapAttrs (_: lib.mkDefault)) derived)
+      ];
+      postgres = lib.mkIf pgCfg.enable {
+        package = lib.mkDefault pgCfg.package;
+        extensions = lib.mkDefault pgCfg.extensions;
+        settings = lib.mkDefault (
+          lib.mapAttrs (_: v: if builtins.isFloat v then toString v else v) (
+            removeAttrs pgCfg.settings pgOwnSettings
+          )
+        );
+        ramdiskMB = lib.mkIf pgCfg.dangerouslyDisableDurabilityForSpeed.enable (
+          lib.mkDefault (megabytes pgCfg.dangerouslyDisableDurabilityForSpeed.ramdiskSize)
+        );
+      };
+      redis = lib.mkIf redisCfg.enable (lib.mkDefault redisCfg.package);
+    };
 
     # One proxy, one CA: lazy-cow-tree serves the hostnames.
     process.proxy.enable = lib.mkIf (derivedProcs != { }) (lib.mkForce false);
-
-    lazyCowTree.postgres = lib.mkIf pgCfg.enable {
-      package = lib.mkDefault pgCfg.package;
-      extensions = lib.mkDefault pgCfg.extensions;
-      settings = lib.mkDefault (
-        lib.mapAttrs (_: v: if builtins.isFloat v then toString v else v) (
-          removeAttrs pgCfg.settings pgOwnSettings
-        )
-      );
-      ramdiskMB = lib.mkIf pgCfg.dangerouslyDisableDurabilityForSpeed.enable (
-        lib.mkDefault (megabytes pgCfg.dangerouslyDisableDurabilityForSpeed.ramdiskSize)
-      );
-    };
-    lazyCowTree.redis = lib.mkIf redisCfg.enable (lib.mkDefault redisCfg.package);
 
     assertions =
       lib.mapAttrsToList (name: p: {
@@ -1107,50 +1112,54 @@ in
       description = "codex --no-daemon (lazy-cow-tree.codex.noDaemon)";
     };
 
-    # Codex and pi have no LSP client: each language server as an MCP server.
-    files.".codex/config.toml".toml.mcp_servers = lib.mkIf (cfg.codex.lsp && lspServers != { }) lspMcpServers;
-    files.".pi/mcp.json".json.mcpServers = lib.mkIf (cfg.pi.lsp && lspServers != { }) lspMcpServers;
-    # pi writes /mcp changes (enable, exposure) back to the file defining the server.
-    files.".pi/mcp.json".copyMode = lib.mkIf (cfg.pi.lsp && lspServers != { }) "copy";
+    files = {
+      # Codex and pi have no LSP client: each language server as an MCP server.
+      ".codex/config.toml".toml.mcp_servers = lib.mkIf (cfg.codex.lsp && lspServers != { }) lspMcpServers;
+      ".pi/mcp.json".json.mcpServers = lib.mkIf (cfg.pi.lsp && lspServers != { }) lspMcpServers;
+      # pi writes /mcp changes (enable, exposure) back to the file defining the server.
+      ".pi/mcp.json".copyMode = lib.mkIf (cfg.pi.lsp && lspServers != { }) "copy";
 
-    # Claude Code runs language servers from plugins only: ours, from a local marketplace.
-    files.".claude/settings.local.json".json.extraKnownMarketplaces = lib.mkIf claudeLsp {
-      lazy-cow-tree.source = {
-        source = "directory";
-        path = "${claudeMarketplace}";
+      ".claude/settings.local.json".json = {
+        # Claude Code runs language servers from plugins only: ours, from a local marketplace.
+        extraKnownMarketplaces = lib.mkIf claudeLsp {
+          lazy-cow-tree.source = {
+            source = "directory";
+            path = "${claudeMarketplace}";
+          };
+        };
+        enabledPlugins = lib.mkIf claudeLsp {
+          "lazy-cow-tree-lsp@lazy-cow-tree" = true;
+        };
+
+        # Node (Claude Code) ignores the keychain `lazy-cow-tree trust` writes to.
+        env = lib.mkIf (cfg.claude.trustCa && cfg.home != null) {
+          NODE_EXTRA_CA_CERTS = lib.mkDefault "${cfg.home}/ca/ca.pem";
+        };
+
+        hooks = {
+          WorktreeCreate = [
+            {
+              hooks = [
+                {
+                  type = "command";
+                  command = "${exe} hook worktree-create";
+                  timeout = 120;
+                }
+              ];
+            }
+          ];
+          WorktreeRemove = [
+            {
+              hooks = [
+                {
+                  type = "command";
+                  command = "${exe} hook worktree-remove";
+                }
+              ];
+            }
+          ];
+        };
       };
-    };
-    files.".claude/settings.local.json".json.enabledPlugins = lib.mkIf claudeLsp {
-      "lazy-cow-tree-lsp@lazy-cow-tree" = true;
-    };
-
-    # Node (Claude Code) ignores the keychain `lazy-cow-tree trust` writes to.
-    files.".claude/settings.local.json".json.env = lib.mkIf (cfg.claude.trustCa && cfg.home != null) {
-      NODE_EXTRA_CA_CERTS = lib.mkDefault "${cfg.home}/ca/ca.pem";
-    };
-
-    files.".claude/settings.local.json".json.hooks = {
-      WorktreeCreate = [
-        {
-          hooks = [
-            {
-              type = "command";
-              command = "${exe} hook worktree-create";
-              timeout = 120;
-            }
-          ];
-        }
-      ];
-      WorktreeRemove = [
-        {
-          hooks = [
-            {
-              type = "command";
-              command = "${exe} hook worktree-remove";
-            }
-          ];
-        }
-      ];
     };
   };
 }
