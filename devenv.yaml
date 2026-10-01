@@ -7,3 +7,5 @@ inputs:
         follows: nixpkgs
   nixpkgs:
     url: github:cachix/devenv-nixpkgs/rolling
+  statix:
+    url: github:onnimonni/statix
