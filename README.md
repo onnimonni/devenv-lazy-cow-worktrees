@@ -360,6 +360,7 @@ FIXME: other language servers. devenv's `languages.*.lsp` has only `enable` and
 | `lazyCowTree.package` | built with lazy-cow-tree's pinned nixpkgs | lazy-cow-tree build; the default is on lazy-cow-tree.cachix.org |
 | `lazyCowTree.cachix.enable` | `true` | `cachix.pull = [ "lazy-cow-tree" ]` |
 | `lazyCowTree.shellHook.enable` | `true` | every bash/zsh from the devenv shell (agents' tool shells) gets its checkout's environment, again after `cd` (step 7) |
+| `lazyCowTree.processMarkerShim.enable` | `true` | macOS: children of node, bun, python and erlang keep the worktree process marker, so `git worktree remove` finds them (`DYLD_INSERT_LIBRARIES`) |
 | `lazyCowTree.git.enable` | `true` | `git` in the shell is a wrapper: `git worktree add` fills the worktree like `lazy-cow-tree worktree new` (copy-on-write clones of the primary, build caches included; locked as initializing meanwhile); `LAZY_COW_TREE_GIT_DISABLE=1` for plain git. Don't also import git-cow's module |
 | `lazyCowTree.git.package` | `pkgs.git` | the real git it runs |
 | `lazyCowTree.claude.lsp` | `true` | the language servers as Claude Code plugin `lazy-cow-tree-lsp` from a local marketplace in `.claude/settings.local.json` (step 8) |
@@ -516,10 +517,14 @@ and is still running`); `FORCE_KILL_PROCESSES=1` SIGKILLs them, with their desce
 and removes it. "Started in it": its working directory or executable is inside it, or
 it inherited the marker the shell hook keeps open in every shell inside a worktree
 (`WORKTREE_PROCESS_MARKER`, an fd on the worktree's git admin dir, kept across `setsid`, `cd /` and double
-forks; on Linux also `DEVENV_ROOT` in its environment). Best effort: children of node,
-bun and python subprocesses lose the fd, so one of those that left the worktree and
-outlived its parent is missed on macOS
-([#46](https://github.com/onnimonni/devenv-lazy-cow-worktrees/issues/46)).
+forks; on Linux also `DEVENV_ROOT` in its environment). node, bun, python and erlang
+close inherited fds in what they start; on macOS the module loads a small library into
+the shell's processes (`DYLD_INSERT_LIBRARIES`, `lazyCowTree.processMarkerShim.enable`)
+that keeps the marker open there. It only acts in processes holding a marker, and runs
+nix's `sh` and `env` for `/bin/sh` and `/usr/bin/env` (also as a script's `#!`), which
+SIP would make drop it; the shell hook restores it after SIP's bash and zsh.
+Best effort: hardened-runtime binaries that don't allow `DYLD_*` (most notarized
+apps) ignore it, and daemons that close every fd lose the marker.
 `lazy-cow-tree worktree procs <path> [--kill]` lists (kills) them by hand.
 
 Nothing watches the filesystem: a worktree made or deleted outside the wrapper (plain

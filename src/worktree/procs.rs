@@ -7,8 +7,9 @@ use super::*;
 /// What the shell hook keeps open in every shell inside a worktree, as `<fd>:<path>`:
 /// an fd on the worktree's git admin dir (`marker_path`: nothing else keeps that one
 /// open), inherited by everything started there, even what double-forks, `setsid`s
-/// and `cd /`s away (node, bun and python subprocesses close it in their children; on
-/// Linux `DEVENV_ROOT` in their environment still tells).
+/// and `cd /`s away (node, bun, python and erlang close it in their children: on macOS
+/// the devenv module's process-marker.c keeps it, on Linux `DEVENV_ROOT` in their
+/// environment still tells).
 pub const MARKER: &str = "WORKTREE_PROCESS_MARKER";
 
 /// The marker uses fds from here up (bash: 213, zsh: its first free one >= 10).
