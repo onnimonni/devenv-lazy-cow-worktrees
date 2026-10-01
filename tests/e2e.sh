@@ -262,7 +262,7 @@ if [[ $(uname -s) == Darwin ]] && command -v cc >/dev/null; then
   (cd .claude/worktrees/shim && bash -c 'eval "$("$1" shell-hook)"; export DYLD_INSERT_LIBRARIES=$2
     '"$python"' -c "import subprocess as s; s.Popen([\"sleep\", \"4343\"], cwd=\"/\", start_new_session=True, stdin=s.DEVNULL, stdout=s.DEVNULL, stderr=s.DEVNULL)"' \
     _ "$bin" "$home/process-marker.dylib") >"$work/shim.log" 2>&1
-  eventually 5 pgrep -f 'sleep 4343$' || fail "python's child did not start (: $(command -v ${python%% *})): $(cat "$work/shim.log")"
+  eventually 5 pgrep -f 'sleep 4343$' || fail "python's child did not start ($python: $(command -v "${python%% *}")): $(cat "$work/shim.log")"
   out=$("$bin" worktree procs .claude/worktrees/shim)
   [[ $out == *'"sleep 4343"'* ]] || fail "python's detached child not found with the library: $out"
   FORCE_KILL_PROCESSES=1 wgit worktree remove shim 2>/dev/null || fail "FORCE_KILL_PROCESSES=1 did not remove"
