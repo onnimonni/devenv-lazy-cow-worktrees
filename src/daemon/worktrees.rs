@@ -292,7 +292,7 @@ impl Daemon {
         let c = rt.project.checkout(Some(&info.name), info.path.clone());
         self.servers.stop_checkout(&c).await;
         // Whatever else runs there: a server started by hand, iex, watchers.
-        worktree::kill_processes_in(&info.path, keep).await;
+        worktree::kill_processes_in(&info.path, keep, false).await;
         // Decided while the worktree (its HEAD) is still there.
         let delete_branch = pr.is_some() || self.branch_disposable(rt, info).await;
         // Files first: if they can't move, the databases stay with them.
