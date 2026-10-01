@@ -72,12 +72,23 @@ let
       -DSH_PATH='"${pkgs.bash}/bin/sh"' -DENV_PATH='"${pkgs.coreutils}/bin/env"' \
       -o $out/lib/liblazy-cow-tree-process-marker.dylib ${./process-marker.c}
   '';
+  # dyld kills every process whose DYLD_INSERT_LIBRARIES names a missing library: only
+  # while it is there (a garbage-collected store path is dropped from the list instead).
   shimEnv = lib.optionalString shim ''
     export WORKTREE_PROCESS_SHIM=${processMarkerShim}/lib/liblazy-cow-tree-process-marker.dylib
-    case ":''${DYLD_INSERT_LIBRARIES:-}:" in
-      *":$WORKTREE_PROCESS_SHIM:"*) ;;
-      *) export DYLD_INSERT_LIBRARIES="$WORKTREE_PROCESS_SHIM''${DYLD_INSERT_LIBRARIES:+:$DYLD_INSERT_LIBRARIES}" ;;
-    esac
+    if [ -r "$WORKTREE_PROCESS_SHIM" ]; then
+      case ":''${DYLD_INSERT_LIBRARIES:-}:" in
+        *":$WORKTREE_PROCESS_SHIM:"*) ;;
+        *) export DYLD_INSERT_LIBRARIES="$WORKTREE_PROCESS_SHIM''${DYLD_INSERT_LIBRARIES:+:$DYLD_INSERT_LIBRARIES}" ;;
+      esac
+    else
+      __lct_dyld=":''${DYLD_INSERT_LIBRARIES:-}:"
+      __lct_dyld=''${__lct_dyld//:$WORKTREE_PROCESS_SHIM:/:}
+      __lct_dyld=''${__lct_dyld#:}
+      __lct_dyld=''${__lct_dyld%:}
+      if [ -n "$__lct_dyld" ]; then export DYLD_INSERT_LIBRARIES=$__lct_dyld; else unset DYLD_INSERT_LIBRARIES; fi
+      unset __lct_dyld
+    fi
   '';
   # Sourced by every bash (BASH_ENV) and zsh (ZDOTDIR) started from the devenv shell, so
   # agents' tool shells (Claude Code: bash -c, Codex: zsh -lc) get the checkout they run

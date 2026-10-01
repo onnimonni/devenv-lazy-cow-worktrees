@@ -38,10 +38,13 @@ static int marker(void) {
   return a.st_dev == b.st_dev && a.st_ino == b.st_ino ? fd : -1;
 }
 
+// Nix's replacement for a SIP interpreter; none when it is gone (garbage collected):
+// then the original runs, without the library below it.
 static const char *unrestricted(const char *interpreter) {
-  if (!strcmp(interpreter, "/bin/sh")) return SH_PATH;
-  if (!strcmp(interpreter, "/usr/bin/env")) return ENV_PATH;
-  return NULL;
+  const char *to = !strcmp(interpreter, "/bin/sh")        ? SH_PATH
+                   : !strcmp(interpreter, "/usr/bin/env") ? ENV_PATH
+                                                          : NULL;
+  return to && access(to, X_OK) == 0 ? to : NULL;
 }
 
 // What to run instead of `path` so DYLD_* survives: *argv_out is malloc'd (free it).
