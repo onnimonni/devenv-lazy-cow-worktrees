@@ -74,7 +74,8 @@ primary checkout's, nor unchanged since setup finished are printed as warnings.
 Binaries (`lazy-cow-tree` and `lazy-cow-tree-cow`) for macOS (arm64) and Linux (x86_64,
 arm64) are on the
 [releases page](https://github.com/onnimonni/devenv-lazy-cow-worktrees/releases); or
-`nix profile install github:onnimonni/devenv-lazy-cow-worktrees`, or
+`nix profile install github:onnimonni/devenv-lazy-cow-worktrees` (or `#prebuilt` for the
+release binaries, no build), or
 `cargo install --git https://github.com/onnimonni/devenv-lazy-cow-worktrees`. lazy-cow-tree runs
 `postgres`/`initdb` (18+) and `redis-server` from PATH unless told where they are
 (the devenv module does).
@@ -124,7 +125,9 @@ In CI, let [cachix-action](https://github.com/cachix/cachix-action) configure it
 
 To build it yourself instead: `lazyCowTree.cachix.enable = false;` and
 `lazyCowTree.package = pkgs.callPackage (inputs.lazy-cow-tree + "/package.nix") { };`
-(your nixpkgs; compiled locally).
+(your nixpkgs; compiled locally). Or the latest release's binaries, no build (Cachix can be off too):
+`lazyCowTree.package = inputs.lazy-cow-tree.packages.${pkgs.stdenv.hostPlatform.system}.prebuilt;`
+(macOS arm64, Linux x86_64 and arm64).
 
 **2. Describe the project** in plain devenv. The module reads `processes`,
 `services.postgres` and `services.redis`, and lazy-cow-tree runs them in every
