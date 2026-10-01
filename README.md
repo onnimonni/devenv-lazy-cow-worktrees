@@ -523,8 +523,8 @@ the shell's processes (`DYLD_INSERT_LIBRARIES`, `lazyCowTree.processMarkerShim.e
 that keeps the marker open there. It only acts in processes holding a marker, and runs
 nix's `sh` and `env` for `/bin/sh` and `/usr/bin/env` (also as a script's `#!`), which
 SIP would make drop it; the shell hook restores it after SIP's bash and zsh.
-Best effort: hardened-runtime binaries (python.org's Python, notarized apps) ignore
-it, and daemons that close every fd lose the marker.
+Best effort: hardened-runtime binaries that don't allow `DYLD_*` (most notarized
+apps) ignore it, and daemons that close every fd lose the marker.
 `lazy-cow-tree worktree procs <path> [--kill]` lists (kills) them by hand.
 
 Nothing watches the filesystem: a worktree made or deleted outside the wrapper (plain

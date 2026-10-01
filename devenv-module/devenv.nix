@@ -892,7 +892,7 @@ in
     processMarkerShim.enable = mkOption {
       type = types.bool;
       default = true;
-      description = "macOS: load a small library (DYLD_INSERT_LIBRARIES) into what the devenv shell starts that keeps the worktree process marker open in children of node, bun, python and erlang, which close inherited fds, so `git worktree remove` lists (and FORCE_KILL_PROCESSES=1 kills) them too. Only acts in processes started in a worktree. Ignored by hardened-runtime binaries (python.org's Python, notarized apps). Linux reads DEVENV_ROOT from /proc instead.";
+      description = "macOS: load a small library (DYLD_INSERT_LIBRARIES) into what the devenv shell starts that keeps the worktree process marker open in children of node, bun, python and erlang, which close inherited fds, so `git worktree remove` lists (and FORCE_KILL_PROCESSES=1 kills) them too. Only acts in processes started in a worktree. Ignored by hardened-runtime binaries that don't allow DYLD environment variables (most notarized apps). Linux reads DEVENV_ROOT from /proc instead.";
     };
     git.enable = mkOption {
       type = types.bool;
