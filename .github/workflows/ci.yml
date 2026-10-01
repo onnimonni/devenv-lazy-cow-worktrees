@@ -57,3 +57,5 @@ jobs:
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
       - run: nix build .#lazy-cow-tree -L
       - run: ./result/bin/lazy-cow-tree --version && ./result/bin/lazy-cow-tree-cow --version
+      # Release binaries (prebuilt.json): Linux ones need patchelf to run.
+      - run: nix build .#prebuilt -L -o prebuilt && ./prebuilt/bin/lazy-cow-tree --version

@@ -12,13 +12,21 @@
         "aarch64-linux"
         "x86_64-linux"
       ];
-      forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+      forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f system nixpkgs.legacyPackages.${system});
+      prebuiltHashes = (nixpkgs.lib.importJSON ./prebuilt.json).hashes;
     in
     {
-      packages = forAllSystems (pkgs: rec {
-        lazy-cow-tree = pkgs.callPackage ./package.nix { };
-        default = lazy-cow-tree;
-      });
+      packages = forAllSystems (
+        system: pkgs:
+        rec {
+          lazy-cow-tree = pkgs.callPackage ./package.nix { };
+          default = lazy-cow-tree;
+        }
+        # Release binary from GitHub, on systems with one: `nix profile install .#prebuilt`.
+        // nixpkgs.lib.optionalAttrs (prebuiltHashes ? ${system}) {
+          prebuilt = pkgs.callPackage ./prebuilt.nix { };
+        }
+      );
       overlays.default = final: _prev: {
         lazy-cow-tree = final.callPackage ./package.nix { };
       };
