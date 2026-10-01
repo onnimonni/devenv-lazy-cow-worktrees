@@ -5,6 +5,7 @@
   stdenv,
   fetchurl,
   autoPatchelfHook,
+  zlib,
 }:
 
 let
@@ -30,9 +31,12 @@ stdenv.mkDerivation {
   };
   sourceRoot = name;
 
-  # Linux binaries link glibc and libgcc_s; OpenSSL is static.
+  # Linux binaries link glibc, libgcc_s and zlib; OpenSSL is static.
   nativeBuildInputs = lib.optionals stdenv.hostPlatform.isLinux [ autoPatchelfHook ];
-  buildInputs = lib.optionals stdenv.hostPlatform.isLinux [ stdenv.cc.cc.lib ];
+  buildInputs = lib.optionals stdenv.hostPlatform.isLinux [
+    stdenv.cc.cc.lib
+    zlib
+  ];
 
   installPhase = ''
     runHook preInstall
