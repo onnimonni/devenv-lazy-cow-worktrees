@@ -236,7 +236,15 @@ wgit worktree add -q -b procs .claude/worktrees/procs
 (cd .claude/worktrees/procs && bash -c 'eval "$("$1" shell-hook)"
   perl -e "use POSIX; fork and exit; POSIX::setsid(); chdir q(/); exec q(sleep), q(4242)" </dev/null >/dev/null 2>&1' _ "$bin")
 eventually 5 pgrep -f 'sleep 4242$' || fail "detached process did not start"
-if out=$(wgit worktree remove procs 2>&1); then fail "removed with a process left: $out"; fi
+procs_debug() {
+  local p; p=$(pgrep -f 'sleep 4242$' | head -1)
+  echo "procs: $("$bin" worktree procs .claude/worktrees/procs 2>&1)"
+  echo "sleep $p: ppid $(ps -o ppid= -p "$p") $(lsof -p "$p" 2>/dev/null | grep -E 'cwd|DIR' | tr -s ' ' | cut -d' ' -f4-)"
+  git worktree list --porcelain
+}
+dbg=$(procs_debug 2>&1)
+if out=$(wgit worktree remove procs 2>&1); then fail "removed with a process left: $out
+$dbg"; fi
 [[ $out == *'with command "sleep 4242" was launched from this worktree'* ]] || fail "not listed: $out"
 [[ -d .claude/worktrees/procs ]] || fail "worktree removed anyway"
 FORCE_KILL_PROCESSES=1 wgit worktree remove procs || fail "FORCE_KILL_PROCESSES=1 did not remove"
