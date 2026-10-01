@@ -260,8 +260,8 @@ if [[ $(uname -s) == Darwin ]] && command -v cc >/dev/null; then
   cc -dynamiclib -O2 -o "$home/process-marker.dylib" "$src/devenv-module/process-marker.c"
   wgit worktree add -q -b shim .claude/worktrees/shim
   (cd .claude/worktrees/shim && bash -c 'eval "$("$1" shell-hook)"; export DYLD_INSERT_LIBRARIES=$2
-    '"$python"' -c "import subprocess as s, time; p = s.Popen([\"sleep\", \"4343\"], cwd=\"/\", start_new_session=True, stdin=s.DEVNULL, stdout=s.DEVNULL); time.sleep(0.5); print(\"child\", p.pid, p.poll())"; sw_vers -productVersion; codesign -dv "$(python3 -c "import sys; print(sys.executable)")" 2>&1 | grep flags' \
-    _ "$bin" "$home/process-marker.dylib") >"$work/shim.log" 2>&1
+    '"$python"' -c "import subprocess as s, time; p = s.Popen([\"sleep\", \"4343\"], cwd=\"/\", start_new_session=True, stdin=s.DEVNULL, stdout=s.DEVNULL); time.sleep(0.5); print(\"child\", p.pid, p.poll())"; echo "python rc $?"; '"$python"' -c "print(1)"; echo "plain rc $?"; DYLD_PRINT_LIBRARIES=1 '"$python"' -c "" 2>&1 | grep -i marker; sw_vers -productVersion; codesign -dv --entitlements - "$(DYLD_INSERT_LIBRARIES= python3 -c "import sys, os; print(os.path.realpath(sys.executable))")" 2>&1 | grep -iE "flags|cs\."; true' \
+    _ "$bin" "$home/process-marker.dylib") >"$work/shim.log" 2>&1 || echo "bash rc $?" >>"$work/shim.log"; cat "$work/shim.log"
   eventually 5 pgrep -f 'sleep 4343$' || fail "python's child did not start ($python: $(command -v "${python%% *}")): $(cat "$work/shim.log")"
   out=$("$bin" worktree procs .claude/worktrees/shim)
   [[ $out == *'"sleep 4343"'* ]] || fail "python's detached child not found with the library: $out"
