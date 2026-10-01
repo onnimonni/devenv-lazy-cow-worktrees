@@ -66,7 +66,9 @@ let
   shim = cfg.processMarkerShim.enable && pkgs.stdenv.hostPlatform.isDarwin;
   processMarkerShim = pkgs.runCommandCC "lazy-cow-tree-process-marker" { } ''
     mkdir -p $out/lib
-    $CC -dynamiclib -O2 \
+    # Universal: arm64e (Apple's own binaries, when SIP is off they honor DYLD_*) and
+    # x86_64 (Rosetta) processes would be killed by an arm64-only library.
+    $CC -dynamiclib -O2 -arch arm64 -arch arm64e -arch x86_64 \
       -DSH_PATH='"${pkgs.bash}/bin/sh"' -DENV_PATH='"${pkgs.coreutils}/bin/env"' \
       -o $out/lib/liblazy-cow-tree-process-marker.dylib ${./process-marker.c}
   '';

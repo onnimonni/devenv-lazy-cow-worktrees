@@ -257,7 +257,7 @@ pass "git wrapper: worktree remove lists, then kills, what a shell there started
 # macOS: python's subprocess closes inherited fds in its children; the devenv module's
 # library (process-marker.c, DYLD_INSERT_LIBRARIES) keeps the marker there.
 if [[ $(uname -s) == Darwin ]] && command -v cc >/dev/null; then
-  cc -dynamiclib -O2 -o "$home/process-marker.dylib" "$src/devenv-module/process-marker.c"
+  cc -dynamiclib -O2 -arch arm64 -arch arm64e -arch x86_64 -o "$home/process-marker.dylib" "$src/devenv-module/process-marker.c"
   wgit worktree add -q -b shim .claude/worktrees/shim
   (cd .claude/worktrees/shim && bash -c 'eval "$("$1" shell-hook)"; export DYLD_INSERT_LIBRARIES=$2
     '"$python"' -c "import subprocess as s, time; p = s.Popen([\"sleep\", \"4343\"], cwd=\"/\", start_new_session=True, stdin=s.DEVNULL, stdout=s.DEVNULL); time.sleep(0.5); print(\"child\", p.pid, p.poll())"; echo "python rc $?"; '"$python"' -c "print(1)"; echo "plain rc $?"; DYLD_PRINT_LIBRARIES=1 '"$python"' -c "" 2>&1 | grep -i marker; sw_vers -productVersion; codesign -dv --entitlements - "$(DYLD_INSERT_LIBRARIES= python3 -c "import sys, os; print(os.path.realpath(sys.executable))")" 2>&1 | grep -iE "flags|cs\."; true' \
