@@ -241,6 +241,8 @@ procs_debug() {
   echo "procs: $("$bin" worktree procs .claude/worktrees/procs 2>&1)"
   echo "sleep $p: ppid $(ps -o ppid= -p "$p") $(lsof -p "$p" 2>/dev/null | grep -E 'cwd|DIR' | tr -s ' ' | cut -d' ' -f4-)"
   git worktree list --porcelain
+  echo "outer marker: ${WORKTREE_PROCESS_MARKER:-}"
+  (cd .claude/worktrees/procs && "$bin" shell-hook 2>&1 | grep -iE 'marker|exec|lct' ; echo "hook rc $?")
 }
 dbg=$(procs_debug 2>&1)
 if out=$(wgit worktree remove procs 2>&1); then fail "removed with a process left: $out
