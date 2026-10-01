@@ -315,10 +315,12 @@ fn marker_script(
     match &want {
         Some(w) => {
             let q = shell_quote(w);
+            // No `{ exec ...; } 2>/dev/null`: bash 3.2 undoes the exec when the group
+            // ends. And it keeps an fd open already (inherited) on `exec 213<`: closed first.
             out.push_str(&format!(
                 "unset {M}\n\
-                 if [ -n \"${{ZSH_VERSION:-}}\" ]; then {{ exec {{__lct_fd}}<{q}; }} 2>/dev/null && export {M}=\"$__lct_fd:\"{q}; \
-                 else {{ exec 213<{q}; }} 2>/dev/null && export {M}={}; fi\n",
+                 if [ -n \"${{ZSH_VERSION:-}}\" ]; then [ -r {q} ] && exec {{__lct_fd}}<{q} && export {M}=\"$__lct_fd:\"{q}; \
+                 else exec 213<&-; [ -r {q} ] && exec 213<{q} && export {M}={}; fi\n",
                 shell_quote(&format!("213:{w}"))
             ));
         }
@@ -898,7 +900,7 @@ mod tests {
         let s = marker_script(Some(wt), None, open);
         assert!(s.contains("exec 213<'/src/app/.claude/worktrees/x'"));
         assert!(s.contains("export WORKTREE_PROCESS_MARKER='213:/src/app/.claude/worktrees/x'"));
-        assert!(!s.contains("<&-"));
+        assert!(!s.contains("exec {__lct_fd}<&-"), "no zsh marker to close");
         // Still there: kept.
         let cur = "213:/src/app/.claude/worktrees/x";
         assert_eq!(marker_script(Some(wt), Some(cur), open), "");
@@ -917,7 +919,7 @@ mod tests {
         // An fd that isn't the marker any more (inherited environment, not the fd) is
         // left alone; the same worktree is opened again.
         let s = marker_script(Some(wt), Some(cur), |_, _| false);
-        assert!(!s.contains("<&-"));
+        assert!(!s.contains("exec {__lct_fd}<&-"), "not the marker: kept");
         assert!(s.contains("exec 213<"));
     }
 

@@ -234,17 +234,14 @@ pass "git wrapper: worktree remove cleaned up"
 # through the shell hook's marker; `worktree remove` refuses until asked to kill it.
 wgit worktree add -q -b procs .claude/worktrees/procs
 (cd .claude/worktrees/procs && bash -c 'eval "$("$1" shell-hook)"
-  echo "inner: bash $BASH_VERSION marker=${WORKTREE_PROCESS_MARKER:-} ulimit=$(ulimit -n)"; lsof -a -p $$ -d 213 2>&1 | tail -1
-  perl -e "use POSIX; fork and exit; POSIX::setsid(); chdir q(/); exec q(sleep), q(4242)" </dev/null >/dev/null 2>&1' _ "$bin") >"$work/inner.log" 2>&1
-
+  perl -e "use POSIX; fork and exit; POSIX::setsid(); chdir q(/); exec q(sleep), q(4242)" </dev/null >/dev/null 2>&1' _ "$bin")
 eventually 5 pgrep -f 'sleep 4242$' || fail "detached process did not start"
 procs_debug() {
   local p; p=$(pgrep -f 'sleep 4242$' | head -1)
   echo "procs: $("$bin" worktree procs .claude/worktrees/procs 2>&1)"
   echo "sleep $p: ppid $(ps -o ppid= -p "$p") $(lsof -p "$p" 2>/dev/null | grep -E 'cwd|DIR' | tr -s ' ' | cut -d' ' -f4-)"
   git worktree list --porcelain
-  echo "outer marker: ${WORKTREE_PROCESS_MARKER:-}"; cat "$work/inner.log"
-  (cd .claude/worktrees/procs && "$bin" shell-hook 2>&1 | grep -iE 'marker|exec|lct' ; echo "hook rc $?")
+  echo "outer marker: ${WORKTREE_PROCESS_MARKER:-}"
 }
 dbg=$(procs_debug 2>&1)
 if out=$(wgit worktree remove procs 2>&1); then fail "removed with a process left: $out
