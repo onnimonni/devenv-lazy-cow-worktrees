@@ -31,7 +31,7 @@ mod worktree;
 
 use std::{
     collections::BTreeMap,
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -156,6 +156,16 @@ enum WorktreeCmd {
     },
     /// List worktrees.
     List,
+    /// What still runs in a worktree: started there (by a shell in it, even if it
+    /// detached since) and not run by lazy-cow-tree (the daemon's services, which it
+    /// stops itself; `lazy-cow-tree lsp`'s language servers).
+    /// For the `git` wrapper's `worktree remove`.
+    Procs {
+        path: PathBuf,
+        /// SIGKILL them (with their descendants) first; lists what survived.
+        #[arg(long)]
+        kill: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -268,6 +278,57 @@ impl ShellState {
         }
         out
     }
+}
+
+/// Shell code keeping the shell's process marker (`worktree::MARKER`, `<fd>:<path>`)
+/// open on `want` (`worktree::marker_path` of the worktree it is in), closing one of
+/// another worktree: what the shell starts inherits it, so `worktree procs` finds it
+/// even after it detached.
+/// `open_on(fd, path)`: whether the shell's `fd` is still that marker (the hook runs
+/// with the shell's fds; one whose environment outlived its fds mustn't close another).
+/// bash (3.2 too) takes fd 213; zsh only names fds above 9 through a variable.
+fn marker_script(
+    want: Option<&Path>,
+    current: Option<&str>,
+    open_on: impl Fn(i32, &str) -> bool,
+) -> String {
+    const M: &str = worktree::MARKER;
+    let current = current.and_then(|c| {
+        let (fd, path) = c.split_once(':')?;
+        Some((fd.parse::<i32>().ok()?, path))
+    });
+    let want = want.map(|p| p.to_string_lossy().into_owned());
+    if let (Some((fd, path)), Some(w)) = (current, &want)
+        && path == w
+        && open_on(fd, path)
+    {
+        return String::new();
+    }
+    let mut out = String::new();
+    if let Some((fd, path)) = current
+        && open_on(fd, path)
+    {
+        out.push_str(&format!(
+            "if [ -n \"${{ZSH_VERSION:-}}\" ]; then __lct_fd={fd}; exec {{__lct_fd}}<&-; else exec {fd}<&-; fi\n"
+        ));
+    }
+    match &want {
+        Some(w) => {
+            let q = shell_quote(w);
+            out.push_str(&format!(
+                "unset {M}\n\
+                 if [ -n \"${{ZSH_VERSION:-}}\" ]; then {{ exec {{__lct_fd}}<{q}; }} 2>/dev/null && export {M}=\"$__lct_fd:\"{q}; \
+                 else {{ exec 213<{q}; }} 2>/dev/null && export {M}={}; fi\n",
+                shell_quote(&format!("213:{w}"))
+            ));
+        }
+        None if current.is_some() => out.push_str(&format!("unset {M}\n")),
+        None => {}
+    }
+    if !out.is_empty() {
+        out.push_str("unset __lct_fd\n");
+    }
+    out
 }
 
 /// The environment of `path`'s checkout (`service`'s, else the default service's).
@@ -415,6 +476,15 @@ async fn remove(root: PathBuf, name: String, force: bool) -> Result<()> {
     Ok(())
 }
 
+/// A command line on one line, at most 120 characters.
+fn short_command(c: &str) -> String {
+    let c = c.replace(['\n', '\r'], " ");
+    match c.char_indices().nth(119) {
+        Some((i, _)) => format!("{}…", &c[..i]),
+        None => c,
+    }
+}
+
 fn print_status(s: &daemon::Status) {
     println!(
         "daemon {} · postgres 127.0.0.1:{} · redis 127.0.0.1:{} · https :{}",
@@ -485,6 +555,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Cmd::Serve { project, path } => {
+            worktree::drop_marker();
             let p = project_for(&path, project)?;
             daemon::serve(cli.global, Some(p)).await
         }
@@ -493,6 +564,7 @@ async fn main() -> Result<()> {
             https_listen,
             control_socket,
         } => {
+            worktree::drop_marker();
             let global = Global {
                 http_port: listen.port(),
                 https_port: https_listen.map_or(cli.global.https_port, |a| a.port()),
@@ -509,6 +581,18 @@ async fn main() -> Result<()> {
             let state = ShellState::from_env();
             let env = hook_env(&cli.global, project, &path, service.as_deref(), &state);
             print!("{}", state.script(&env, |k| std::env::var(k).ok()));
+            let worktree = config::locate(&path)
+                .ok()
+                .and_then(|(_, wt, co_path)| wt.and_then(|_| worktree::marker_path(&co_path)));
+            let current = std::env::var(worktree::MARKER).ok();
+            print!(
+                "{}",
+                marker_script(
+                    worktree.as_deref(),
+                    current.as_deref(),
+                    worktree::fd_open_on
+                )
+            );
             Ok(())
         }
         Cmd::Reconcile { path } => {
@@ -540,6 +624,30 @@ async fn main() -> Result<()> {
                     c.url,
                     c.checkout.path.display()
                 );
+            }
+            Ok(())
+        }
+        Cmd::Worktree(WorktreeCmd::Procs { path, kill }) => {
+            let dir = path
+                .canonicalize()
+                .with_context(|| format!("no worktree {}", path.display()))?;
+            let keep = worktree::ancestors();
+            if kill {
+                worktree::kill_processes_in(&dir, &keep, true).await;
+            }
+            let mut out = std::io::stdout().lock();
+            for l in worktree::processes_left(&dir, &keep) {
+                // A closed pipe (`| head`) is no error.
+                if writeln!(
+                    out,
+                    "pid {} with command \"{}\" was launched from this worktree and is still running",
+                    l.pid,
+                    short_command(&l.command)
+                )
+                .is_err()
+                {
+                    break;
+                }
             }
             Ok(())
         }
@@ -778,6 +886,46 @@ mod tests {
             .find_map(|l| l.strip_prefix(&format!("export {SHELL_STATE}='")))
             .unwrap();
         serde_json::from_str(line.strip_suffix('\'').unwrap()).unwrap()
+    }
+
+    #[test]
+    fn marker_follows_the_worktree_the_shell_is_in() {
+        let open = |_: i32, _: &str| true;
+        let wt = Path::new("/src/app/.claude/worktrees/x");
+        // Outside worktrees, none before: nothing to do.
+        assert_eq!(marker_script(None, None, open), "");
+        // Entering one opens it.
+        let s = marker_script(Some(wt), None, open);
+        assert!(s.contains("exec 213<'/src/app/.claude/worktrees/x'"));
+        assert!(s.contains("export WORKTREE_PROCESS_MARKER='213:/src/app/.claude/worktrees/x'"));
+        assert!(!s.contains("<&-"));
+        // Still there: kept.
+        let cur = "213:/src/app/.claude/worktrees/x";
+        assert_eq!(marker_script(Some(wt), Some(cur), open), "");
+        // Another worktree: closes the old one first.
+        let s = marker_script(
+            Some(Path::new("/src/app/.claude/worktrees/y")),
+            Some(cur),
+            open,
+        );
+        assert!(s.starts_with("if [ -n \"${ZSH_VERSION:-}\" ]; then __lct_fd=213; exec {__lct_fd}<&-; else exec 213<&-; fi\n"));
+        assert!(s.contains("213:/src/app/.claude/worktrees/y"));
+        // Left the worktrees: closed and unset.
+        let s = marker_script(None, Some("12:/src/app/.claude/worktrees/x"), open);
+        assert!(s.contains("__lct_fd=12; exec {__lct_fd}<&-; else exec 12<&-"));
+        assert!(s.contains("unset WORKTREE_PROCESS_MARKER\n"));
+        // An fd that isn't the marker any more (inherited environment, not the fd) is
+        // left alone; the same worktree is opened again.
+        let s = marker_script(Some(wt), Some(cur), |_, _| false);
+        assert!(!s.contains("<&-"));
+        assert!(s.contains("exec 213<"));
+    }
+
+    #[test]
+    fn short_commands_fit_one_line() {
+        assert_eq!(short_command("npm exec\nvitest"), "npm exec vitest");
+        let long = "x".repeat(200);
+        assert_eq!(short_command(&long).chars().count(), 120);
     }
 
     #[test]

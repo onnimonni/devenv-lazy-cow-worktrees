@@ -59,8 +59,10 @@ get the environment of the worktree they're in.
 | **LSP proxy** | `lazy-cow-tree lsp -- <server>` runs one language server per worktree, routes each request by file, and drops results from other worktrees. Wrapped in the devenv shell and given to Claude Code, Codex and pi (dexter, typescript-language-server, pyright and rust-analyzer for now). |
 
 Removing a worktree SIGKILLs everything running in it (each service's process group,
-plus any process whose working directory or executable is inside it, with all
-descendants: the BEAM, esbuild, tailwind, node, …; never the process asking for the
+plus any process whose working directory or executable is inside it or that a shell in
+it started, even one that detached or `cd`'d away since, such as a tmux server or an
+agent session started there, with all descendants: the BEAM, esbuild, tailwind, node, …;
+never the process asking for the
 removal or its ancestors, such as the Claude Code session), stops its redis-server, drops
 its databases and role, deletes its branch (even `--force` keeps one with commits
 that aren't on the base branch, pushed, or in its merged PR, renamed to
@@ -292,11 +294,13 @@ of the devenv shell that names a path in the primary point into the worktree ins
 for the services run there, so scripts using `$DEVENV_ROOT` act on the checkout you're in. How: `BASH_ENV` (every non-interactive
 bash) and `ZDOTDIR` (every zsh; Codex runs commands with `zsh -lc`) source a hook
 that defines the `cd`/`pushd`/`popd` wrappers and runs `lazy-cow-tree shell-hook`
-(hidden command, ~10 ms), which also records in `LAZY_COW_TREE_SHELL` what it set. Your own
+(hidden command, ~10 ms), which also records in `LAZY_COW_TREE_SHELL` what it set, and in
+a worktree keeps an fd on its git admin dir (`.git/worktrees/<name>`) open (`WORKTREE_PROCESS_MARKER`, see `git worktree remove`). Your own
 `BASH_ENV` and zsh startup files (from your `ZDOTDIR`, else `$HOME`) still run.
 `codex` is wrapped to run with `--no-daemon`: a shared `codex app-server` started
 elsewhere would run commands with its own environment. Not covered: `builtin cd`,
-fish. Turn it off with `lazyCowTree.shellHook.enable = false` (then `enterShell`
+fish, an interactive bash started from the devenv shell (it doesn't read `BASH_ENV`:
+it keeps the environment and process marker of where it started). Turn it off with `lazyCowTree.shellHook.enable = false` (then `enterShell`
 only exports the environment of the checkout it starts in) and
 `lazyCowTree.codex.noDaemon = false`.
 
@@ -504,7 +508,19 @@ reconcile too, which drops a removed worktree's databases, role and redis-server
 With a GitHub `origin`, `git worktree remove` refuses while the worktree's branch has an
 open pull request (checked with `gh`; one error line naming the PR); a merged, closed
 or missing PR removes it as usual, and if `gh` can't tell (not logged in, offline) it
-removes it too. `FORCE_ALLOW_OPEN_PR=1` skips the check.
+removes it too. `FORCE_ALLOW_OPEN_PR=1` skips the check. It also refuses while something
+started in the worktree still runs, other than what lazy-cow-tree runs (its services, which the daemon stops; language
+servers of `lazy-cow-tree lsp`),
+listing each (`pid 123 with command "npm exec vitest" was launched from this worktree
+and is still running`); `FORCE_KILL_PROCESSES=1` SIGKILLs them, with their descendants,
+and removes it. "Started in it": its working directory or executable is inside it, or
+it inherited the marker the shell hook keeps open in every shell inside a worktree
+(`WORKTREE_PROCESS_MARKER`, an fd on the worktree's git admin dir, kept across `setsid`, `cd /` and double
+forks; on Linux also `DEVENV_ROOT` in its environment). Best effort: children of node,
+bun and python subprocesses lose the fd, so one of those that left the worktree and
+outlived its parent is missed on macOS
+([#46](https://github.com/onnimonni/devenv-lazy-cow-worktrees/issues/46)).
+`lazy-cow-tree worktree procs <path> [--kill]` lists (kills) them by hand.
 
 Nothing watches the filesystem: a worktree made or deleted outside the wrapper (plain
 git elsewhere, `rm -rf`) is picked up by the daemon within a minute, and one made by

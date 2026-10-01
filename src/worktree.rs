@@ -23,7 +23,9 @@ use crate::{
 
 mod procs;
 
-pub use self::procs::{ancestors, kill_processes_in};
+pub use self::procs::{
+    MARKER, ancestors, drop_marker, fd_open_on, kill_processes_in, marker_path, processes_left,
+};
 
 #[derive(Debug, Clone)]
 pub struct Info {

@@ -230,6 +230,20 @@ role_gone() { ! role_exists; }
 eventually 30 role_gone || fail "git worktree remove: its role survived"
 pass "git wrapper: worktree remove cleaned up"
 
+# Something a shell in a worktree started, detached (setsid, cd /, parent gone): found
+# through the shell hook's marker; `worktree remove` refuses until asked to kill it.
+wgit worktree add -q -b procs .claude/worktrees/procs
+(cd .claude/worktrees/procs && bash -c 'eval "$("$1" shell-hook)"
+  perl -e "use POSIX; fork and exit; POSIX::setsid(); chdir q(/); exec q(sleep), q(4242)" </dev/null >/dev/null 2>&1' _ "$bin")
+eventually 5 pgrep -f 'sleep 4242$' || fail "detached process did not start"
+if out=$(wgit worktree remove procs 2>&1); then fail "removed with a process left: $out"; fi
+[[ $out == *'with command "sleep 4242" was launched from this worktree'* ]] || fail "not listed: $out"
+[[ -d .claude/worktrees/procs ]] || fail "worktree removed anyway"
+FORCE_KILL_PROCESSES=1 wgit worktree remove procs || fail "FORCE_KILL_PROCESSES=1 did not remove"
+gone() { ! pgrep -f 'sleep 4242$' >/dev/null; }
+eventually 5 gone || fail "detached process survived"
+pass "git wrapper: worktree remove lists, then kills, what a shell there started"
+
 mix_starts() { [[ $(wc -l <"$home/mix-starts.log") -eq $1 ]]; }
 setups() { [[ $(wc -l <"$home/setup.log") -eq $1 ]]; }
 curl_lf -o /dev/null "https://phx.demo.localhost:8443/" || fail "mix service did not start"
