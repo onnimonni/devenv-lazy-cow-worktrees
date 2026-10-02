@@ -411,6 +411,7 @@ fn global() -> Global {
         redis_server: None,
         postgres_extensions: Some("postgis, vector  pg_trgm,".into()),
         devenv_proxy_socket: None,
+        devenv_proxy_ca: false,
         postgres_durable: false,
         redis_idle_timeout: None,
     }

@@ -679,7 +679,10 @@ async fn main() -> Result<()> {
         }
         Cmd::Trust => {
             let ca = tls::Ca::load_or_create(&config::home().join("ca"))?;
-            tls::trust(&ca)?;
+            if !tls::trust(&ca)? {
+                eprintln!("already trusted {}", config::ca_cert_path().display());
+                return Ok(());
+            }
             eprintln!("trusted {}", config::ca_cert_path().display());
             eprintln!(
                 "Firefox and Node use their own stores: NODE_EXTRA_CA_CERTS is in the devenv shell."

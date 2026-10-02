@@ -182,15 +182,25 @@ pub fn server_config(certificates: Arc<dyn ResolvesServerCert>) -> rustls::Serve
 }
 
 /// Add the CA to the login keychain and trust it for TLS (macOS asks for the
-/// password). Uses the Security framework directly, no `security` subprocess.
+/// password). Uses the Security framework directly, no `security` subprocess. False:
+/// it already was, nothing asked.
 #[cfg(target_os = "macos")]
-pub fn trust(ca: &Ca) -> Result<()> {
+pub fn trust(ca: &Ca) -> Result<bool> {
     use security_framework::{
         certificate::SecCertificate,
         item::{ItemAddOptions, ItemAddValue},
+        policy::SecPolicy,
+        trust::SecTrust,
         trust_settings::{Domain, TrustSettings},
     };
     let cert = SecCertificate::from_der(ca.cert_der())?;
+    // Already trusted (as `security verify-cert` checks): no password prompt, so the
+    // nix-darwin module can run this on every switch.
+    if SecTrust::create_with_certificates(std::slice::from_ref(&cert), &[SecPolicy::create_x509()])
+        .is_ok_and(|t| t.evaluate_with_error().is_ok())
+    {
+        return Ok(false);
+    }
     // errSecDuplicateItem (-25299): already in the keychain.
     if let Err(e) = ItemAddOptions::new(ItemAddValue::Ref(
         security_framework::item::AddRef::Certificate(cert.clone()),
@@ -203,11 +213,11 @@ pub fn trust(ca: &Ca) -> Result<()> {
     TrustSettings::new(Domain::User)
         .set_trust_settings_always(&cert)
         .context("trusting the CA")?;
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn trust(_ca: &Ca) -> Result<()> {
+pub fn trust(_ca: &Ca) -> Result<bool> {
     anyhow::bail!(
         "automatic trust is macOS only; add {} to your system and browser trust stores",
         crate::config::ca_cert_path().display()

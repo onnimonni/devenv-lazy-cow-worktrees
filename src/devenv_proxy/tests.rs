@@ -59,7 +59,7 @@ fn owners_cannot_take_each_others_routes() {
 
 #[test]
 fn lazy_cow_tree_hosts_and_non_local_routes_are_refused() {
-    let t = DevenvRoutes::new(Arc::new(|h| h == "web.app.localhost"), None);
+    let t = DevenvRoutes::new(Arc::new(|h| h == "web.app.localhost"), None, false);
     let e = t
         .register(route("web.app.localhost", 3000, "x"))
         .unwrap_err();
@@ -68,6 +68,24 @@ fn lazy_cow_tree_hosts_and_non_local_routes_are_refused() {
     let mut public = route("web.x.localhost", 3000, "x");
     public.upstream = SocketAddr::from(([192, 0, 2, 1], 3000));
     assert!(t.register(public).is_err());
+}
+
+#[test]
+fn own_ca_ignores_the_projects_certificate() {
+    let mut tls = route("web.x.localhost", 3000, "x");
+    tls.tls = Some(TlsConfig {
+        certificate: "/nonexistent/cert.pem".into(),
+        key: "/nonexistent/key.pem".into(),
+    });
+    let project = DevenvRoutes::new(Arc::new(|_| false), None, false);
+    assert!(project.register(tls.clone()).is_err());
+    let own = DevenvRoutes::new(Arc::new(|_| false), None, true);
+    own.register(tls).unwrap();
+    assert!(own.certificate("web.x.localhost").is_none());
+    assert_eq!(
+        own.list()[0].tls.as_ref().map(|t| t.key.as_path()),
+        Some(Path::new("/nonexistent/key.pem"))
+    );
 }
 
 #[test]
