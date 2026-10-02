@@ -122,6 +122,12 @@ pub struct Global {
     #[arg(long, env = "LAZY_COW_TREE_DEVENV_PROXY_SOCKET", global = true)]
     #[serde(default)]
     pub devenv_proxy_socket: Option<PathBuf>,
+    /// Serve the hostnames devenv projects register with lazy-cow-tree's CA (trusted
+    /// once, `lazy-cow-tree trust`) instead of each project's own mkcert certificate.
+    /// With TRUST_STORES=none mkcert then never asks to trust a new project's CA.
+    #[arg(long, env = "LAZY_COW_TREE_DEVENV_PROXY_CA", global = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new())]
+    #[serde(default)]
+    pub devenv_proxy_ca: bool,
     /// PostgreSQL keeps its data safe (on disk, fsync on) instead of the RAM disk with
     /// fsync, synchronous_commit and full_page_writes off. Daemon-wide: projects with
     /// another value are refused.

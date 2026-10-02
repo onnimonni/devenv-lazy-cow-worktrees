@@ -576,7 +576,7 @@ lazy-cow-tree service start|stop|restart|log [-s <service>] [<worktree> | .]
 lazy-cow-tree status                       # projects, worktrees, services, databases
 lazy-cow-tree sync                         # pull, merge, remove merged, migrate now
 lazy-cow-tree snapshot                     # template := the primary's dev database
-lazy-cow-tree trust                        # trust the local CA
+lazy-cow-tree trust                        # trust the local CA (no-op once trusted)
 lazy-cow-tree cert show                    # lazyCowTree.tls.domain's certificate: names, expiry, what it lacks
 lazy-cow-tree down [--eject]               # stop the daemon; --eject drops the RAM disk
 lazy-cow-tree lsp -- <server> [args]
@@ -618,6 +618,44 @@ over plain HTTP, like with devenv's proxy. Nothing changes in that project.
   socket; `off` disables it.
 - Routes live in memory: after a daemon restart, run `devenv up` again in those
   projects.
+- `--devenv-proxy-ca` (`LAZY_COW_TREE_DEVENV_PROXY_CA=1`) serves those hostnames
+  with lazy-cow-tree's CA instead of the project's mkcert certificate. Node in such
+  a project still trusts only its mkcert CA (`NODE_EXTRA_CA_CERTS`).
+
+### nix-darwin: one CA, no trust prompt per project
+
+devenv gives every project (and every worktree that runs devenv) its own mkcert CA
+and runs `mkcert -install` for it: a "System Certificate Trust Settings" password
+prompt each time. The nix-darwin module makes lazy-cow-tree the proxy for every
+devenv project and stops those prompts:
+
+```nix
+# flake.nix of your nix-darwin configuration
+{
+  inputs.lazy-cow-tree.url = "github:onnimonni/devenv-lazy-cow-worktrees";
+
+  outputs = { nix-darwin, lazy-cow-tree, ... }: {
+    darwinConfigurations.my-mac = nix-darwin.lib.darwinSystem {
+      modules = [
+        lazy-cow-tree.darwinModules.default
+        {
+          services.lazy-cow-tree.enable = true;
+          # user = "me";             # default: system.primaryUser
+          # mkcertTrustStores = "nss";  # default "none"; null = mkcert's default
+        }
+      ];
+    };
+  };
+}
+```
+
+For your shells and everything launchd starts it sets `DEVENV_PROXY_BINARY` (devenv
+starts lazy-cow-tree instead of `devenv-proxy`), `TRUST_STORES=none` (mkcert, devenv's
+included, creates CAs but never touches the keychain) and
+`LAZY_COW_TREE_DEVENV_PROXY_CA=1`. Activation runs `lazy-cow-tree trust` as the user,
+which asks for the password only while the CA isn't trusted yet: once, not on
+every `darwin-rebuild switch`. Open shells pick the variables up after a restart; a
+daemon already running keeps its settings until `lazy-cow-tree down`.
 
 ## Notes
 

@@ -40,5 +40,15 @@
           imports = [ ./devenv-module/devenv.nix ];
           lazyCowTree.package = lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.default;
         };
+      # nix-darwin: lazy-cow-tree replaces devenv-proxy for every project, one CA
+      # trusted once (darwin-module/default.nix).
+      darwinModules.default =
+        { pkgs, lib, ... }:
+        {
+          imports = [ ./darwin-module ];
+          services.lazy-cow-tree.package =
+            lib.mkDefault
+              self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+        };
     };
 }
