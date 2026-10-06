@@ -104,8 +104,15 @@ pub fn leaf(der: &[u8]) -> Result<Leaf> {
     })
 }
 
-/// The GitHub repository of the checkout's `remote`, with the token gh has.
-pub fn repo_client(root: &Path, remote: &str) -> Result<github::Client> {
+/// The GitHub repository with the certificates, with the token gh has:
+/// `repository` (`lazyCowTree.tls.githubRepository`), else the checkout's `remote`'s.
+pub fn repo_client(root: &Path, remote: &str, repository: Option<&str>) -> Result<github::Client> {
+    if let Some(r) = repository {
+        let repo =
+            github::parse_repo(r).ok_or_else(|| anyhow!("{r} is not a GitHub repository"))?;
+        let token = github::auth_token(&repo.host)?;
+        return github::Client::new(repo, token);
+    }
     let repo = git2::Repository::open(root)?
         .find_remote(remote)?
         .url()

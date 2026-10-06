@@ -539,10 +539,12 @@ phone simulator, Node, curl and CI job accepts it.
 
 ```nix
 lazyCowTree.tls.domain = "dev.example.com";   # hostnames: <worktree>.<service>.<project>.dev.example.com
+lazyCowTree.tls.githubRepository = "my-org/certs";  # optional: the artifact's repository, default the checkout's remote
 ```
 
 Set up [onnimonni/trusted-https-certificate-to-artifacts-action](https://github.com/onnimonni/trusted-https-certificate-to-artifacts-action)
-in the project's GitHub repository; lazy-cow-tree serves the certificates it keeps
+in the project's GitHub repository (or the one `lazyCowTree.tls.githubRepository` names,
+e.g. `example-org/certificates` issuing them for several projects); lazy-cow-tree serves the certificates it keeps
 there (the newest `https-certificate` artifact, a zip with one `.pem` per domain, e.g. `_._.app.example-dev.com.pem`):
 
 - It downloads them with the token `gh` has, only from a private (or internal)

@@ -243,6 +243,12 @@ pub struct ProjectSettings {
     #[arg(long, env = "LAZY_COW_TREE_TLS_DOMAIN", value_parser = parse_domain)]
     #[serde(default)]
     pub tls_domain: Option<String>,
+    /// GitHub repository whose `https-certificate` artifact has the domain's
+    /// certificates (`owner/repo`, `host/owner/repo` or a URL), when it isn't the
+    /// checkout's `remote`: e.g. one repository issuing them for several projects.
+    #[arg(long, env = "LAZY_COW_TREE_TLS_GITHUB_REPOSITORY", value_parser = parse_repository)]
+    #[serde(default)]
+    pub tls_github_repository: Option<String>,
     /// Service names the certificate covers besides the project's own services, so
     /// adding one of them needs no new certificate.
     #[arg(
