@@ -97,8 +97,12 @@ let
   # Shell functions aren't inherited, env vars are.
   shellHook = pkgs.writeText "lazy-cow-tree-shell-hook.sh" ''
     ${shimEnv}
-    if [ -n "''${BASH_VERSION:-}" ] && [ -n "''${LAZY_COW_TREE_BASH_ENV:-}" ]; then
-      . "$LAZY_COW_TREE_BASH_ENV"
+    # Never a lazy-cow-tree hook (an older build's would source itself forever).
+    if [ -n "''${BASH_VERSION:-}" ]; then
+      case "''${LAZY_COW_TREE_BASH_ENV:-}" in
+        "" | *-lazy-cow-tree-shell-hook.sh) ;;
+        *) . "$LAZY_COW_TREE_BASH_ENV" ;;
+      esac
     fi
     __lazy_cow_tree_env() { eval "$(command ${exe} shell-hook 2>/dev/null)"; }
     cd() { builtin cd "$@" && __lazy_cow_tree_env; }
@@ -127,6 +131,7 @@ let
     for f in .zshenv .zprofile .zshrc .zlogin .zlogout; do
       cat >> "$out"/$f <<EOF
     ZDOTDIR=\''${LAZY_COW_TREE_ZDOTDIR:-\$HOME}
+    case \$ZDOTDIR in *-lazy-cow-tree-zdotdir) ZDOTDIR=\$HOME ;; esac
     [ -f "\$ZDOTDIR/$f" ] && . "\$ZDOTDIR/$f"
     LAZY_COW_TREE_ZDOTDIR=\$ZDOTDIR ZDOTDIR=$out
     EOF
@@ -1167,15 +1172,19 @@ in
       if cfg.shellHook.enable then
         ''
           # env.BASH_ENV is filtered out by devenv, so exported here. Keeps the user's own
-          # BASH_ENV / ZDOTDIR (the hook and zdotdir run them), unless already ours.
-          if [ "''${BASH_ENV:-}" != ${shellHook} ]; then
-            export LAZY_COW_TREE_BASH_ENV=''${BASH_ENV:-}
-            export BASH_ENV=${shellHook}
-          fi
-          if [ "''${ZDOTDIR:-}" != ${zdotdir} ]; then
-            export LAZY_COW_TREE_ZDOTDIR=''${ZDOTDIR:-$HOME}
-            export ZDOTDIR=${zdotdir}
-          fi
+          # BASH_ENV / ZDOTDIR (the hook and zdotdir run them), unless already ours, from
+          # this build or an older one (a shell started before the module changed): then
+          # the user's stays the one saved then.
+          case "''${BASH_ENV:-}" in
+            *-lazy-cow-tree-shell-hook.sh) ;;
+            *) export LAZY_COW_TREE_BASH_ENV=''${BASH_ENV:-} ;;
+          esac
+          export BASH_ENV=${shellHook}
+          case "''${ZDOTDIR:-}" in
+            *-lazy-cow-tree-zdotdir) ;;
+            *) export LAZY_COW_TREE_ZDOTDIR=''${ZDOTDIR:-$HOME} ;;
+          esac
+          export ZDOTDIR=${zdotdir}
           . ${shellHook}
         ''
       else
