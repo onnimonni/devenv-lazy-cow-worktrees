@@ -124,9 +124,7 @@ async fn connection(mut client: TcpStream, backend: &PathBuf, resolve: &Resolve)
     let user = get("user").unwrap_or_default();
     let database = get("database").unwrap_or_else(|| user.clone());
     if let Err(e) = resolve(user, database).await {
-        client
-            .write_all(&error("3D000", &format!("lazy-cow-tree: {e:#}")))
-            .await?;
+        client.write_all(&error("3D000", &format!("{e:#}"))).await?;
         return Ok(());
     }
     let mut server = UnixStream::connect(backend)

@@ -34,6 +34,7 @@
   lib,
   config,
   options,
+  inputs ? { },
   ...
 }:
 
@@ -104,7 +105,19 @@ let
     pushd() { builtin pushd "$@" && __lazy_cow_tree_env; }
     popd() { builtin popd "$@" && __lazy_cow_tree_env; }
     __lazy_cow_tree_env
+    ${lib.optionalString cfg.protectPrimary.enable ". ${protectPrimaryGuard}"}
   '';
+  # lazyCowTree.protectPrimary's command allowlist, for the shell hook.
+  protectPrimaryGuard = pkgs.writeText "lazy-cow-tree-protect-primary.sh" (
+    builtins.replaceStrings
+      [ "@root@" "@allowed@" "@worktreesDir@" ]
+      [
+        (lib.escapeShellArg config.devenv.root)
+        (lib.escapeShellArgs cfg.protectPrimary.allow)
+        cfg.worktreesDir
+      ]
+      (builtins.readFile ./protect-primary.sh)
+  );
   # Every zsh reads $ZDOTDIR/.zshenv. Codex's shell snapshot replays the ZDOTDIR it
   # captured, so it stays this dir: each startup file runs the user's own one (from
   # their ZDOTDIR, or $HOME) and notes where a file of theirs moved ZDOTDIR to.
@@ -305,7 +318,7 @@ let
         unit = builtins.elemAt m 1;
       in
       if m == null then
-        throw "lazy-cow-tree: duration ${builtins.toJSON d} is not like 30s, 15m or 1h"
+        throw "lazyCowTree: duration ${builtins.toJSON d} is not like 30s, 15m or 1h"
       else if unit == "h" then
         n * 3600
       else if unit == "m" then
@@ -323,7 +336,7 @@ let
         n = lib.toInt (builtins.elemAt m 0);
       in
       if m == null then
-        throw "lazy-cow-tree: size ${builtins.toJSON s} is not like 512M or 4G"
+        throw "lazyCowTree: size ${builtins.toJSON s} is not like 512M or 4G"
       else if lib.toLower (toString (builtins.elemAt m 1)) == "g" then
         n * 1024
       else
@@ -407,7 +420,7 @@ let
       watched = lib.filter (x: x != null) (map (relativeTo cwd) p.watch.paths);
     in
     lib.warnIf (ignored != [ ])
-      "lazy-cow-tree: processes.${name}.after: ${lib.concatStringsSep ", " ignored} ignored (only other processes lazy-cow-tree runs are started first)"
+      "processes.${name}.after: ${lib.concatStringsSep ", " ignored} ignored (only other processes lazy-cow-tree runs are started first)"
       {
         exec = toString (pkgs.writeShellScript "lazy-cow-tree-${name}" p.exec);
         portEnv = if httpAliases == [ ] then null else builtins.head httpAliases;
@@ -919,6 +932,40 @@ in
         default = true;
         description = "Replace `git` in the shell with a wrapper whose `git worktree add` (by you, scripts or agents) fills the worktree like `lazy-cow-tree worktree new`: copy-on-write clones of the primary checkout, build caches included. Everything else is the real git. Replaces git-cow's devenv module (don't import both).";
       };
+      protectPrimary = {
+        enable = mkOption {
+          type = types.bool;
+          default = false;
+          description = "Keep the primary checkout for `git pull`; all work happens in worktrees. In it (not in its worktrees) the shells started from the devenv shell run only `allow`ed commands, typed or given to `bash -c` / `zsh -c` (agents' tool shells), and point to `git worktree add` otherwise. Claude Code's Edit/Write tools refuse its files (a PreToolUse hook), and with a git-hooks input pre-commit/pre-merge-commit/pre-rebase hooks refuse there too, for git outside the shell. A guardrail against mistakes, not a security boundary. Needs shellHook.enable.";
+        };
+        allow = mkOption {
+          type = types.listOf types.str;
+          default = [
+            "cd"
+            "pushd"
+            "popd"
+            "git pull"
+            "git fetch"
+            "git status"
+            "git log"
+            "git diff"
+            "git worktree"
+            "gh"
+            "lazy-cow-tree"
+            "devenv"
+            "claude"
+            "codex"
+            "pi"
+            "exit"
+          ];
+          example = [
+            "cd"
+            "git pull"
+            "git worktree add"
+          ];
+          description = "Commands allowed in the primary checkout: an entry allows a command starting with exactly its words ('git pull' allows `git pull --rebase`, not `git push`). Setting it replaces the default.";
+        };
+      };
       git.package = mkOption {
         type = types.package;
         default = pkgs.git;
@@ -1014,9 +1061,11 @@ in
         }
       ];
 
-    # Accepted so configs don't need changing later, but the daemon doesn't act on them yet.
     warnings =
-      lib.optional (pgCfg.enable && pgCfg.start.on == "demand") ''services.postgres.start.on = "demand" isn't supported yet: lazy-cow-tree starts its PostgreSQL with the daemon.''
+      lib.optional (cfg.protectPrimary.enable && !cfg.shellHook.enable) "lazyCowTree.protectPrimary needs lazyCowTree.shellHook.enable: shells don't guard the primary checkout."
+      ++ lib.optional (cfg.protectPrimary.enable && !(inputs ? git-hooks)) "lazyCowTree.protectPrimary: no git-hooks input, so git outside the devenv shell (IDEs, GUIs) can still commit in the primary checkout. Add it: devenv inputs add git-hooks github:cachix/git-hooks.nix --follows nixpkgs"
+      # Accepted so configs don't need changing later, but the daemon doesn't act on them yet.
+      ++ lib.optional (pgCfg.enable && pgCfg.start.on == "demand") ''services.postgres.start.on = "demand" isn't supported yet: lazy-cow-tree starts its PostgreSQL with the daemon.''
       ++ lib.optional (pgCfg.enable && pgCfg.start.idleTimeout != null) "services.postgres.start.idleTimeout isn't supported yet: lazy-cow-tree's PostgreSQL runs until the daemon stops."
       ++ lib.optional (pgCfg.enable && pgCfg.initialDatabases != [ ]) "services.postgres.initialDatabases: lazy-cow-tree gives every checkout <project>_dev and <project>_test (DATABASE_URL, TEST_DATABASE_URL) instead of these names for now.";
 
@@ -1088,6 +1137,27 @@ in
 
     processes.lazy-cow-tree.exec = "${exe} serve";
 
+    # For git outside the shell (IDEs, GUIs); worktrees share the hooks, so they
+    # check where they run.
+    git-hooks.hooks.lazy-cow-tree-protect-primary = lib.mkIf (cfg.protectPrimary.enable && inputs ? git-hooks) {
+      enable = true;
+      name = "not in the primary checkout (lazyCowTree.protectPrimary)";
+      entry = toString (
+        pkgs.writeShellScript "lazy-cow-tree-protect-primary" ''
+          [ "$(git rev-parse --absolute-git-dir)" = "$(git rev-parse --path-format=absolute --git-common-dir)" ] || exit 0
+          echo "$(git rev-parse --show-toplevel) is the primary checkout (lazyCowTree.protectPrimary): work in a worktree (git worktree add ${cfg.worktreesDir}/<name>)." >&2
+          exit 1
+        ''
+      );
+      stages = [
+        "pre-commit"
+        "pre-merge-commit"
+        "pre-rebase"
+      ];
+      pass_filenames = false;
+      always_run = true;
+    };
+
     enterShell =
       if cfg.shellHook.enable then
         ''
@@ -1146,6 +1216,17 @@ in
         };
 
         hooks = {
+          PreToolUse = lib.mkIf cfg.protectPrimary.enable [
+            {
+              matcher = "Edit|MultiEdit|Write|NotebookEdit";
+              hooks = [
+                {
+                  type = "command";
+                  command = "${exe} hook guard-primary ${lib.escapeShellArg config.devenv.root} ${lib.escapeShellArg cfg.worktreesDir}";
+                }
+              ];
+            }
+          ];
           WorktreeCreate = [
             {
               hooks = [

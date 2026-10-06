@@ -209,6 +209,14 @@ enum HookCmd {
     WorktreeCreate,
     /// WorktreeRemove: {"worktree_path": ...}
     WorktreeRemove,
+    /// PreToolUse of Edit/Write (lazyCowTree.protectPrimary): refuses files of the
+    /// primary checkout at <root>.
+    GuardPrimary {
+        root: PathBuf,
+        /// Where the refusal suggests the worktree.
+        #[arg(default_value = ".claude/worktrees")]
+        worktrees_dir: String,
+    },
 }
 
 fn shell_quote(s: &str) -> String {
@@ -829,6 +837,25 @@ async fn main() -> Result<()> {
                     }
                     let root = root_of(Path::new(path))?;
                     remove(root, path.to_string(), true).await?;
+                }
+                HookCmd::GuardPrimary {
+                    root,
+                    worktrees_dir,
+                } => {
+                    let input = &v["tool_input"];
+                    let file = input["file_path"]
+                        .as_str()
+                        .or_else(|| input["notebook_path"].as_str());
+                    if let Some(file) = file
+                        && config::in_primary(&dir.join(file), &root)
+                    {
+                        // Exit 2: Claude Code refuses the tool call and shows this to the model.
+                        eprintln!(
+                            "{} is the primary checkout, kept for `git pull` only (lazyCowTree.protectPrimary): don't edit {file} there. Work in a worktree: `git worktree add {worktrees_dir}/<name>`, then edit the file under it.",
+                            root.display()
+                        );
+                        std::process::exit(2);
+                    }
                 }
             }
             Ok(())

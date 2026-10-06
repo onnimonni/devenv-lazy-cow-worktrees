@@ -120,6 +120,26 @@ fn names_are_unique() {
 }
 
 #[test]
+fn primary_files_are_told_from_worktrees() {
+    let (d, project, syncer) = fixture();
+    let wt = create(&project, &syncer, "feat", None).unwrap();
+    let root = &project.root;
+    let in_primary = |p: &Path| crate::config::in_primary(p, root);
+    assert!(in_primary(&root.join("a.txt")));
+    // Not there yet: its nearest directory.
+    assert!(in_primary(&root.join("new/dir/b.txt")));
+    assert!(in_primary(&root.join("cache/big")));
+    assert!(!in_primary(&wt.join("a.txt")));
+    assert!(!in_primary(&wt.join("new/b.txt")));
+    // Outside it, another repository inside it, another primary.
+    assert!(!in_primary(&d.path().join("x.txt")));
+    let nested = root.join("deps/lib");
+    Repository::init(&nested).unwrap();
+    assert!(!in_primary(&nested.join("x.ex")));
+    assert!(!crate::config::in_primary(&root.join("a.txt"), &wt));
+}
+
+#[test]
 fn ports_never_collide() {
     let port_of = |plan: &[(PathBuf, u16, bool)], p: &Path| {
         plan.iter()
