@@ -175,7 +175,7 @@ How devenv's options map:
 | `cwd` | relative to the checkout |
 | `ports.http` (or the only port) | `$PORT`, the service's hostname; env entries holding a port's value are replaced by the checkout's port |
 | other `ports.<p>` | named port, in the variable that held its value (else `<P>_PORT`); `http` if it has its own `proxy.hostname` |
-| `proxy.hostname` | hostname in the primary; worktrees get `<worktree>.` in front |
+| `proxy.hostname` | hostname in the primary (under `.localhost` or `lazyCowTree.tls.domain`); worktrees get `<worktree>.` in front |
 | `after = [ "devenv:processes:<x>" ]` | `dependsOn`, when lazy-cow-tree runs `<x>` too; other entries are ignored with a warning |
 | `ready.http.get.path`, `ready.timeout` | a first request waits for this probe (200–399), default 60 s |
 | `restart.on`, `watch.paths` | `restart`, `restartOnChange` |
@@ -398,7 +398,7 @@ Service options:
 | `start` | `"demand"` | `"up"`, `"demand"` or `"manual"` |
 | `idleTimeout` | `null` | seconds without open connections before it's stopped |
 | `ready` | `null` | `{ path; timeout; }`: HTTP probe a first request waits for |
-| `hostname` | `<service>.<project>.localhost` | hostname in the primary; worktrees prefix `<worktree>.` |
+| `hostname` | `<service>.<project>.localhost` | hostname in the primary, under `.localhost` or `lazyCowTree.tls.domain`; worktrees prefix `<worktree>.` |
 
 Commands are split like a shell would, then run directly (no shell) with the
 service's environment and the project's `PATH`. Logs: `lazy-cow-tree service log -s <name>`.
@@ -583,8 +583,9 @@ there (the newest `https-certificate` artifact, a zip with one `.pem` per domain
   ones are skipped. A file whose certificate isn't for its key is refused, and the
   ones read before stay in use.
 - Until a certificate covers a name, or while none can be read, the local CA serves
-  it. Hostnames set with `processes.<name>.proxy.hostname` stay as they are
-  (`.localhost`, local CA).
+  it. Hostnames set with `processes.<name>.proxy.hostname` stay as they are:
+  `.localhost` ones get the local CA, ones under the domain (e.g.
+  `sim.<project>.<domain>`, a name the certificate already covers) its certificate.
 
 The certificate should name, per http service, `<service>.<project>.<domain>` and
 `*.<service>.<project>.<domain>` (its worktrees'): one certificate covers every

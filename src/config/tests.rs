@@ -70,7 +70,7 @@ fn service_hostname_override() {
     );
     for bad in [
         r#"{"a": {"exec": "x", "hostname": "Care.localhost"}}"#,
-        r#"{"a": {"exec": "x", "hostname": "care.example.com"}}"#,
+        r#"{"a": {"exec": "x", "hostname": "localhost"}}"#,
         r#"{"a": {"exec": "x", "hostname": "-a.localhost"}}"#,
         r#"{"a": {"exec": "x", "hostname": "h.localhost"}, "b": {"exec": "y", "hostname": "h.localhost"}}"#,
     ] {
@@ -743,6 +743,44 @@ fn domain_hosts_and_certificate_names() {
             "app.dev.example.com",
         ]
     );
+    assert_eq!(p.check_hostnames(), Ok(()));
+
+    // An own hostname under the domain: served with its certificate, which covers it
+    // and its worktrees'. Elsewhere, only `.localhost`.
+    let mut settings = p.settings.clone();
+    settings.services = r#"{"sim": {"exec": "a", "hostname": "simulator.app.dev.example.com"},
+        "admin": {"exec": "c", "hostname": "admin.localhost"}}"#
+        .parse()
+        .unwrap();
+    let p = Project::new("/src/app".into(), settings.clone());
+    assert_eq!(p.check_hostnames(), Ok(()));
+    assert_eq!(
+        p.checkout_on(Some("wt"), "/x".into(), 20000)
+            .service_host("sim"),
+        "wt.simulator.app.dev.example.com"
+    );
+    assert!(
+        p.tls_names()
+            .contains(&"*.simulator.app.dev.example.com".to_string())
+    );
+    settings.services = r#"{"sim": {"exec": "a", "hostname": "sim.example.com"}}"#
+        .parse()
+        .unwrap();
+    assert!(
+        Project::new("/src/app".into(), settings.clone())
+            .check_hostnames()
+            .is_err()
+    );
+    settings.tls_domain = None;
+    settings.services = r#"{"sim": {"exec": "a", "hostname": "simulator.app.dev.example.com"}}"#
+        .parse()
+        .unwrap();
+    assert!(
+        Project::new("/src/app".into(), settings)
+            .check_hostnames()
+            .is_err()
+    );
+
     assert!(parse_domain("Dev.Example.com.").is_ok_and(|d| d == "dev.example.com"));
     assert!(parse_domain("localhost").is_err());
     assert_eq!(

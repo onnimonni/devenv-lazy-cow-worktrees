@@ -217,8 +217,9 @@ impl Services {
         let mut hosts = BTreeMap::new();
         for (name, s) in &self.0 {
             let Some(h) = &s.hostname else { continue };
+            // Under `.localhost` or the project's tls domain: `Project::check_hostnames`.
             let valid = h == &h.to_ascii_lowercase()
-                && h.ends_with(".localhost")
+                && h.contains('.')
                 && h.split('.').all(|l| {
                     !l.is_empty()
                         && !l.starts_with('-')
@@ -227,7 +228,7 @@ impl Services {
                 });
             if !valid {
                 return Err(format!(
-                    "service {name}: hostname {h} must be a lowercase name ending in .localhost"
+                    "service {name}: hostname {h} must be a lowercase DNS name"
                 ));
             }
             if let Some(other) = hosts.insert(h.clone(), name.clone()) {

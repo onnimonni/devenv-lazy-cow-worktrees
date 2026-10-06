@@ -677,7 +677,7 @@ let
         type = types.nullOr types.str;
         default = null;
         example = "web.myapp.localhost";
-        description = "Hostname in the primary checkout instead of <service>.<project>.localhost; worktrees prefix `<worktree>.`.";
+        description = "Hostname in the primary checkout instead of <service>.<project>.localhost, under .localhost or `lazyCowTree.tls.domain`; worktrees prefix `<worktree>.`.";
       };
     };
   };

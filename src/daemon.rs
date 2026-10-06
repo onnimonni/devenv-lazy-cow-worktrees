@@ -380,6 +380,7 @@ impl Daemon {
         }
         Repository::open(&root)
             .with_context(|| format!("{} is not a git checkout", root.display()))?;
+        project.check_hostnames().map_err(anyhow::Error::msg)?;
         durability_check(
             self.global.postgres_durable,
             &project,
