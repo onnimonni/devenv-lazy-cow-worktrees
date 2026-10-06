@@ -392,12 +392,17 @@ let
           "${lib.toUpper (lib.replaceStrings [ "-" ] [ "_" ] port)}_PORT";
       extraPorts = lib.filter (port: port != httpPort) portNames;
       # The http port's own variable (e.g. `env.WEB_PORT = toString ports.http.value`),
-      # set per checkout like PORT, in its shells too.
+      # set per checkout like PORT, in its shells too. `env.PORT = ...` is no alias:
+      # lazy-cow-tree sets PORT itself.
       httpAliases =
         if httpPort == null then
           [ ]
         else
-          lib.attrNames (lib.filterAttrs (_: v: v == value httpPort) p.env);
+          lib.attrNames (
+            lib.filterAttrs (
+              n: v: v == value httpPort && n != "PORT" && !lib.hasPrefix "LAZY_COW_TREE_" n
+            ) p.env
+          );
       # lazy-cow-tree sets PORT and each named port's variable per checkout.
       portValues = map value portNames;
       env = lib.filterAttrs (_: v: !(builtins.elem v portValues)) p.env;
