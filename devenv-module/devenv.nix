@@ -820,6 +820,12 @@ in
           example = "dev.example.com";
           description = "Domain whose `*` A record points at 127.0.0.1: hostnames become https://<worktree>.<service>.<project>.<domain> with the Let's Encrypt certificate github.com/onnimonni/trusted-https-certificate-to-artifacts-action keeps as the GitHub repository's https-certificate Actions artifact (read only while the repository is private), instead of .localhost ones with the local CA. Until it has one, the local CA serves them. `lazy-cow-tree cert show` prints the names it needs.";
         };
+        githubRepository = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          example = "my-org/dev-certificates";
+          description = "GitHub repository (`owner/repo`, `host/owner/repo` or a URL) whose https-certificate artifact has the domain's certificates, when it isn't the checkout's own remote (e.g. one private repository issuing them for several projects). Same rules: read with gh's token, only while it's private.";
+        };
         services = mkOption {
           type = types.nullOr (types.listOf types.str);
           default = null;
@@ -1064,6 +1070,9 @@ in
     // lib.optionalAttrs (cfg.project != null) { LAZY_COW_TREE_PROJECT = cfg.project; }
     // lib.optionalAttrs (cfg.tls.domain != null) {
       LAZY_COW_TREE_TLS_DOMAIN = cfg.tls.domain;
+    }
+    // lib.optionalAttrs (cfg.tls.domain != null && cfg.tls.githubRepository != null) {
+      LAZY_COW_TREE_TLS_GITHUB_REPOSITORY = cfg.tls.githubRepository;
     }
     // lib.optionalAttrs (cfg.tls.domain != null && cfg.tls.services != null) {
       LAZY_COW_TREE_TLS_SERVICES = lib.concatStringsSep "," cfg.tls.services;

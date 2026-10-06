@@ -695,7 +695,11 @@ async fn main() -> Result<()> {
             if wanted.is_empty() {
                 anyhow::bail!("no lazyCowTree.tls.domain (LAZY_COW_TREE_TLS_DOMAIN)");
             }
-            let gh = tls::trusted::repo_client(&p.root, &p.settings.remote)?;
+            let gh = tls::trusted::repo_client(
+                &p.root,
+                &p.settings.remote,
+                p.settings.tls_github_repository.as_deref(),
+            )?;
             let now = tls::trusted::now();
             let mut have = Vec::new();
             match tls::trusted::fetch(&gh).await? {

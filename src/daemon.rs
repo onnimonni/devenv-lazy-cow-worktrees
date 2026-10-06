@@ -566,7 +566,11 @@ async fn domain_certificate(trusted: Arc<Trusted>, rt: Arc<ProjectRt>) {
     let mut current: Option<Vec<u8>> = None;
     loop {
         let run = async {
-            let gh = tls::trusted::repo_client(&p.root, &p.settings.remote)?;
+            let gh = tls::trusted::repo_client(
+                &p.root,
+                &p.settings.remote,
+                p.settings.tls_github_repository.as_deref(),
+            )?;
             if !gh.is_private().await? {
                 trusted.clear(&domain);
                 current = None;

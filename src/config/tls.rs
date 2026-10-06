@@ -22,6 +22,12 @@ pub(crate) fn parse_domain(s: &str) -> std::result::Result<String, String> {
     }
 }
 
+pub(crate) fn parse_repository(s: &str) -> std::result::Result<String, String> {
+    crate::github::parse_repo(s)
+        .map(|r| format!("{}/{}/{}", r.host, r.owner, r.name))
+        .ok_or_else(|| format!("{s} is not a GitHub repository (owner/repo)"))
+}
+
 impl Project {
     /// Names its domain's certificates need, each with a wildcard for its worktrees':
     /// every http host of the primary checkout under the domain, then the project's

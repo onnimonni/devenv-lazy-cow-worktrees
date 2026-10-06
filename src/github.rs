@@ -51,6 +51,20 @@ pub fn parse_remote_url(url: &str) -> Option<RepoId> {
     })
 }
 
+/// A repository named in settings: `owner/repo` (on github.com), `host/owner/repo`
+/// or a remote URL.
+pub fn parse_repo(s: &str) -> Option<RepoId> {
+    let s = s.trim().trim_matches('/');
+    if s.contains("://") || s.contains(':') {
+        return parse_remote_url(s);
+    }
+    match s.split('/').count() {
+        2 => parse_remote_url(&format!("https://github.com/{s}")),
+        3 => parse_remote_url(&format!("https://{s}")),
+        _ => None,
+    }
+}
+
 /// Same lookup order as go-gh: env vars, the keyring entry `gh` writes, then its
 /// hosts.yml (where gh keeps the token without a keyring, e.g. on Linux).
 pub fn auth_token(host: &str) -> Result<String> {
@@ -165,10 +179,19 @@ impl Client {
     /// collaborators (an artifact holding a key, say) must not come from a public one,
     /// whose artifacts anyone can download.
     pub async fn is_private(&self) -> Result<bool> {
-        let repo: Value = self
+        let resp = self
             .req(reqwest::Method::GET, &self.repo_url())
             .send()
-            .await?
+            .await?;
+        // GitHub answers 404 for private repositories the token can't read.
+        if resp.status() == StatusCode::NOT_FOUND {
+            bail!(
+                "can't find {} on {}: most likely it's private and the account gh is logged in as (`gh auth status`) has no access to it; otherwise check its name",
+                self.repo,
+                self.repo.host
+            );
+        }
+        let repo: Value = resp
             .error_for_status()
             .with_context(|| format!("reading {}", self.repo))?
             .json()
@@ -537,6 +560,17 @@ mod tests {
             id("ghe.corp", "o", "r")
         );
         assert_eq!(parse_remote_url("/tmp/some/bare.git"), None);
+        assert_eq!(
+            parse_repo("example-org/app"),
+            id("github.com", "example-org", "app")
+        );
+        assert_eq!(parse_repo("ghe.corp/o/r"), id("ghe.corp", "o", "r"));
+        assert_eq!(
+            parse_repo("git@github.com:example-org/app.git"),
+            id("github.com", "example-org", "app")
+        );
+        assert_eq!(parse_repo("app"), None);
+        assert_eq!(parse_repo("a/b/c/d"), None);
     }
 
     #[test]
@@ -599,5 +633,61 @@ mod tests {
             "gho_x"
         );
         assert_eq!(decode_go_keyring("gho_plain").unwrap(), "gho_plain");
+    }
+
+    /// A client of `example-org/app` whose API answers every request with `status`.
+    async fn answering(status: u16, body: &'static str) -> Client {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf).await;
+                let _ = s
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status} X\r\ncontent-length: {}\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            }
+        });
+        let mut gh =
+            Client::new(id("github.com", "example-org", "app").unwrap(), "t".into()).unwrap();
+        gh.api = format!("http://127.0.0.1:{port}");
+        gh
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_repository_says_so() {
+        let e = answering(404, r#"{"message":"Not Found"}"#)
+            .await
+            .is_private()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("can't find example-org/app on github.com"),
+            "{e}"
+        );
+        assert!(e.contains("private") && e.contains("gh auth status"), "{e}");
+        assert!(
+            answering(200, r#"{"private":true}"#)
+                .await
+                .is_private()
+                .await
+                .unwrap()
+        );
+        assert!(
+            !answering(200, r#"{"private":false}"#)
+                .await
+                .is_private()
+                .await
+                .unwrap()
+        );
+        assert!(answering(500, "").await.is_private().await.is_err());
     }
 }
