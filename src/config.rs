@@ -914,6 +914,18 @@ pub fn primary_root(path: &Path) -> Result<PathBuf> {
     }
 }
 
+/// `path` (or, not there yet, its nearest directory) is in the primary checkout at
+/// `root`: not in one of its worktrees, nor in another repository.
+pub fn in_primary(path: &Path, root: &Path) -> bool {
+    let Some(dir) = path.ancestors().find(|p| p.is_dir()) else {
+        return false;
+    };
+    let Ok(root) = root.canonicalize() else {
+        return false;
+    };
+    matches!(locate(dir), Ok((r, None, _)) if r == root)
+}
+
 /// (primary root, worktree name or None, checkout path) for `path`.
 pub fn locate(path: &Path) -> Result<(PathBuf, Option<String>, PathBuf)> {
     let repo = Repository::discover(path)

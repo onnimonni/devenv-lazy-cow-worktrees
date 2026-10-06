@@ -147,7 +147,7 @@ worktree=$(cd "$path" && pwd -P) || exit 1
 wt_git() { env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE "$real_git" -C "$worktree" "$@"; }
 
 if ! "$cow" populate ${quiet:+-q} "$worktree"; then
-  echo "lazy-cow-tree: falling back to a regular checkout" >&2
+  echo "copy-on-write fill failed: falling back to a regular checkout" >&2
   wt_git reset --hard --no-recurse-submodules -q || status=$?
 fi
 

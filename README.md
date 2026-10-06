@@ -531,6 +531,35 @@ Nothing watches the filesystem: a worktree made or deleted outside the wrapper (
 git elsewhere, `rm -rf`) is picked up by the daemon within a minute, and one made by
 plain git has no caches.
 
+## Keep the primary checkout for `git pull`
+
+```nix
+lazyCowTree.protectPrimary.enable = true;   # off by default
+lazyCowTree.protectPrimary.allow = [ "cd" "git pull" "git worktree" ];   # optional, replaces the default
+```
+
+All work then happens in worktrees: in the primary checkout (and its subdirectories,
+not its worktrees) shells started from the devenv shell run only allowed commands. An
+entry allows a command starting with exactly its words: `git pull` allows
+`git pull --rebase`, not `git push`. Default: `cd`, `pushd`, `popd`, `git pull`,
+`git fetch`, `git status`, `git log`, `git diff`, `git worktree`, `gh`,
+`lazy-cow-tree`, `devenv`, `claude`, `codex`, `pi`, `exit`. Anything else is refused,
+pointing to `git worktree add <worktreesDir>/<name>`:
+
+- **bash** (3.2 and 5): a typed command is skipped (a DEBUG trap); a `bash -c` line
+  (agents' tool shells) is checked before it runs, each command where it runs
+  (`cd .claude/worktrees/x && make` is fine), and refused whole.
+- **zsh**: typed and `zsh -c` commands, each `;`-separated list checked the same way.
+- Scripts run as files (git hooks, tools' scripts), startup files and functions
+  aren't checked.
+- **Claude Code**: Edit/Write of the primary's files is refused (a PreToolUse hook).
+- **git outside the shell** (IDEs, GUIs): with a `git-hooks` input
+  (`devenv inputs add git-hooks github:cachix/git-hooks.nix --follows nixpkgs`),
+  pre-commit, pre-merge-commit and pre-rebase hooks refuse in the primary.
+
+A guardrail against mistakes, not a security boundary. Needs
+`lazyCowTree.shellHook.enable` (the default).
+
 ## Trusted certificates on your own domain
 
 Instead of `.localhost` names and the local CA, a project can use a domain of its

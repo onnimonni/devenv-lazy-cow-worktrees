@@ -401,16 +401,16 @@ async fn handle(
                     full(
                         StatusCode::BAD_GATEWAY,
                         "text/plain; charset=utf-8",
-                        format!("lazy-cow-tree: nothing answers for {host} on {upstream} ({e}); devenv registered it\n"),
+                        format!(
+                            "Nothing answers for {host} on {upstream} ({e}); devenv registered it\n"
+                        ),
                     )
                 }));
         }
         return Ok(full(
             StatusCode::NOT_FOUND,
             "text/plain; charset=utf-8",
-            format!(
-                "lazy-cow-tree: no worktree serves {host}; see https://lazy-cow-tree.localhost\n"
-            ),
+            format!("No worktree serves {host}; see https://lazy-cow-tree.localhost\n"),
         ));
     };
 
@@ -433,7 +433,7 @@ async fn handle(
             StatusCode::BAD_GATEWAY,
             "text/plain; charset=utf-8",
             format!(
-                "lazy-cow-tree: could not start {host}: {e}\nSee `lazy-cow-tree status` and the logs in ~/.local/state/lazy-cow-tree/logs.\n"
+                "Could not start {host}: {e}\nSee `lazy-cow-tree status` and the logs in ~/.local/state/lazy-cow-tree/logs.\n"
             ),
         ));
     }
@@ -445,7 +445,7 @@ async fn handle(
                 StatusCode::BAD_GATEWAY,
                 "text/plain; charset=utf-8",
                 format!(
-                    "lazy-cow-tree: nothing answers for {host} on 127.0.0.1:{port} ({e}).\nGive it a process in devenv.nix to start it on demand, or run it with PORT={port}; logs: `lazy-cow-tree service log -s <name>`.\n"
+                    "Nothing answers for {host} on 127.0.0.1:{port} ({e}).\nGive it a process in devenv.nix to start it on demand, or run it with PORT={port}; logs: `lazy-cow-tree service log -s <name>`.\n"
                 ),
             )
         }))

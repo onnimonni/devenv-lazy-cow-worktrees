@@ -67,10 +67,10 @@ in
     launchd.user.envVariables = env;
 
     system.activationScripts.postActivation.text = lib.mkIf cfg.trustCa ''
-      echo "lazy-cow-tree: trusting the local CA for ${cfg.user}..." >&2
+      echo "Trusting the lazy-cow-tree local CA for ${cfg.user}..." >&2
       launchctl asuser "$(id -u -- ${cfg.user})" sudo --user=${cfg.user} --set-home -- \
         ${cfg.package}/bin/lazy-cow-tree trust \
-        || echo "lazy-cow-tree: trust failed; run \`lazy-cow-tree trust\` yourself" >&2
+        || echo "Trusting the lazy-cow-tree local CA failed; run \`lazy-cow-tree trust\` yourself" >&2
     '';
   };
 }
