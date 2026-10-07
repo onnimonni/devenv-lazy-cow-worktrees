@@ -80,12 +80,6 @@ pub fn auth_token(host: &str) -> Result<String> {
             return Ok(t.trim().to_string());
         }
     }
-    if let Ok(secret) =
-        keyring::Entry::new(&format!("gh:{host}"), "").and_then(|e| e.get_password())
-    {
-        return decode_go_keyring(&secret);
-    }
-    // Without a keyring (typical on Linux) gh keeps the token in hosts.yml.
     let dir = std::env::var_os("GH_CONFIG_DIR")
         .map(std::path::PathBuf::from)
         .or_else(|| {
@@ -94,24 +88,37 @@ pub fn auth_token(host: &str) -> Result<String> {
         .or_else(|| {
             std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config/gh"))
         });
-    if let Some(dir) = dir
-        && let Ok(yml) = std::fs::read_to_string(dir.join("hosts.yml"))
-        && let Some(t) = hosts_yml_token(&yml, host)
-    {
+    let yml = dir
+        .and_then(|d| std::fs::read_to_string(d.join("hosts.yml")).ok())
+        .unwrap_or_default();
+    // gh keeps the active token under an empty account, which the keyring crate refuses
+    // on macOS, and under the active user's (hosts.yml `user:`).
+    let user = hosts_yml_value(&yml, host, "user");
+    for account in std::iter::once("").chain(user.as_deref()) {
+        if let Ok(secret) =
+            keyring::Entry::new(&format!("gh:{host}"), account).and_then(|e| e.get_password())
+        {
+            return decode_go_keyring(&secret);
+        }
+    }
+    // Without a keyring (typical on Linux) gh keeps the token in hosts.yml.
+    if let Some(t) = hosts_yml_value(&yml, host, "oauth_token") {
         return Ok(t);
     }
     bail!("no token for {host}: set GH_TOKEN or run `gh auth login`")
 }
 
-/// `oauth_token` of `host` in gh's hosts.yml (top-level host keys, indented fields).
-fn hosts_yml_token(yml: &str, host: &str) -> Option<String> {
+/// The first `key` (`oauth_token`, `user`) under `host` in gh's hosts.yml (top-level
+/// host keys, indented fields).
+fn hosts_yml_value(yml: &str, host: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}:");
     let mut in_host = false;
     for line in yml.lines() {
         if !line.starts_with(' ') && !line.starts_with('\t') {
             in_host = line.trim_end().trim_end_matches(':') == host;
             continue;
         }
-        if in_host && let Some(v) = line.trim().strip_prefix("oauth_token:") {
+        if in_host && let Some(v) = line.trim().strip_prefix(prefix.as_str()) {
             let v = v.trim().trim_matches('"').trim_matches('\'');
             if !v.is_empty() {
                 return Some(v.to_string());
@@ -619,11 +626,19 @@ mod tests {
         let yml = "github.com:\n    users:\n        onni:\n            oauth_token: gho_nested\n    oauth_token: gho_top\n    user: onni\nghe.corp:\n    oauth_token: \"gho_ghe\"\n";
         // The first oauth_token under the host (older files have it top-level).
         assert_eq!(
-            hosts_yml_token(yml, "github.com").as_deref(),
+            hosts_yml_value(yml, "github.com", "oauth_token").as_deref(),
             Some("gho_nested")
         );
-        assert_eq!(hosts_yml_token(yml, "ghe.corp").as_deref(), Some("gho_ghe"));
-        assert_eq!(hosts_yml_token(yml, "other.host"), None);
+        assert_eq!(
+            hosts_yml_value(yml, "ghe.corp", "oauth_token").as_deref(),
+            Some("gho_ghe")
+        );
+        assert_eq!(hosts_yml_value(yml, "other.host", "oauth_token"), None);
+        // The active user (keyring account), not the `users:` map.
+        assert_eq!(
+            hosts_yml_value(yml, "github.com", "user").as_deref(),
+            Some("onni")
+        );
     }
 
     #[test]
