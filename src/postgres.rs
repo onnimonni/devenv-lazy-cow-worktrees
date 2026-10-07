@@ -694,7 +694,16 @@ mod tests {
         let child = tokio::process::Command::new(bin.join("postgres"))
             .arg("-D")
             .arg(&data)
-            .args(["-c", "listen_addresses=", "-c", "fsync=off", "-c"])
+            // The port `connect` uses, not PGPORT's (set in a lazy-cow-tree shell).
+            .args([
+                "-c",
+                "port=5432",
+                "-c",
+                "listen_addresses=",
+                "-c",
+                "fsync=off",
+                "-c",
+            ])
             .arg(format!("unix_socket_directories={}", tmp.path().display()))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
