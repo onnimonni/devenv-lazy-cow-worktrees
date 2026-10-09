@@ -815,6 +815,18 @@ impl Checkout {
     /// Environment of a service: its port and hostname, the checkout's database and
     /// Redis (FIXME: shared by all its services for now; see `Service`), plus
     /// LAZY_COW_TREE_<SERVICE>_URL / _PORT of every service of the checkout.
+    /// A worktree's own TMPDIR (made here: tools fail on a missing one), so its unix
+    /// sockets, browser profiles (Playwright's "profile in use") and temp files aren't
+    /// the primary's or another worktree's; gone with it. The primary keeps the default.
+    pub fn worktree_isolation_env(&self) -> Vec<(String, String)> {
+        if self.worktree.is_none() {
+            return Vec::new();
+        }
+        let tmp = runtime_dir(&self.path).join("tmp");
+        let _ = std::fs::create_dir_all(&tmp);
+        vec![("TMPDIR".into(), format!("{}/", tmp.display()))]
+    }
+
     pub fn service_env(&self, g: &Global, service: Option<&str>) -> Vec<(String, String)> {
         let (host, port) = match service {
             Some(n) if self.service(n).is_some() => (self.service_host(n), self.service_port(n)),
@@ -904,12 +916,20 @@ impl Checkout {
             .and_then(|s| s.cwd.as_ref())
             .map_or_else(|| self.path.clone(), |d| self.path.join(d));
         env.extend(framework_env(&dir, &host));
+        env.extend(self.worktree_isolation_env());
         // The service's own env wins over everything detected.
         if let Some(s) = svc {
             env.extend(s.env.iter().map(|(k, v)| (k.clone(), v.clone())));
         }
         env
     }
+}
+
+/// A worktree's runtime dir (DEVENV_RUNTIME; its TMPDIR inside): short, as unix
+/// sockets must fit 104 bytes.
+pub fn runtime_dir(checkout: &Path) -> PathBuf {
+    let h = hex::encode(&Sha256::digest(checkout.to_string_lossy().as_bytes())[..4]);
+    PathBuf::from("/tmp").join(format!("lazy-cow-tree-{h}"))
 }
 
 /// Primary checkout of the repository containing `path`.

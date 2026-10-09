@@ -231,7 +231,11 @@ out=$("$bin" worktree new feat/slash 2>&1) || fail "worktree new feat/slash: $ou
   fail "feat/slash not worktree feat-slash on its branch: $out"
 if out=$("$bin" worktree new feat-slash 2>&1); then fail "feat-slash shared feat/slash's worktree"; fi
 [[ $out == *"branch feat/slash"* ]] || fail "collision not explained: $out"
+tmp=$(env_of "$PWD/.claude/worktrees/feat-slash" TMPDIR)
+[[ $tmp == /tmp/lazy-cow-tree-*/tmp/ && -d $tmp && $(env_of "$PWD" TMPDIR) != "$tmp" ]] ||
+  fail "worktree TMPDIR: $tmp (primary: $(env_of "$PWD" TMPDIR))"
 "$bin" worktree rm --force feat/slash >/dev/null || fail "worktree rm feat/slash"
+[[ ! -d $tmp ]] || fail "worktree TMPDIR $tmp left behind"
 pass "worktree new feat/slash: worktree feat-slash; feat-slash refused"
 
 # A filling RAM disk (macOS: $home/pg is one): under 10% free idle worktree test
@@ -344,8 +348,12 @@ out=$("$bin" worktree rm --force manual 2>&1) || fail "rm of a fresh worktree fa
 pass "fresh worktree removed without a gitignored-files warning"
 
 port=$(env_of "$wt" PORT)
+feat_tmp=$TMPDIR
 "$bin" worktree rm --force feat-a
 [[ ! -e $wt ]] || fail "worktree still there"
+# Back in the primary: the hook gives this shell its own TMPDIR again.
+eval "$("$bin" shell-hook)"
+[[ ${TMPDIR:-} != "$feat_tmp" ]] || fail "TMPDIR still the removed worktree's: $TMPDIR"
 for p in "$port" "$((port + 9))"; do
   if curl -s --max-time 2 "http://127.0.0.1:$p/" >/dev/null; then fail "its server on $p survived"; fi
 done

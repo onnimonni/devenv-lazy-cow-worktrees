@@ -545,6 +545,10 @@ impl Daemon {
         }
         self.servers.stop_checkout(c).await;
         self.redis.remove(&c.id()).await;
+        if c.worktree.is_some() {
+            // Its DEVENV_RUNTIME and TMPDIR (`Checkout::worktree_isolation_env`).
+            let _ = std::fs::remove_dir_all(config::runtime_dir(&c.path));
+        }
         for rt in self.projects.lock().values() {
             rt.migrate_failures.lock().remove(&c.id());
             rt.migrating.lock().remove(&c.id());

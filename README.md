@@ -478,6 +478,7 @@ needed), e.g. for services `web` (default), `api` and `worker`:
 | named ports' `env`, `LAZY_COW_TREE_<SERVICE>_<NAME>_PORT`, `_URL` | every service's | every service's |
 | `LAZY_COW_TREE_SERVICE`, `LAZY_COW_TREE_WORKTREE`, `LAZY_COW_TREE_PROJECT` | | |
 | `NODE_EXTRA_CA_CERTS` | the local CA | |
+| `TMPDIR` | unchanged | `/tmp/lazy-cow-tree-<hash>/tmp/`, its own (unix sockets, browser profiles, temp files), deleted with it |
 
 Worktree roles were `<project>-<worktree>` before; the daemon renames an old role to
 the new name on its next start (or, if that name was shared by two checkouts, makes
