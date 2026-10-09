@@ -281,6 +281,9 @@ pub struct CheckoutStatus {
     pub checkout: Checkout,
     pub url: String,
     pub databases: Vec<String>,
+    /// Their size together.
+    #[serde(default)]
+    pub database_bytes: u64,
     pub services: Vec<ServiceStatus>,
     /// Its redis-server is running.
     pub redis: bool,
@@ -321,6 +324,9 @@ pub struct Status {
     pub pg_port: u16,
     pub redis_port: u16,
     pub https_port: u16,
+    /// (free, total) bytes on the databases' disk (the RAM disk).
+    #[serde(default)]
+    pub pg_disk: Option<(u64, u64)>,
 }
 
 #[derive(Serialize, Deserialize)]

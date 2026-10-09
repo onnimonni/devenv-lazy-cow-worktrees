@@ -239,6 +239,33 @@ impl Postgres {
         Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 
+    /// Databases with their size in bytes, biggest first.
+    pub async fn sizes(&self) -> Result<Vec<(String, i64)>> {
+        let rows = self
+            .admin()
+            .await?
+            .query(
+                "SELECT datname::text, pg_database_size(oid) FROM pg_database \
+                 WHERE datname NOT IN ('template0', 'template1') ORDER BY 2 DESC",
+                &[],
+            )
+            .await?;
+        Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+    }
+
+    /// (free, total) bytes of the filesystem the cluster is on (the RAM disk).
+    pub fn disk(&self) -> Option<(u64, u64)> {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(self.dir.as_os_str().as_bytes()).ok()?;
+        // statfs, as df: macOS's statvfs has 32-bit counts.
+        let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statfs(path.as_ptr(), &mut st) } != 0 {
+            return None;
+        }
+        let block = st.f_bsize as u64;
+        Some((st.f_bavail as u64 * block, st.f_blocks as u64 * block))
+    }
+
     /// Owner of `db`, None if it doesn't exist.
     pub async fn owner(&self, db: &str) -> Result<Option<String>> {
         Ok(self

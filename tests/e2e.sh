@@ -234,6 +234,31 @@ if out=$("$bin" worktree new feat-slash 2>&1); then fail "feat-slash shared feat
 "$bin" worktree rm --force feat/slash >/dev/null || fail "worktree rm feat/slash"
 pass "worktree new feat/slash: worktree feat-slash; feat-slash refused"
 
+# A filling RAM disk (macOS: $home/pg is one): under 10% free idle worktree test
+# databases go; under 5% new clones are refused, naming the biggest databases.
+if [[ $(uname -s) == Darwin ]]; then
+  # fill <percent free to leave>
+  fill() {
+    local total free
+    read -r total free < <(df -k "$home/pg" | awk 'NR == 2 { print $2, $4 }')
+    dd if=/dev/zero of="$home/pg/fill$1" bs=1024 count=$((free - total * $1 / 100)) 2>/dev/null || true
+  }
+  [[ $(admin_psql "select 1 from pg_database where datname = 'demo_test_feat_a2'") == 1 ]] || fail "no partition database to drop"
+  fill 8
+  "$bin" worktree new low-x >/dev/null 2>&1 || fail "worktree new on a disk 92% full"
+  [[ -z $(admin_psql "select 1 from pg_database where datname = 'demo_test_feat_a2'") ]] || fail "idle test database not dropped"
+  [[ $(admin_psql "select 1 from pg_database where datname = 'demo_dev_low_x'") == 1 ]] || fail "clone refused on a disk 92% full"
+  fill 4
+  full=$("$bin" worktree new full-x 2>/dev/null | tail -1) || true
+  out=$(cd "$full" && eval "$("$bin" shell-hook)" && psql -tAc "select 1" 2>&1) || true
+  rm -f "$home"/pg/fill*
+  [[ $out == *"database disk"*"full"*"biggest"* ]] || fail "clone on a full disk not refused: $out"
+  [[ $("$bin" status) == *"database disk:"* ]] || fail "status lacks the database disk"
+  "$bin" worktree rm --force full-x >/dev/null
+  "$bin" worktree rm --force low-x >/dev/null
+  pass "filling database disk: idle test databases dropped, then clones refused"
+fi
+
 # The module's gh wrapper over a fake gh: the PR is in FAKE_PR ("<state> <branch>").
 cat >"$home/fake-gh" <<'EOF'
 #!/usr/bin/env bash

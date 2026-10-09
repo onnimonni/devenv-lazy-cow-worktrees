@@ -528,6 +528,14 @@ fn print_status(s: &daemon::Status) {
         "daemon {} · postgres 127.0.0.1:{} · redis 127.0.0.1:{} · https :{}",
         s.pid, s.pg_port, s.redis_port, s.https_port
     );
+    if let Some((free, total)) = s.pg_disk {
+        println!(
+            "database disk: {} of {} MB used ({}%)",
+            (total - free) >> 20,
+            total >> 20,
+            100 - free * 100 / total.max(1)
+        );
+    }
     for p in &s.projects {
         println!(
             "\n{} ({}) base {}{}",
@@ -541,11 +549,12 @@ fn print_status(s: &daemon::Status) {
         );
         for c in &p.checkouts {
             println!(
-                "  {:<24} {:<40} {} [{}]{}",
+                "  {:<24} {:<40} {} [{}] {} MB{}",
                 c.checkout.worktree.as_deref().unwrap_or("(primary)"),
                 c.url,
                 c.branch.as_deref().unwrap_or("-"),
                 c.databases.join(", "),
+                c.database_bytes >> 20,
                 if c.redis { " redis" } else { "" },
             );
             if let Some(e) = &c.migrate_error {

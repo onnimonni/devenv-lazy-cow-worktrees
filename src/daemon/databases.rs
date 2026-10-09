@@ -228,6 +228,7 @@ impl Daemon {
         } else {
             None
         };
+        self.ensure_space().await?;
         let t = std::time::Instant::now();
         self.pg
             .create(&dev, source.as_deref(), Some(&c.id()))
@@ -244,6 +245,61 @@ impl Daemon {
                 info!("{dev}: created empty (copy-on-write off)")
             }
             None => info!("{dev}: created empty (no template yet)"),
+        }
+        Ok(())
+    }
+
+    /// Room for another clone on the cluster's disk (the RAM disk, which takes every
+    /// checkout down when full). Under 5% free: an error naming the biggest databases,
+    /// without writing anything (even DROP DATABASE needs WAL room). Under 10%:
+    /// worktrees' test databases nobody is connected to go, biggest first, until 10%
+    /// is free (test runners create them again).
+    pub(super) async fn ensure_space(&self) -> Result<()> {
+        let Some((free, total)) = self.pg.disk() else {
+            return Ok(());
+        };
+        if free * 10 >= total {
+            return Ok(());
+        }
+        let sizes = self.pg.sizes().await?;
+        if free * 20 < total {
+            let biggest: Vec<String> = sizes
+                .iter()
+                .take(5)
+                .map(|(db, b)| format!("{db} {} MB", b >> 20))
+                .collect();
+            anyhow::bail!(
+                "the database disk {} is {}% full ({} of {} MB free); biggest: {}. Remove \
+                 worktrees (`lazy-cow-tree worktree rm`) or raise lazyCowTree.postgres.ramdiskMB",
+                self.pg.dir.display(),
+                100 - free * 100 / total.max(1),
+                free >> 20,
+                total >> 20,
+                biggest.join(", ")
+            );
+        }
+        let checkouts = self.all_checkouts();
+        for (db, bytes) in &sizes {
+            let Some(c) = checkouts.iter().find(|c| {
+                c.worktree.is_some()
+                    && c.owns_db(db)
+                    && !c.db_kinds().any(|k| c.dev_db_of(k) == *db)
+                    && config::db_owner(db, checkouts.iter()).is_some_and(|o| o.same(c))
+            }) else {
+                continue;
+            };
+            if self.pg.connections(db).await? > 0 {
+                continue;
+            }
+            self.pg.drop(db).await?;
+            warn!(
+                "{db}: dropped ({} MB) for room on the database disk; {} creates it again",
+                bytes >> 20,
+                c.id()
+            );
+            if self.pg.disk().is_some_and(|(f, t)| f * 10 >= t) {
+                break;
+            }
         }
         Ok(())
     }
