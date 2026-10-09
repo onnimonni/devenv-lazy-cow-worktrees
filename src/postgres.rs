@@ -35,6 +35,8 @@ fn cluster_settings(
         ("port", port.to_string()),
         ("unix_socket_directories", dir.display().to_string()),
         ("max_connections", "1000".into()),
+        // Compiling a query plan costs more than test suites' short queries save.
+        ("jit", "off".into()),
     ];
     if !durable {
         settings.extend([
@@ -47,10 +49,11 @@ fn cluster_settings(
             ("wal_level", "minimal".into()),
             ("max_wal_senders", "0".into()),
             ("archive_mode", "off".into()),
-            // The default max_wal_size (1 GB) would crowd the RAM disk; checkpoints
-            // are cheap without fsync.
+            // The default max_wal_size (1 GB) would crowd the RAM disk; fewer
+            // checkpoints during seeds and bulk loads.
             ("min_wal_size", "32MB".into()),
-            ("max_wal_size", "64MB".into()),
+            ("max_wal_size", "256MB".into()),
+            ("checkpoint_timeout", "30min".into()),
         ]);
     }
     settings
