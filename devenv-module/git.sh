@@ -5,16 +5,22 @@
 # does (`lazy-cow-tree-cow populate`): copy-on-write clones of the primary checkout,
 # build caches included. After `worktree add/remove/prune/move` the daemon, if
 # running, provisions or cleans up (`lazy-cow-tree reconcile`). `worktree remove` refuses
-# while the branch has an open pull request on a GitHub origin (gh). Every other command
+# while the branch has an open pull request on a GitHub origin (gh) or something started
+# in the worktree still runs (`lazy-cow-tree worktree procs`). Every other command
 # is the real git. Adapted from git-cow's wrapper.
 #
 #   LAZY_COW_TREE_GIT_DISABLE=1  plain git
 #   FORCE_ALLOW_OPEN_PR=1        `git worktree remove` even while its branch has an open PR
+#   FORCE_KILL_PROCESSES=1       `git worktree remove` SIGKILLs what still runs in it
+#                                (else it refuses and lists them)
 
 real_git=@git@
 cow=@cow@
 gh=@gh@
 lazy_cow_tree=@lazyCowTree@
+
+# FORCE_* variables: set to 1 (true, yes); 0, false or empty is off.
+truthy() { case ${1:-} in 1 | [Tt]rue | TRUE | [Yy]es | YES) return 0 ;; esac; return 1; }
 
 # Tell the daemon (if running) to provision new worktrees / clean up removed ones.
 reconcile() { ("$lazy_cow_tree" reconcile --path "$1" >/dev/null 2>&1 &) }
@@ -49,14 +55,50 @@ case ${2:-} in
     for a in "${@:3}"; do
       [[ $a == -* ]] || { target=$a; break; }
     done
+    arg=$target
     [[ -z $target || $target == /* ]] || target=$base/$target
-    if [[ -n $target && -z ${FORCE_ALLOW_OPEN_PR:-} ]] &&
+    if [[ -n $target ]] && ! truthy "${FORCE_ALLOW_OPEN_PR:-}" &&
       branch=$("$real_git" -C "$target" symbolic-ref -q --short HEAD 2>/dev/null) &&
       [[ $("$real_git" -C "$target" remote get-url origin 2>/dev/null) == *github* ]]; then
       # gh failing (not logged in, offline): removed as usual.
       if prs=$(cd "$target" && "$gh" pr list --head "$branch" --state open \
         --json url --jq '.[].url' 2>/dev/null) && [[ -n $prs ]]; then
         echo "error: worktree not removed: branch '$branch' has an open pull request (${prs//$'\n'/, }); merge or close it first, or set FORCE_ALLOW_OPEN_PR=1" >&2
+        exit 1
+      fi
+    fi
+    # Not while something started in it still runs (it would keep writing into a
+    # deleted directory), unless asked to kill it. The daemon's services it stops itself.
+    # Only a linked worktree git would remove: an exact path or, like git, a unique
+    # suffix of one (`git worktree remove foo` for .claude/worktrees/foo).
+    wt=
+    if [[ -n $target ]]; then
+      want=$(cd "$target" 2>/dev/null && pwd -P) || want=
+      matches=()
+      primary=1
+      # Like git: case-insensitive where the filesystem is (core.ignorecase).
+      [[ $("$real_git" "${globals[@]}" config --bool core.ignorecase 2>/dev/null) == true ]] &&
+        shopt -s nocasematch
+      while IFS= read -r l; do
+        [[ $l == "worktree "* ]] || continue
+        p=${l#worktree }
+        if ((primary)); then primary=0; continue; fi
+        if [[ -n $want ]]; then
+          [[ $(cd "$p" 2>/dev/null && pwd -P) == "$want" ]] && matches=("$p")
+        elif [[ $p == */"$arg" ]]; then
+          matches+=("$p")
+        fi
+      done < <("$real_git" "${globals[@]}" worktree list --porcelain 2>/dev/null)
+      shopt -u nocasematch
+      ((${#matches[@]} == 1)) && wt=${matches[0]}
+    fi
+    if [[ -n $wt && -d $wt ]]; then
+      if truthy "${FORCE_KILL_PROCESSES:-}"; then
+        RUST_LOG=lazy_cow_tree=warn "$lazy_cow_tree" worktree procs --kill "$wt" | while IFS= read -r l; do echo "warning: $l" >&2; done
+      elif procs=$("$lazy_cow_tree" worktree procs "$wt" 2>/dev/null) && [[ -n $procs ]]; then
+        while IFS= read -r l; do echo "warning: $l" >&2; done <<<"$procs"
+        printf -v again ' %q' "${globals[@]}" "$@"
+        echo "error: worktree not removed: stop them, or kill them with: FORCE_KILL_PROCESSES=1 git$again" >&2
         exit 1
       fi
     fi
@@ -105,7 +147,7 @@ worktree=$(cd "$path" && pwd -P) || exit 1
 wt_git() { env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE "$real_git" -C "$worktree" "$@"; }
 
 if ! "$cow" populate ${quiet:+-q} "$worktree"; then
-  echo "lazy-cow-tree: falling back to a regular checkout" >&2
+  echo "copy-on-write fill failed: falling back to a regular checkout" >&2
   wt_git reset --hard --no-recurse-submodules -q || status=$?
 fi
 

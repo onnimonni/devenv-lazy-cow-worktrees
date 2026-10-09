@@ -312,9 +312,7 @@ impl Redis {
             Ok(s) => s,
             Err(e) => {
                 warn!("{e:#}");
-                client
-                    .write_all(format!("-ERR lazy-cow-tree: {e}\r\n").as_bytes())
-                    .await?;
+                client.write_all(format!("-ERR {e}\r\n").as_bytes()).await?;
                 return Ok(());
             }
         };

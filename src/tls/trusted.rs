@@ -104,8 +104,15 @@ pub fn leaf(der: &[u8]) -> Result<Leaf> {
     })
 }
 
-/// The GitHub repository of the project's remote, with its token.
+/// The GitHub repository with the certificates, with the project's token:
+/// `lazyCowTree.tls.githubRepository`, else the project's remote's.
 pub fn repo_client(project: &crate::config::Project) -> Result<github::Client> {
+    if let Some(r) = project.settings.tls_github_repository.as_deref() {
+        let repo =
+            github::parse_repo(r).ok_or_else(|| anyhow!("{r} is not a GitHub repository"))?;
+        let token = github::auth_token(&repo.host, &project.env)?;
+        return github::Client::new(repo, token);
+    }
     let remote = &project.settings.remote;
     let repo = git2::Repository::open(&project.root)?
         .find_remote(remote)?

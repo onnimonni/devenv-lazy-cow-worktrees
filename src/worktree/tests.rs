@@ -19,6 +19,7 @@ fn settings() -> ProjectSettings {
         no_auto_remove: false,
         databases: Vec::new(),
         tls_domain: None,
+        tls_github_repository: None,
         tls_services: Vec::new(),
     }
 }
@@ -116,6 +117,26 @@ fn names_are_unique() {
     // A name git gave another worktree's admin dir.
     let err = create(&project, &syncer, "dup1", None).unwrap_err();
     assert!(err.to_string().contains("pick another name"), "{err}");
+}
+
+#[test]
+fn primary_files_are_told_from_worktrees() {
+    let (d, project, syncer) = fixture();
+    let wt = create(&project, &syncer, "feat", None).unwrap();
+    let root = &project.root;
+    let in_primary = |p: &Path| crate::config::in_primary(p, root);
+    assert!(in_primary(&root.join("a.txt")));
+    // Not there yet: its nearest directory.
+    assert!(in_primary(&root.join("new/dir/b.txt")));
+    assert!(in_primary(&root.join("cache/big")));
+    assert!(!in_primary(&wt.join("a.txt")));
+    assert!(!in_primary(&wt.join("new/b.txt")));
+    // Outside it, another repository inside it, another primary.
+    assert!(!in_primary(&d.path().join("x.txt")));
+    let nested = root.join("deps/lib");
+    Repository::init(&nested).unwrap();
+    assert!(!in_primary(&nested.join("x.ex")));
+    assert!(!crate::config::in_primary(&root.join("a.txt"), &wt));
 }
 
 #[test]

@@ -20,7 +20,7 @@ if [[ -z $real ]]; then
       break
     fi
   done
-  [[ -n $real ]] || { echo "lazy-cow-tree: no @name@ in PATH besides this wrapper" >&2; exit 127; }
+  [[ -n $real ]] || { echo "no @name@ in PATH besides the lazy-cow-tree wrapper" >&2; exit 127; }
 fi
 
 # A language server start: the entry's arguments first (no arguments: exactly none).

@@ -31,7 +31,7 @@ fn service_start_ready_hostname_and_back_compat() {
         (None, None, None)
     );
     let new: Services = r#"{"web": {"exec": "/nix/store/x-web", "start": "up", "idleTimeout": 900,
-        "ready": {"timeout": 5}, "hostname": "care.treat.localhost"},
+        "ready": {"timeout": 5}, "hostname": "care.myapp.localhost"},
         "adm": {"exec": "x", "start": "manual"}}"#
         .parse()
         .unwrap();
@@ -54,23 +54,23 @@ fn service_start_ready_hostname_and_back_compat() {
 #[test]
 fn service_hostname_override() {
     let c = with_services(
-        r#"{"care": {"exec": "x", "hostname": "care.treat.localhost"}, "web": {"exec": "y"}}"#,
+        r#"{"care": {"exec": "x", "hostname": "care.myapp.localhost"}, "web": {"exec": "y"}}"#,
     );
-    assert_eq!(c.service_host("care"), "wt.care.treat.localhost");
+    assert_eq!(c.service_host("care"), "wt.care.myapp.localhost");
     assert_eq!(c.service_host("web"), "wt.web.my-app.localhost");
     let primary = Checkout {
         worktree: None,
         ..c.clone()
     };
-    assert_eq!(primary.service_host("care"), "care.treat.localhost");
+    assert_eq!(primary.service_host("care"), "care.myapp.localhost");
     assert!(
         c.routes()
             .iter()
-            .any(|(_, h, _)| h == "wt.care.treat.localhost")
+            .any(|(_, h, _)| h == "wt.care.myapp.localhost")
     );
     for bad in [
         r#"{"a": {"exec": "x", "hostname": "Care.localhost"}}"#,
-        r#"{"a": {"exec": "x", "hostname": "care.example.com"}}"#,
+        r#"{"a": {"exec": "x", "hostname": "localhost"}}"#,
         r#"{"a": {"exec": "x", "hostname": "-a.localhost"}}"#,
         r#"{"a": {"exec": "x", "hostname": "h.localhost"}, "b": {"exec": "y", "hostname": "h.localhost"}}"#,
     ] {
@@ -123,6 +123,7 @@ fn project_settings_from_env() {
         no_auto_remove: false,
         databases: Vec::new(),
         tls_domain: None,
+        tls_github_repository: None,
         tls_services: Vec::new(),
     };
     let mut p = Project::new("/src/app".into(), settings);
@@ -411,6 +412,7 @@ fn global() -> Global {
         redis_server: None,
         postgres_extensions: Some("postgis, vector  pg_trgm,".into()),
         devenv_proxy_socket: None,
+        devenv_proxy_ca: false,
         postgres_durable: false,
         redis_idle_timeout: None,
     }
@@ -741,8 +743,51 @@ fn domain_hosts_and_certificate_names() {
             "app.dev.example.com",
         ]
     );
+    assert_eq!(p.check_hostnames(), Ok(()));
+
+    // An own hostname under the domain: served with its certificate, which covers it
+    // and its worktrees'. Elsewhere, only `.localhost`.
+    let mut settings = p.settings.clone();
+    settings.services = r#"{"sim": {"exec": "a", "hostname": "simulator.app.dev.example.com"},
+        "admin": {"exec": "c", "hostname": "admin.localhost"}}"#
+        .parse()
+        .unwrap();
+    let p = Project::new("/src/app".into(), settings.clone());
+    assert_eq!(p.check_hostnames(), Ok(()));
+    assert_eq!(
+        p.checkout_on(Some("wt"), "/x".into(), 20000)
+            .service_host("sim"),
+        "wt.simulator.app.dev.example.com"
+    );
+    assert!(
+        p.tls_names()
+            .contains(&"*.simulator.app.dev.example.com".to_string())
+    );
+    settings.services = r#"{"sim": {"exec": "a", "hostname": "sim.example.com"}}"#
+        .parse()
+        .unwrap();
+    assert!(
+        Project::new("/src/app".into(), settings.clone())
+            .check_hostnames()
+            .is_err()
+    );
+    settings.tls_domain = None;
+    settings.services = r#"{"sim": {"exec": "a", "hostname": "simulator.app.dev.example.com"}}"#
+        .parse()
+        .unwrap();
+    assert!(
+        Project::new("/src/app".into(), settings)
+            .check_hostnames()
+            .is_err()
+    );
+
     assert!(parse_domain("Dev.Example.com.").is_ok_and(|d| d == "dev.example.com"));
     assert!(parse_domain("localhost").is_err());
+    assert_eq!(
+        parse_repository("example-org/app").as_deref(),
+        Ok("github.com/example-org/app")
+    );
+    assert!(parse_repository("app").is_err());
 }
 
 #[test]

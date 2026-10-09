@@ -409,6 +409,7 @@ impl Daemon {
         }
         Repository::open(&root)
             .with_context(|| format!("{} is not a git checkout", root.display()))?;
+        project.check_hostnames().map_err(anyhow::Error::msg)?;
         durability_check(
             self.global.postgres_durable,
             &project,
@@ -971,6 +972,7 @@ fn start_proxy(
     let devenv = crate::devenv_proxy::DevenvRoutes::new(
         reserved,
         Some(std::net::SocketAddr::from(([127, 0, 0, 1], https))),
+        global.devenv_proxy_ca,
     );
     // devenv checks its proxy through plain HTTP; without it `devenv up` starts its own.
     let devenv_socket = match global.devenv_proxy_socket.as_deref() {

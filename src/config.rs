@@ -122,6 +122,12 @@ pub struct Global {
     #[arg(long, env = "LAZY_COW_TREE_DEVENV_PROXY_SOCKET", global = true)]
     #[serde(default)]
     pub devenv_proxy_socket: Option<PathBuf>,
+    /// Serve the hostnames devenv projects register with lazy-cow-tree's CA (trusted
+    /// once, `lazy-cow-tree trust`) instead of each project's own mkcert certificate.
+    /// With TRUST_STORES=none mkcert then never asks to trust a new project's CA.
+    #[arg(long, env = "LAZY_COW_TREE_DEVENV_PROXY_CA", global = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new())]
+    #[serde(default)]
+    pub devenv_proxy_ca: bool,
     /// PostgreSQL keeps its data safe (on disk, fsync on) instead of the RAM disk with
     /// fsync, synchronous_commit and full_page_writes off. Daemon-wide: projects with
     /// another value are refused.
@@ -237,6 +243,12 @@ pub struct ProjectSettings {
     #[arg(long, env = "LAZY_COW_TREE_TLS_DOMAIN", value_parser = parse_domain)]
     #[serde(default)]
     pub tls_domain: Option<String>,
+    /// GitHub repository whose `https-certificate` artifact has the domain's
+    /// certificates (`owner/repo`, `host/owner/repo` or a URL), when it isn't the
+    /// checkout's `remote`: e.g. one repository issuing them for several projects.
+    #[arg(long, env = "LAZY_COW_TREE_TLS_GITHUB_REPOSITORY", value_parser = parse_repository)]
+    #[serde(default)]
+    pub tls_github_repository: Option<String>,
     /// Service names the certificate covers besides the project's own services, so
     /// adding one of them needs no new certificate.
     #[arg(
@@ -900,6 +912,18 @@ pub fn primary_root(path: &Path) -> Result<PathBuf> {
         Some(w) => Ok(w.canonicalize()?),
         None => bail!("bare repositories are not supported"),
     }
+}
+
+/// `path` (or, not there yet, its nearest directory) is in the primary checkout at
+/// `root`: not in one of its worktrees, nor in another repository.
+pub fn in_primary(path: &Path, root: &Path) -> bool {
+    let Some(dir) = path.ancestors().find(|p| p.is_dir()) else {
+        return false;
+    };
+    let Ok(root) = root.canonicalize() else {
+        return false;
+    };
+    matches!(locate(dir), Ok((r, None, _)) if r == root)
 }
 
 /// (primary root, worktree name or None, checkout path) for `path`.

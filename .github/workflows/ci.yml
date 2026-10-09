@@ -22,6 +22,18 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
+  statix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      # The statix the git hook runs (devenv.lock), its release binary; shellcheck and
+      # ruff for the scripts in Nix strings.
+      - run: |
+          rev=$(jq -r .nodes.statix.locked.rev devenv.lock)
+          nix shell "github:onnimonni/statix/$rev#prebuilt" nixpkgs#shellcheck nixpkgs#ruff \
+            --command statix check .
+
   e2e:
     strategy:
       fail-fast: false
@@ -36,6 +48,8 @@ jobs:
       - run: cargo build
       # PostgreSQL 18, Redis and jq from nixpkgs; git, curl and python3 from the runner.
       - run: nix shell nixpkgs#postgresql_18 nixpkgs#redis nixpkgs#jq --command tests/e2e.sh target/debug/lazy-cow-tree
+      # The runner's bash (3.2 on macOS) and nixpkgs' bash 5 and zsh.
+      - run: tests/protect-primary.sh /bin/bash "$(nix build --no-link --print-out-paths nixpkgs#bashInteractive.out)/bin/bash" "$(nix build --no-link --print-out-paths nixpkgs#zsh.out)/bin/zsh"
 
   nix:
     strategy:
@@ -57,3 +71,5 @@ jobs:
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
       - run: nix build .#lazy-cow-tree -L
       - run: ./result/bin/lazy-cow-tree --version && ./result/bin/lazy-cow-tree-cow --version
+      # Release binaries (prebuilt.json): Linux ones need patchelf to run.
+      - run: nix build .#prebuilt -L -o prebuilt && ./prebuilt/bin/lazy-cow-tree --version

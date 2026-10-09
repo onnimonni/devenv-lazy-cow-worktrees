@@ -59,8 +59,10 @@ get the environment of the worktree they're in.
 | **LSP proxy** | `lazy-cow-tree lsp -- <server>` runs one language server per worktree, routes each request by file, and drops results from other worktrees. Wrapped in the devenv shell and given to Claude Code, Codex and pi (dexter, typescript-language-server, pyright and rust-analyzer for now). |
 
 Removing a worktree SIGKILLs everything running in it (each service's process group,
-plus any process whose working directory or executable is inside it, with all
-descendants: the BEAM, esbuild, tailwind, node, …; never the process asking for the
+plus any process whose working directory or executable is inside it or that a shell in
+it started, even one that detached or `cd`'d away since, such as a tmux server or an
+agent session started there, with all descendants: the BEAM, esbuild, tailwind, node, …;
+never the process asking for the
 removal or its ancestors, such as the Claude Code session), stops its redis-server, drops
 its databases and role, deletes its branch (even `--force` keeps one with commits
 that aren't on the base branch, pushed, or in its merged PR, renamed to
@@ -74,7 +76,8 @@ primary checkout's, nor unchanged since setup finished are printed as warnings.
 Binaries (`lazy-cow-tree` and `lazy-cow-tree-cow`) for macOS (arm64) and Linux (x86_64,
 arm64) are on the
 [releases page](https://github.com/onnimonni/devenv-lazy-cow-worktrees/releases); or
-`nix profile install github:onnimonni/devenv-lazy-cow-worktrees`, or
+`nix profile install github:onnimonni/devenv-lazy-cow-worktrees` (or `#prebuilt` for the
+release binaries, no build), or
 `cargo install --git https://github.com/onnimonni/devenv-lazy-cow-worktrees`. lazy-cow-tree runs
 `postgres`/`initdb` (18+) and `redis-server` from PATH unless told where they are
 (the devenv module does).
@@ -124,7 +127,9 @@ In CI, let [cachix-action](https://github.com/cachix/cachix-action) configure it
 
 To build it yourself instead: `lazyCowTree.cachix.enable = false;` and
 `lazyCowTree.package = pkgs.callPackage (inputs.lazy-cow-tree + "/package.nix") { };`
-(your nixpkgs; compiled locally).
+(your nixpkgs; compiled locally). Or the latest release's binaries, no build (Cachix can be off too):
+`lazyCowTree.package = inputs.lazy-cow-tree.packages.${pkgs.stdenv.hostPlatform.system}.prebuilt;`
+(macOS arm64, Linux x86_64 and arm64).
 
 **2. Describe the project** in plain devenv. The module reads `processes`,
 `services.postgres` and `services.redis`, and lazy-cow-tree runs them in every
@@ -170,7 +175,7 @@ How devenv's options map:
 | `cwd` | relative to the checkout |
 | `ports.http` (or the only port) | `$PORT`, the service's hostname; env entries holding a port's value are replaced by the checkout's port |
 | other `ports.<p>` | named port, in the variable that held its value (else `<P>_PORT`); `http` if it has its own `proxy.hostname` |
-| `proxy.hostname` | hostname in the primary; worktrees get `<worktree>.` in front |
+| `proxy.hostname` | hostname in the primary (under `.localhost` or `lazyCowTree.tls.domain`); worktrees get `<worktree>.` in front |
 | `after = [ "devenv:processes:<x>" ]` | `dependsOn`, when lazy-cow-tree runs `<x>` too; other entries are ignored with a warning |
 | `ready.http.get.path`, `ready.timeout` | a first request waits for this probe (200–399), default 60 s |
 | `restart.on`, `watch.paths` | `restart`, `restartOnChange` |
@@ -294,11 +299,13 @@ of the devenv shell that names a path in the primary point into the worktree ins
 for the services run there, so scripts using `$DEVENV_ROOT` act on the checkout you're in. How: `BASH_ENV` (every non-interactive
 bash) and `ZDOTDIR` (every zsh; Codex runs commands with `zsh -lc`) source a hook
 that defines the `cd`/`pushd`/`popd` wrappers and runs `lazy-cow-tree shell-hook`
-(hidden command, ~10 ms), which also records in `LAZY_COW_TREE_SHELL` what it set. Your own
+(hidden command, ~10 ms), which also records in `LAZY_COW_TREE_SHELL` what it set, and in
+a worktree keeps an fd on its git admin dir (`.git/worktrees/<name>`) open (`WORKTREE_PROCESS_MARKER`, see `git worktree remove`). Your own
 `BASH_ENV` and zsh startup files (from your `ZDOTDIR`, else `$HOME`) still run.
 `codex` is wrapped to run with `--no-daemon`: a shared `codex app-server` started
 elsewhere would run commands with its own environment. Not covered: `builtin cd`,
-fish. Turn it off with `lazyCowTree.shellHook.enable = false` (then `enterShell`
+fish, an interactive bash started from the devenv shell (it doesn't read `BASH_ENV`:
+it keeps the environment and process marker of where it started). Turn it off with `lazyCowTree.shellHook.enable = false` (then `enterShell`
 only exports the environment of the checkout it starts in) and
 `lazyCowTree.codex.noDaemon = false`.
 
@@ -358,6 +365,7 @@ FIXME: other language servers. devenv's `languages.*.lsp` has only `enable` and
 | `lazyCowTree.package` | built with lazy-cow-tree's pinned nixpkgs | lazy-cow-tree build; the default is on lazy-cow-tree.cachix.org |
 | `lazyCowTree.cachix.enable` | `true` | `cachix.pull = [ "lazy-cow-tree" ]` |
 | `lazyCowTree.shellHook.enable` | `true` | every bash/zsh from the devenv shell (agents' tool shells) gets its checkout's environment, again after `cd` (step 7) |
+| `lazyCowTree.processMarkerShim.enable` | `true` | macOS: children of node, bun, python and erlang keep the worktree process marker, so `git worktree remove` finds them (`DYLD_INSERT_LIBRARIES`) |
 | `lazyCowTree.git.enable` | `true` | `git` in the shell is a wrapper: `git worktree add` fills the worktree like `lazy-cow-tree worktree new` (copy-on-write clones of the primary, build caches included; locked as initializing meanwhile); `LAZY_COW_TREE_GIT_DISABLE=1` for plain git. Don't also import git-cow's module |
 | `lazyCowTree.git.package` | `pkgs.git` | the real git it runs |
 | `lazyCowTree.claude.lsp` | `true` | the language servers as Claude Code plugin `lazy-cow-tree-lsp` from a local marketplace in `.claude/settings.local.json` (step 8) |
@@ -395,7 +403,7 @@ Service options:
 | `start` | `"demand"` | `"up"`, `"demand"` or `"manual"` |
 | `idleTimeout` | `null` | seconds without open connections before it's stopped |
 | `ready` | `null` | `{ path; timeout; }`: HTTP probe a first request waits for |
-| `hostname` | `<service>.<project>.localhost` | hostname in the primary; worktrees prefix `<worktree>.` |
+| `hostname` | `<service>.<project>.localhost` | hostname in the primary, under `.localhost` or `lazyCowTree.tls.domain`; worktrees prefix `<worktree>.` |
 
 Commands are split like a shell would, then run directly (no shell) with the
 service's environment and the project's `PATH`. Logs: `lazy-cow-tree service log -s <name>`.
@@ -513,11 +521,56 @@ reconcile too, which drops a removed worktree's databases, role and redis-server
 With a GitHub `origin`, `git worktree remove` refuses while the worktree's branch has an
 open pull request (checked with `gh`; one error line naming the PR); a merged, closed
 or missing PR removes it as usual, and if `gh` can't tell (not logged in, offline) it
-removes it too. `FORCE_ALLOW_OPEN_PR=1` skips the check.
+removes it too. `FORCE_ALLOW_OPEN_PR=1` skips the check. It also refuses while something
+started in the worktree still runs, other than what lazy-cow-tree runs (its services, which the daemon stops; language
+servers of `lazy-cow-tree lsp`),
+listing each (`pid 123 with command "npm exec vitest" was launched from this worktree
+and is still running`); `FORCE_KILL_PROCESSES=1` SIGKILLs them, with their descendants,
+and removes it. "Started in it": its working directory or executable is inside it, or
+it inherited the marker the shell hook keeps open in every shell inside a worktree
+(`WORKTREE_PROCESS_MARKER`, an fd on the worktree's git admin dir, kept across `setsid`, `cd /` and double
+forks; on Linux also `DEVENV_ROOT` in its environment). node, bun, python and erlang
+close inherited fds in what they start; on macOS the module loads a small library into
+the shell's processes (`DYLD_INSERT_LIBRARIES`, `lazyCowTree.processMarkerShim.enable`)
+that keeps the marker open there. It only acts in processes holding a marker, and runs
+nix's `sh` and `env` for `/bin/sh` and `/usr/bin/env` (also as a script's `#!`), which
+SIP would make drop it; the shell hook restores it after SIP's bash and zsh.
+Best effort: hardened-runtime binaries that don't allow `DYLD_*` (most notarized
+apps) ignore it, and daemons that close every fd lose the marker.
+`lazy-cow-tree worktree procs <path> [--kill]` lists (kills) them by hand.
 
 Nothing watches the filesystem: a worktree made or deleted outside the wrapper (plain
 git elsewhere, `rm -rf`) is picked up by the daemon within a minute, and one made by
 plain git has no caches.
+
+## Keep the primary checkout for `git pull`
+
+```nix
+lazyCowTree.protectPrimary.enable = true;   # off by default
+lazyCowTree.protectPrimary.allow = [ "cd" "git pull" "git worktree" ];   # optional, replaces the default
+```
+
+All work then happens in worktrees: in the primary checkout (and its subdirectories,
+not its worktrees) shells started from the devenv shell run only allowed commands. An
+entry allows a command starting with exactly its words: `git pull` allows
+`git pull --rebase`, not `git push`. Default: `cd`, `pushd`, `popd`, `git pull`,
+`git fetch`, `git status`, `git log`, `git diff`, `git worktree`, `gh`,
+`lazy-cow-tree`, `devenv`, `claude`, `codex`, `pi`, `exit`. Anything else is refused,
+pointing to `git worktree add <worktreesDir>/<name>`:
+
+- **bash** (3.2 and 5): a typed command is skipped (a DEBUG trap); a `bash -c` line
+  (agents' tool shells) is checked before it runs, each command where it runs
+  (`cd .claude/worktrees/x && make` is fine), and refused whole.
+- **zsh**: typed and `zsh -c` commands, each `;`-separated list checked the same way.
+- Scripts run as files (git hooks, tools' scripts), startup files and functions
+  aren't checked.
+- **Claude Code**: Edit/Write of the primary's files is refused (a PreToolUse hook).
+- **git outside the shell** (IDEs, GUIs): with a `git-hooks` input
+  (`devenv inputs add git-hooks github:cachix/git-hooks.nix --follows nixpkgs`),
+  pre-commit, pre-merge-commit and pre-rebase hooks refuse in the primary.
+
+A guardrail against mistakes, not a security boundary. Needs
+`lazyCowTree.shellHook.enable` (the default).
 
 ## Trusted certificates on your own domain
 
@@ -527,10 +580,12 @@ phone simulator, Node, curl and CI job accepts it.
 
 ```nix
 lazyCowTree.tls.domain = "dev.example.com";   # hostnames: <worktree>.<service>.<project>.dev.example.com
+lazyCowTree.tls.githubRepository = "my-org/certs";  # optional: the artifact's repository, default the checkout's remote
 ```
 
 Set up [onnimonni/trusted-https-certificate-to-artifacts-action](https://github.com/onnimonni/trusted-https-certificate-to-artifacts-action)
-in the project's GitHub repository; lazy-cow-tree serves the certificates it keeps
+in the project's GitHub repository (or the one `lazyCowTree.tls.githubRepository` names,
+e.g. `example-org/certificates` issuing them for several projects); lazy-cow-tree serves the certificates it keeps
 there (the newest `https-certificate` artifact, a zip with one `.pem` per domain, e.g. `_._.app.example-dev.com.pem`):
 
 - It downloads them with the token `gh` has, only from a private (or internal)
@@ -540,8 +595,9 @@ there (the newest `https-certificate` artifact, a zip with one `.pem` per domain
   ones are skipped. A file whose certificate isn't for its key is refused, and the
   ones read before stay in use.
 - Until a certificate covers a name, or while none can be read, the local CA serves
-  it. Hostnames set with `processes.<name>.proxy.hostname` stay as they are
-  (`.localhost`, local CA).
+  it. Hostnames set with `processes.<name>.proxy.hostname` stay as they are:
+  `.localhost` ones get the local CA, ones under the domain (e.g.
+  `sim.<project>.<domain>`, a name the certificate already covers) its certificate.
 
 The certificate should name, per http service, `<service>.<project>.<domain>` and
 `*.<service>.<project>.<domain>` (its worktrees'): one certificate covers every
@@ -569,7 +625,7 @@ lazy-cow-tree service env [-s <service>] [--set KEY=VALUE]... [--unset KEY]...
 lazy-cow-tree status                       # projects, worktrees, services, databases
 lazy-cow-tree sync                         # pull, merge, remove merged, migrate now
 lazy-cow-tree snapshot                     # template := the primary's dev database
-lazy-cow-tree trust                        # trust the local CA
+lazy-cow-tree trust                        # trust the local CA (no-op once trusted)
 lazy-cow-tree cert show                    # lazyCowTree.tls.domain's certificate: names, expiry, what it lacks
 lazy-cow-tree down [--eject]               # stop the daemon; --eject drops the RAM disk
 lazy-cow-tree lsp -- <server> [args]
@@ -611,6 +667,44 @@ over plain HTTP, like with devenv's proxy. Nothing changes in that project.
   socket; `off` disables it.
 - Routes live in memory: after a daemon restart, run `devenv up` again in those
   projects.
+- `--devenv-proxy-ca` (`LAZY_COW_TREE_DEVENV_PROXY_CA=1`) serves those hostnames
+  with lazy-cow-tree's CA instead of the project's mkcert certificate. Node in such
+  a project still trusts only its mkcert CA (`NODE_EXTRA_CA_CERTS`).
+
+### nix-darwin: one CA, no trust prompt per project
+
+devenv gives every project (and every worktree that runs devenv) its own mkcert CA
+and runs `mkcert -install` for it: a "System Certificate Trust Settings" password
+prompt each time. The nix-darwin module makes lazy-cow-tree the proxy for every
+devenv project and stops those prompts:
+
+```nix
+# flake.nix of your nix-darwin configuration
+{
+  inputs.lazy-cow-tree.url = "github:onnimonni/devenv-lazy-cow-worktrees";
+
+  outputs = { nix-darwin, lazy-cow-tree, ... }: {
+    darwinConfigurations.my-mac = nix-darwin.lib.darwinSystem {
+      modules = [
+        lazy-cow-tree.darwinModules.default
+        {
+          services.lazy-cow-tree.enable = true;
+          # user = "me";             # default: system.primaryUser
+          # mkcertTrustStores = "nss";  # default "none"; null = mkcert's default
+        }
+      ];
+    };
+  };
+}
+```
+
+For your shells and everything launchd starts it sets `DEVENV_PROXY_BINARY` (devenv
+starts lazy-cow-tree instead of `devenv-proxy`), `TRUST_STORES=none` (mkcert, devenv's
+included, creates CAs but never touches the keychain) and
+`LAZY_COW_TREE_DEVENV_PROXY_CA=1`. Activation runs `lazy-cow-tree trust` as the user,
+which asks for the password only while the CA isn't trusted yet: once, not on
+every `darwin-rebuild switch`. Open shells pick the variables up after a restart; a
+daemon already running keeps its settings until `lazy-cow-tree down`.
 
 ## Notes
 

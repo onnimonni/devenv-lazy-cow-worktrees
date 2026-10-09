@@ -51,6 +51,20 @@ pub fn parse_remote_url(url: &str) -> Option<RepoId> {
     })
 }
 
+/// A repository named in settings: `owner/repo` (on github.com), `host/owner/repo`
+/// or a remote URL.
+pub fn parse_repo(s: &str) -> Option<RepoId> {
+    let s = s.trim().trim_matches('/');
+    if s.contains("://") || s.contains(':') {
+        return parse_remote_url(s);
+    }
+    match s.split('/').count() {
+        2 => parse_remote_url(&format!("https://github.com/{s}")),
+        3 => parse_remote_url(&format!("https://{s}")),
+        _ => None,
+    }
+}
+
 /// Same lookup order as go-gh: env vars, the keyring entry `gh` writes, then its
 /// hosts.yml (where gh keeps the token without a keyring, e.g. on Linux). `env` (a
 /// registering project's environment) comes before the daemon's own: each project uses
@@ -69,12 +83,6 @@ pub fn auth_token(host: &str, env: &[(String, String)]) -> Result<String> {
             return Ok(t.trim().to_string());
         }
     }
-    if let Ok(secret) =
-        keyring::Entry::new(&format!("gh:{host}"), "").and_then(|e| e.get_password())
-    {
-        return decode_go_keyring(&secret);
-    }
-    // Without a keyring (typical on Linux) gh keeps the token in hosts.yml.
     let dir = std::env::var_os("GH_CONFIG_DIR")
         .map(std::path::PathBuf::from)
         .or_else(|| {
@@ -83,24 +91,37 @@ pub fn auth_token(host: &str, env: &[(String, String)]) -> Result<String> {
         .or_else(|| {
             std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config/gh"))
         });
-    if let Some(dir) = dir
-        && let Ok(yml) = std::fs::read_to_string(dir.join("hosts.yml"))
-        && let Some(t) = hosts_yml_token(&yml, host)
-    {
+    let yml = dir
+        .and_then(|d| std::fs::read_to_string(d.join("hosts.yml")).ok())
+        .unwrap_or_default();
+    // gh keeps the active token under an empty account, which the keyring crate refuses
+    // on macOS, and under the active user's (hosts.yml `user:`).
+    let user = hosts_yml_value(&yml, host, "user");
+    for account in std::iter::once("").chain(user.as_deref()) {
+        if let Ok(secret) =
+            keyring::Entry::new(&format!("gh:{host}"), account).and_then(|e| e.get_password())
+        {
+            return decode_go_keyring(&secret);
+        }
+    }
+    // Without a keyring (typical on Linux) gh keeps the token in hosts.yml.
+    if let Some(t) = hosts_yml_value(&yml, host, "oauth_token") {
         return Ok(t);
     }
     bail!("no token for {host}: set GH_TOKEN or run `gh auth login`")
 }
 
-/// `oauth_token` of `host` in gh's hosts.yml (top-level host keys, indented fields).
-fn hosts_yml_token(yml: &str, host: &str) -> Option<String> {
+/// The first `key` (`oauth_token`, `user`) under `host` in gh's hosts.yml (top-level
+/// host keys, indented fields).
+fn hosts_yml_value(yml: &str, host: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}:");
     let mut in_host = false;
     for line in yml.lines() {
         if !line.starts_with(' ') && !line.starts_with('\t') {
             in_host = line.trim_end().trim_end_matches(':') == host;
             continue;
         }
-        if in_host && let Some(v) = line.trim().strip_prefix("oauth_token:") {
+        if in_host && let Some(v) = line.trim().strip_prefix(prefix.as_str()) {
             let v = v.trim().trim_matches('"').trim_matches('\'');
             if !v.is_empty() {
                 return Some(v.to_string());
@@ -168,10 +189,19 @@ impl Client {
     /// collaborators (an artifact holding a key, say) must not come from a public one,
     /// whose artifacts anyone can download.
     pub async fn is_private(&self) -> Result<bool> {
-        let repo: Value = self
+        let resp = self
             .req(reqwest::Method::GET, &self.repo_url())
             .send()
-            .await?
+            .await?;
+        // GitHub answers 404 for private repositories the token can't read.
+        if resp.status() == StatusCode::NOT_FOUND {
+            bail!(
+                "can't find {} on {}: most likely it's private and the account gh is logged in as (`gh auth status`) has no access to it; otherwise check its name",
+                self.repo,
+                self.repo.host
+            );
+        }
+        let repo: Value = resp
             .error_for_status()
             .with_context(|| format!("reading {}", self.repo))?
             .json()
@@ -540,6 +570,17 @@ mod tests {
             id("ghe.corp", "o", "r")
         );
         assert_eq!(parse_remote_url("/tmp/some/bare.git"), None);
+        assert_eq!(
+            parse_repo("example-org/app"),
+            id("github.com", "example-org", "app")
+        );
+        assert_eq!(parse_repo("ghe.corp/o/r"), id("ghe.corp", "o", "r"));
+        assert_eq!(
+            parse_repo("git@github.com:example-org/app.git"),
+            id("github.com", "example-org", "app")
+        );
+        assert_eq!(parse_repo("app"), None);
+        assert_eq!(parse_repo("a/b/c/d"), None);
     }
 
     #[test]
@@ -588,11 +629,19 @@ mod tests {
         let yml = "github.com:\n    users:\n        onni:\n            oauth_token: gho_nested\n    oauth_token: gho_top\n    user: onni\nghe.corp:\n    oauth_token: \"gho_ghe\"\n";
         // The first oauth_token under the host (older files have it top-level).
         assert_eq!(
-            hosts_yml_token(yml, "github.com").as_deref(),
+            hosts_yml_value(yml, "github.com", "oauth_token").as_deref(),
             Some("gho_nested")
         );
-        assert_eq!(hosts_yml_token(yml, "ghe.corp").as_deref(), Some("gho_ghe"));
-        assert_eq!(hosts_yml_token(yml, "other.host"), None);
+        assert_eq!(
+            hosts_yml_value(yml, "ghe.corp", "oauth_token").as_deref(),
+            Some("gho_ghe")
+        );
+        assert_eq!(hosts_yml_value(yml, "other.host", "oauth_token"), None);
+        // The active user (keyring account), not the `users:` map.
+        assert_eq!(
+            hosts_yml_value(yml, "github.com", "user").as_deref(),
+            Some("onni")
+        );
     }
 
     #[test]
@@ -602,5 +651,61 @@ mod tests {
             "gho_x"
         );
         assert_eq!(decode_go_keyring("gho_plain").unwrap(), "gho_plain");
+    }
+
+    /// A client of `example-org/app` whose API answers every request with `status`.
+    async fn answering(status: u16, body: &'static str) -> Client {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf).await;
+                let _ = s
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status} X\r\ncontent-length: {}\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            }
+        });
+        let mut gh =
+            Client::new(id("github.com", "example-org", "app").unwrap(), "t".into()).unwrap();
+        gh.api = format!("http://127.0.0.1:{port}");
+        gh
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_repository_says_so() {
+        let e = answering(404, r#"{"message":"Not Found"}"#)
+            .await
+            .is_private()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("can't find example-org/app on github.com"),
+            "{e}"
+        );
+        assert!(e.contains("private") && e.contains("gh auth status"), "{e}");
+        assert!(
+            answering(200, r#"{"private":true}"#)
+                .await
+                .is_private()
+                .await
+                .unwrap()
+        );
+        assert!(
+            !answering(200, r#"{"private":false}"#)
+                .await
+                .is_private()
+                .await
+                .unwrap()
+        );
+        assert!(answering(500, "").await.is_private().await.is_err());
     }
 }

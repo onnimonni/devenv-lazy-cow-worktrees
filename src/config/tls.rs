@@ -22,7 +22,34 @@ pub(crate) fn parse_domain(s: &str) -> std::result::Result<String, String> {
     }
 }
 
+pub(crate) fn parse_repository(s: &str) -> std::result::Result<String, String> {
+    crate::github::parse_repo(s)
+        .map(|r| format!("{}/{}/{}", r.host, r.owner, r.name))
+        .ok_or_else(|| format!("{s} is not a GitHub repository (owner/repo)"))
+}
+
 impl Project {
+    /// Services' own hostnames are `.localhost` ones (the local CA's) or under the
+    /// project's tls domain (its certificate's).
+    pub fn check_hostnames(&self) -> std::result::Result<(), String> {
+        let domain = self.settings.tls_domain.as_deref();
+        for (name, s) in &self.settings.services.0 {
+            let Some(h) = &s.hostname else { continue };
+            let under = |d: &str| h.strip_suffix(d).is_some_and(|r| r.ends_with('.'));
+            if !under("localhost") && !domain.is_some_and(under) {
+                return Err(match domain {
+                    Some(d) => {
+                        format!("service {name}: hostname {h} must end in .localhost or .{d}")
+                    }
+                    None => format!(
+                        "service {name}: hostname {h} must end in .localhost (or under lazyCowTree.tls.domain)"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Names its domain's certificates need, each with a wildcard for its worktrees':
     /// every http host of the primary checkout under the domain, then the project's
     /// own and `<service>.<project>.<domain>` of `tls_services` (as many as fit).

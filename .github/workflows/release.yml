@@ -47,3 +47,52 @@ jobs:
             lazy-cow-tree-*.tar.gz
             lazy-cow-tree-*.tar.gz.sha256
           generate_release_notes: true
+
+  # Points the flake's `prebuilt` package at this release: a PR updating prebuilt.json.
+  prebuilt-hashes:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - uses: cachix/install-nix-action@v31
+      - name: Update prebuilt.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          dir=$(mktemp -d)
+          gh release download "$TAG" --dir "$dir" --pattern '*.tar.gz' --pattern '*.tar.gz.sha256'
+          (cd "$dir" && shasum -a 256 -c ./*.sha256)
+          declare -A targets=(
+            [aarch64-darwin]=aarch64-apple-darwin
+            [aarch64-linux]=aarch64-unknown-linux-gnu
+            [x86_64-linux]=x86_64-unknown-linux-gnu
+          )
+          hashes='{}'
+          for system in "${!targets[@]}"; do
+            hash=$(nix hash file "$dir/lazy-cow-tree-$TAG-${targets[$system]}.tar.gz")
+            hashes=$(jq --arg s "$system" --arg h "$hash" '. + {($s): $h}' <<<"$hashes")
+          done
+          jq -n --arg v "${TAG#v}" --argjson h "$hashes" '{version: $v, hashes: ($h | to_entries | sort_by(.key) | from_entries)}' > prebuilt.json
+          cat prebuilt.json
+      - run: nix build .#prebuilt -L && ./result/bin/lazy-cow-tree --version
+      - name: Open PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          git diff --quiet prebuilt.json && exit 0
+          branch=prebuilt-$TAG
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git switch -c "$branch"
+          git commit -am "Prebuilt binaries $TAG"
+          git push origin "$branch"
+          gh pr create --title "Prebuilt binaries $TAG" --body "Points \`.#prebuilt\` at the $TAG release binaries."

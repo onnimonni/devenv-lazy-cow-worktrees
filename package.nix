@@ -30,7 +30,7 @@ rustPlatform.buildRustPackage {
 
   # DEVENV_PROXY_BINARY takes one path: this name runs `lazy-cow-tree devenv-proxy`.
   postInstall = ''
-    ln -s lazy-cow-tree $out/bin/lazy-cow-tree-devenv-proxy
+    ln -s lazy-cow-tree "$out"/bin/lazy-cow-tree-devenv-proxy
   '';
 
   meta = {

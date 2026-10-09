@@ -76,7 +76,8 @@ struct Registered {
 }
 
 impl Registered {
-    fn new(mut route: Route) -> Result<Self> {
+    /// `own_ca`: leave the route's certificate unloaded, lazy-cow-tree's CA serves it.
+    fn new(mut route: Route, own_ca: bool) -> Result<Self> {
         route.hostname = normalize_hostname(&route.hostname)?;
         if route.owner.trim().is_empty() {
             bail!("route owner cannot be empty");
@@ -87,6 +88,7 @@ impl Registered {
         let certificate = route
             .tls
             .as_ref()
+            .filter(|_| !own_ca)
             .map(|tls| load_certificate(tls, &route.hostname))
             .transpose()?
             .map(Arc::new);
@@ -103,6 +105,7 @@ pub struct DevenvRoutes {
     map: Arc<RwLock<BTreeMap<String, Arc<Registered>>>>,
     reserved: Reserved,
     https_listen: Option<SocketAddr>,
+    own_ca: bool,
 }
 
 impl std::fmt::Debug for DevenvRoutes {
@@ -113,16 +116,17 @@ impl std::fmt::Debug for DevenvRoutes {
 
 impl Default for DevenvRoutes {
     fn default() -> Self {
-        Self::new(Arc::new(|_| false), None)
+        Self::new(Arc::new(|_| false), None, false)
     }
 }
 
 impl DevenvRoutes {
-    pub fn new(reserved: Reserved, https_listen: Option<SocketAddr>) -> Self {
+    pub fn new(reserved: Reserved, https_listen: Option<SocketAddr>, own_ca: bool) -> Self {
         Self {
             map: Default::default(),
             reserved,
             https_listen,
+            own_ca,
         }
     }
 
@@ -145,7 +149,7 @@ impl DevenvRoutes {
     }
 
     pub fn register(&self, route: Route) -> Result<()> {
-        let registered = Registered::new(route)?;
+        let registered = Registered::new(route, self.own_ca)?;
         let mut map = self.map.write();
         self.check_free(&map, &registered.route.hostname, &registered.route.owner)?;
         map.insert(registered.route.hostname.clone(), Arc::new(registered));
@@ -176,7 +180,7 @@ impl DevenvRoutes {
             if route.owner != owner {
                 bail!("replacement route has a different owner");
             }
-            let registered = Registered::new(route)?;
+            let registered = Registered::new(route, self.own_ca)?;
             if replacement
                 .insert(registered.route.hostname.clone(), Arc::new(registered))
                 .is_some()
