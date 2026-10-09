@@ -417,7 +417,12 @@ pub fn create(
     }
     std::fs::create_dir_all(&dir)?;
     add_no_checkout(root, name, &path, branch)?;
-    cow::populate(root, &path, name)?;
+    let generated = project
+        .env
+        .iter()
+        .find(|(k, _)| k == cow::GENERATED_FILES_ENV)
+        .map_or("", |(_, v)| v.as_str());
+    cow::populate(root, &path, name, generated)?;
     Ok(path.canonicalize()?)
 }
 

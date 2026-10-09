@@ -54,5 +54,6 @@ fn main() -> Result<()> {
         .canonicalize()?;
     anyhow::ensure!(root != path, "{} is the primary checkout", path.display());
     let name = path.file_name().unwrap_or_default().to_string_lossy();
-    cow::populate(&root, &path, &name)
+    let generated = std::env::var(cow::GENERATED_FILES_ENV).unwrap_or_default();
+    cow::populate(&root, &path, &name, &generated)
 }

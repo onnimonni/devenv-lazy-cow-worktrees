@@ -996,7 +996,7 @@ in
       gh.enable = mkOption {
         type = types.bool;
         default = true;
-        description = "Replace `gh` in the shell with a wrapper: after `gh pr merge` or `gh pr close` leaves the pull request merged or closed, the worktree with its branch is removed (`lazy-cow-tree worktree rm`; one with uncommitted changes stays). Everything else is the real gh.";
+        description = "Replace `gh` in the shell with a wrapper: after `gh pr merge` or `gh pr close` leaves the pull request merged or closed, the worktree with its branch is removed (`lazy-cow-tree worktree rm`; one with uncommitted changes stays), and `gh pr merge` refuses while that worktree has uncommitted changes (`FORCE_ALLOW_DIRTY_MERGE=1` merges anyway). Everything else is the real gh.";
       };
       gh.package = mkOption {
         type = types.package;
@@ -1123,6 +1123,8 @@ in
       LAZY_COW_TREE_SERVICES = builtins.toJSON cfg.services;
       LAZY_COW_TREE_NO_AUTO_REMOVE = lib.boolToString (!cfg.autoRemoveMerged);
       LAZY_COW_TREE_WORKTREES_DIR = cfg.worktreesDir;
+      # What `files.*` writes into the primary: git ignores it in new worktrees.
+      LAZY_COW_TREE_GENERATED_FILES = lib.concatStringsSep ":" (builtins.attrNames config.files);
       LAZY_COW_TREE_RAMDISK_MB = toString cfg.postgres.ramdiskMB;
       LAZY_COW_TREE_POSTGRES_BIN = "${postgres}/bin";
       LAZY_COW_TREE_POSTGRES_SETTINGS = builtins.toJSON cfg.postgres.settings;

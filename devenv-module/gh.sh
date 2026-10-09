@@ -5,11 +5,17 @@
 # closed one whose branch has commits that aren't pushed or merged anywhere (`--force`
 # keeps them as `<name>-kept-<sha>`, then removes it). Every other command is the real gh.
 #
+# `gh pr merge` refuses while that worktree has uncommitted changes.
+#
 #   LAZY_COW_TREE_GH_DISABLE=1  plain gh
+#   FORCE_ALLOW_DIRTY_MERGE=1   `gh pr merge` even with uncommitted changes in its worktree
 
 real_gh=@gh@
 real_git=@git@
 lazy_cow_tree=@lazyCowTree@
+
+# FORCE_* variables: set to 1 (true, yes); 0, false or empty is off.
+truthy() { case ${1:-} in 1 | [Tt]rue | TRUE | [Yy]es | YES) return 0 ;; esac; return 1; }
 
 if [[ -n ${LAZY_COW_TREE_GH_DISABLE:-} || ${1:-} != pr || (${2:-} != merge && ${2:-} != close) ]]; then
   exec "$real_gh" "$@"
@@ -30,23 +36,21 @@ for ((i = 0; i < ${#args[@]}; i++)); do
   esac
 done
 
-"$real_gh" "$@"
-status=$?
-
 # Another repository's PR: its branch name says nothing about this one's worktrees.
 if [[ -n $repo_name ]]; then
   repo=(--repo "$repo_name")
   this=$("$real_gh" repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null)
   that=$("$real_gh" repo view "$repo_name" --json nameWithOwner -q .nameWithOwner 2>/dev/null)
   # gh prints the repository as GitHub spells it, whatever case -R had.
-  [[ -n $this && $this == "$that" ]] || exit "$status"
+  [[ -n $this && $this == "$that" ]] || exec "$real_gh" "$@"
 fi
 
-# `--delete-branch` may fail on the local branch (checked out in a worktree) after
-# merging: what the PR is now decides, not gh's exit status.
-read -r state branch < <("$real_gh" pr view "${selector[@]}" "${repo[@]}" --json state,headRefName \
-  -q '"\(.state) \(.headRefName)"' 2>/dev/null)
-[[ $state == MERGED || $state == CLOSED ]] || exit "$status"
+pr() {
+  "$real_gh" pr view "${selector[@]}" "${repo[@]}" --json state,headRefName \
+    -q '"\(.state) \(.headRefName)"' 2>/dev/null
+}
+read -r state branch < <(pr)
+[[ -n $branch ]] || exec "$real_gh" "$@"
 
 # The worktree (not the primary checkout) with that branch.
 wt='' path='' first=''
@@ -56,10 +60,27 @@ while read -r key value; do
     branch) [[ $value == "refs/heads/$branch" && $path != "$first" ]] && wt=$path ;;
   esac
 done < <("$real_git" worktree list --porcelain 2>/dev/null)
-[[ -n $wt ]] || exit "$status"
+[[ -n $wt ]] || exec "$real_gh" "$@"
+dirty=$("$real_git" -C "$wt" status --porcelain 2>/dev/null)
+
+# Merging what's pushed while edits wait in the worktree: they'd be left behind.
+if [[ $2 == merge && -n $dirty ]] && ! truthy "${FORCE_ALLOW_DIRTY_MERGE:-}"; then
+  echo "warning: not merging: worktree $wt has uncommitted changes:" >&2
+  while IFS= read -r l; do echo "  $l"; done <<<"$dirty" | head -20 >&2
+  echo "commit and push them (or discard them) first, or set FORCE_ALLOW_DIRTY_MERGE=1" >&2
+  exit 1
+fi
+
+"$real_gh" "$@"
+status=$?
+
+# `--delete-branch` may fail on the local branch (checked out in a worktree) after
+# merging: what the PR is now decides, not gh's exit status.
+read -r state branch < <(pr)
+[[ $state == MERGED || $state == CLOSED ]] || exit "$status"
 
 echo "PR $state: removing worktree $wt" >&2
-if [[ -n $("$real_git" -C "$wt" status --porcelain 2>/dev/null) ]]; then
+if [[ -n $dirty ]]; then
   echo "kept: $wt has uncommitted changes; \`lazy-cow-tree worktree rm --force $wt\` deletes them" >&2
   exit "$status"
 fi

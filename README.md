@@ -516,7 +516,11 @@ fills it like `lazy-cow-tree worktree new`: copy-on-write clones of the primary,
 gitignored caches (`deps/`, `_build/`, `node_modules/`, …) included and a carried Mix
 build relocated ([git-cow](https://github.com/onnimonni/git-cow)); where the filesystem
 can't clone, the caches are copied. Language server indexes (`.dexter/`,
-`.elixir_ls/`, …) are never carried: they name the primary's paths. Then it asks the
+`.elixir_ls/`, …) are never carried: they name the primary's paths. What the devenv
+shell writes (its `files.*`: `.pi/mcp.json`, `.codex/config.toml`,
+`.claude/settings.local.json`, …; devenv's `.pre-commit-config.yaml` link) goes into
+`.git/info/exclude` unless the branch tracks it or it's already ignored, so a worktree
+devenv later writes them into (direnv) has no untracked files. Then it asks the
 daemon to provision it (`lazy-cow-tree reconcile`, in the background), which runs
 `lazyCowTree.setup` once in it. `git worktree remove`, `prune` and `move` ask it to
 reconcile too, which drops a removed worktree's databases, role and redis-server.
@@ -545,7 +549,9 @@ apps) ignore it, and daemons that close every fd lose the marker.
 `gh pr close` (a number, URL, branch, or the current branch's PR) leaves the PR merged
 or closed, the worktree with its branch goes right away (`lazy-cow-tree worktree rm`),
 without waiting for the daemon's merged-PR sweep. `gh pr merge --auto` waits for that
-sweep. One with uncommitted changes stays (the command to delete them is printed); a
+sweep. `gh pr merge` refuses while that worktree has uncommitted changes (they would be
+left out of the merge; `FORCE_ALLOW_DIRTY_MERGE=1` merges anyway). One with uncommitted
+changes stays (the command to delete them is printed); a
 closed PR's commits that aren't pushed stay as branch `<name>-kept-<sha>`. With
 `-R` it acts only when that is this repository.
 

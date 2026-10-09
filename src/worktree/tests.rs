@@ -120,6 +120,38 @@ fn names_are_unique() {
 }
 
 #[test]
+fn generated_files_carried_into_a_worktree_are_excluded() {
+    let (_d, mut project, syncer) = fixture();
+    let root = project.root.clone();
+    // Tracked, ignored and outside: left alone.
+    project.env = vec![(
+        crate::cow::GENERATED_FILES_ENV.into(),
+        ".pi/mcp.json:./.pi/lsp.json:a.txt:cache/big:../x:.codex/config.toml".into(),
+    )];
+    let wt = create(&project, &syncer, "gen", None).unwrap();
+    let exclude = std::fs::read_to_string(root.join(".git/info/exclude")).unwrap();
+    assert!(
+        exclude.ends_with("/.pi/mcp.json\n/.pi/lsp.json\n/.codex/config.toml\n"),
+        "{exclude}"
+    );
+    // devenv (direnv) writes them into the worktree later.
+    std::fs::create_dir(wt.join(".pi")).unwrap();
+    std::fs::write(wt.join(".pi/mcp.json"), "{}").unwrap();
+    std::fs::write(wt.join(".pi/lsp.json"), "{}").unwrap();
+    assert!(
+        uncommitted(&wt).unwrap().is_empty(),
+        "{:?}",
+        uncommitted(&wt)
+    );
+    // Already ignored now: not added again.
+    assert!(
+        crate::cow::exclude_generated(&wt, ".pi/mcp.json")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn slash_branches_get_dashed_names_that_never_collide() {
     let (_d, project, syncer) = fixture();
     let wt = create(&project, &syncer, "feat/login", None).unwrap();

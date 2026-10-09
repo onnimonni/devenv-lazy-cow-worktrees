@@ -224,6 +224,7 @@ pass "worktree new feat/slash: worktree feat-slash; feat-slash refused"
 cat >"$home/fake-gh" <<'EOF'
 #!/usr/bin/env bash
 [[ "$1 $2" == "pr view" ]] && echo "$FAKE_PR"
+[[ "$1 $2" == "pr merge" ]] && echo merged >>"$(dirname "$0")/gh-merges"
 exit 0
 EOF
 chmod +x "$home/fake-gh"
@@ -242,11 +243,17 @@ dirty=$("$bin" worktree new dirty-x 2>/dev/null | tail -1)
 echo y >"$dirty/y.txt"
 out=$(gh_wrapper "$PWD" "CLOSED dirty-x" pr close 7 --comment "no -R")
 [[ -d $dirty && $out == *"uncommitted changes"* ]] || fail "dirty worktree of a closed PR removed: $out"
+merges=$(wc -l <"$home/gh-merges")
+if out=$(gh_wrapper "$dirty" "OPEN dirty-x" pr merge --squash); then fail "merged with uncommitted changes: $out"; fi
+[[ $out == *"not merging"*"y.txt"* && $(wc -l <"$home/gh-merges") == "$merges" ]] ||
+  fail "dirty merge not refused before gh: $out"
+out=$(FORCE_ALLOW_DIRTY_MERGE=1 gh_wrapper "$dirty" "OPEN dirty-x" pr merge --squash) ||
+  fail "FORCE_ALLOW_DIRTY_MERGE=1 refused: $out"
 out=$(gh_wrapper "$PWD" "CLOSED closed-x" pr close closed-x)
 [[ ! -d $closed ]] || fail "closed PR's worktree not removed: $out"
 [[ -n $(git branch --list 'closed-x-kept-*') ]] || fail "closed PR's unpushed commit not kept: $out"
 "$bin" worktree rm --force dirty-x >/dev/null
-pass "gh wrapper: merged/closed PR's worktree removed; open or dirty kept, unpushed commits kept"
+pass "gh wrapper: merged/closed PR's worktree removed; open or dirty kept, unpushed commits kept; dirty merge refused"
 
 "$bin" worktree new broken >/dev/null 2>&1 || fail "worktree new failed on a failing migration"
 [[ $("$bin" status) == *"migrations failed"* ]] || fail "failed migration not in status"
