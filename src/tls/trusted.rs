@@ -7,7 +7,7 @@
 //! private. The daemon keeps the certificates in memory; names none of them covers
 //! get a leaf of the local CA.
 
-use std::{collections::HashMap, io::Read, path::Path, sync::Arc};
+use std::{collections::HashMap, io::Read, sync::Arc};
 
 use anyhow::{Context, Result, anyhow, bail};
 use parking_lot::Mutex;
@@ -104,16 +104,17 @@ pub fn leaf(der: &[u8]) -> Result<Leaf> {
     })
 }
 
-/// The GitHub repository with the certificates, with the token gh has:
-/// `repository` (`lazyCowTree.tls.githubRepository`), else the checkout's `remote`'s.
-pub fn repo_client(root: &Path, remote: &str, repository: Option<&str>) -> Result<github::Client> {
-    if let Some(r) = repository {
+/// The GitHub repository with the certificates, with the project's token:
+/// `lazyCowTree.tls.githubRepository`, else the project's remote's.
+pub fn repo_client(project: &crate::config::Project) -> Result<github::Client> {
+    if let Some(r) = project.settings.tls_github_repository.as_deref() {
         let repo =
             github::parse_repo(r).ok_or_else(|| anyhow!("{r} is not a GitHub repository"))?;
-        let token = github::auth_token(&repo.host)?;
+        let token = github::auth_token(&repo.host, &project.env)?;
         return github::Client::new(repo, token);
     }
-    let repo = git2::Repository::open(root)?
+    let remote = &project.settings.remote;
+    let repo = git2::Repository::open(&project.root)?
         .find_remote(remote)?
         .url()
         .ok()
@@ -123,7 +124,7 @@ pub fn repo_client(root: &Path, remote: &str, repository: Option<&str>) -> Resul
                 "the certificate lives in a GitHub repository's artifacts: no GitHub remote {remote}"
             )
         })?;
-    let token = github::auth_token(&repo.host)?;
+    let token = github::auth_token(&repo.host, &project.env)?;
     github::Client::new(repo, token)
 }
 

@@ -789,3 +789,35 @@ fn domain_hosts_and_certificate_names() {
     );
     assert!(parse_repository("app").is_err());
 }
+
+#[test]
+fn env_overrides_kept_in_the_git_dir_private() {
+    let d = tempfile::tempdir().unwrap();
+    Repository::init(d.path()).unwrap();
+    let set = |kv: &[&str]| kv.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        edit_env_overrides(d.path(), "care", &set(&["B=1", "A=x=y"]), &[]).unwrap(),
+        ["A", "B"]
+    );
+    assert_eq!(
+        edit_env_overrides(d.path(), "care", &set(&["B=2"]), &set(&["A"])).unwrap(),
+        ["B"]
+    );
+    assert_eq!(
+        env_overrides(d.path(), "care"),
+        [("B".to_string(), "2".to_string())]
+    );
+    assert!(env_overrides(d.path(), "web").is_empty());
+    let file = d.path().join(".git/lazy-cow-tree-env/care.env");
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    for bad in ["1A=x", "A-B=x", "noequals", "A=x\ny"] {
+        assert!(
+            edit_env_overrides(d.path(), "care", &set(&[bad]), &[]).is_err(),
+            "{bad}"
+        );
+    }
+}

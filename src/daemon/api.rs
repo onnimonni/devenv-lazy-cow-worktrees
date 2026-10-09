@@ -91,6 +91,7 @@ pub(super) fn api(d: Arc<Daemon>) -> Router {
             post(|State(d): State<Arc<Daemon>>, Json(r): Json<ServiceReq>| async move {
                 let (rt, c, svc) =
                     d.service_named(&r.root, r.worktree.as_deref(), r.service.as_deref())?;
+                d.servers.release(&c.service_id(&svc));
                 d.ensure_service(&rt, &c, &svc, None).await?;
                 ApiResult::Ok(Json(serde_json::json!({
                     "log": crate::server::log_path(&c.service_id(&svc)),
@@ -103,8 +104,23 @@ pub(super) fn api(d: Arc<Daemon>) -> Router {
             post(|State(d): State<Arc<Daemon>>, Json(r): Json<ServiceReq>| async move {
                 let (_, c, svc) =
                     d.service_named(&r.root, r.worktree.as_deref(), r.service.as_deref())?;
-                d.servers.stop(&c.service_id(&svc)).await;
+                d.servers.stop_held(&c.service_id(&svc)).await;
                 ApiResult::Ok(Json(serde_json::json!({})))
+            }),
+        )
+        .route(
+            "/service/env",
+            post(|State(d): State<Arc<Daemon>>, Json(r): Json<ServiceEnvReq>| async move {
+                let s = &r.service;
+                let (_, c, svc) =
+                    d.service_named(&s.root, s.worktree.as_deref(), s.service.as_deref())?;
+                let changed = !r.set.is_empty() || !r.unset.is_empty();
+                let keys = config::edit_env_overrides(&c.path, &svc, &r.set, &r.unset)?;
+                ApiResult::Ok(Json(serde_json::json!({
+                    "keys": keys,
+                    "changed": changed,
+                    "running": d.servers.running(&c.service_id(&svc)).await,
+                })))
             }),
         )
         .route(

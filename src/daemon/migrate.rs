@@ -154,12 +154,16 @@ impl Daemon {
                 .run_command(rt, &c.path, &format!("{id}+migrate"), &cmd, &cwd, env)
                 .await
             {
-                warn!("{e:#}");
-                failed.push(id);
+                warn!("{id}: {e:#}");
+                failed.push(format!("{id}: {e:#}"));
             }
         }
         if !failed.is_empty() {
-            anyhow::bail!("migrations failed: {}", failed.join(", "));
+            anyhow::bail!(
+                "migrations failed in {}\n{}",
+                c.path.display(),
+                failed.join("\n\n")
+            );
         }
         Ok(())
     }

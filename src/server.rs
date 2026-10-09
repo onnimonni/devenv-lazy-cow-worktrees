@@ -446,19 +446,16 @@ fn spawn(project: &Project, c: &Checkout, name: &str, g: &Global, append: bool) 
         .cwd
         .as_ref()
         .map_or_else(|| c.path.clone(), |d| c.path.join(d));
-    let child = command(
-        project,
-        &c.path,
-        &svc.exec,
-        &cwd,
-        c.service_env(g, Some(name)),
-    )?
-    .stdout(log.try_clone()?)
-    .stderr(log)
-    // Own group: removal kills it and every watcher it started.
-    .process_group(0)
-    .spawn()
-    .with_context(|| format!("starting {id}: `{}`", svc.exec))?;
+    let mut env = c.service_env(g, Some(name));
+    // `lazy-cow-tree service env` wins over the rest.
+    env.extend(config::env_overrides(&c.path, name));
+    let child = command(project, &c.path, &svc.exec, &cwd, env)?
+        .stdout(log.try_clone()?)
+        .stderr(log)
+        // Own group: removal kills it and every watcher it started.
+        .process_group(0)
+        .spawn()
+        .with_context(|| format!("starting {id}: `{}`", svc.exec))?;
     info!(
         "{id}: started `{}` (port {})",
         svc.exec,
@@ -499,17 +496,31 @@ pub async fn run_logged(
         .stderr(log)
         .kill_on_drop(true)
         .status();
-    let status = tokio::time::timeout(Duration::from_secs(900), status)
-        .await
-        .map_err(|_| anyhow!("`{cmd}` timed out"))??;
+    let status = match tokio::time::timeout(Duration::from_secs(900), status).await {
+        Ok(status) => status?,
+        Err(_) => bail!("{}", failed(cmd, "timed out", cwd, &log_path)),
+    };
     if !status.success() {
-        bail!(
-            "`{cmd}` failed in {id} ({status}); see {}",
-            log_path.display()
-        );
+        bail!("{}", failed(cmd, &status.to_string(), cwd, &log_path));
     }
     info!("{id}: done in {:?}", t.elapsed());
     Ok(())
+}
+
+/// Lines of a failed run's log its error carries (the 502 page, `status`).
+const LOG_TAIL_LINES: usize = 40;
+
+/// A failed run's error: the command, where it ran, and the end of its log.
+fn failed(cmd: &str, why: &str, cwd: &Path, log_path: &Path) -> String {
+    let log = std::fs::read(log_path).unwrap_or_default();
+    let log = String::from_utf8_lossy(&log);
+    let lines: Vec<&str> = log.lines().collect();
+    let tail = lines[lines.len().saturating_sub(LOG_TAIL_LINES)..].join("\n");
+    format!(
+        "`{cmd}` failed ({why})\n  in: {}\n  log: {}\n{tail}",
+        cwd.display(),
+        log_path.display()
+    )
 }
 
 /// The project's setup command (`mix deps.get`) in a checkout whose dependency files
@@ -558,6 +569,10 @@ pub struct Servers {
     /// Checkouts (and those under them) whose services aren't restarted for changed
     /// files now, by holders: pulling / migrating, or running setup. Changes wait.
     held: parking_lot::Mutex<HashMap<PathBuf, usize>>,
+    /// Services `lazy-cow-tree service stop` stopped: not started again (by a request,
+    /// as a dependency, at `up`) until `service start`, so a foreground run can take
+    /// their port.
+    stopped: parking_lot::Mutex<HashSet<String>>,
 }
 
 /// Holds back `restartOnChange` restarts of a checkout (and those under it) until
@@ -818,6 +833,13 @@ impl Servers {
         if svc.http && listening(port).await {
             return Ok(());
         }
+        if self.stopped(&id) {
+            bail!(
+                "{id} was stopped by `lazy-cow-tree service stop`; run it on port {port} \
+                 yourself or `lazy-cow-tree service start -s {name}` in {}",
+                c.path.display()
+            );
+        }
         {
             let mut procs = self.procs.lock().await;
             let alive = match procs.get_mut(&id) {
@@ -976,10 +998,27 @@ impl Servers {
         }
     }
 
-    /// Stop every service of a checkout.
+    /// `stop`, and keep it down until `release`d.
+    pub async fn stop_held(&self, id: &str) {
+        self.stopped.lock().insert(id.to_string());
+        self.stop(id).await;
+    }
+
+    /// Let a `stop_held` service start again.
+    pub fn release(&self, id: &str) {
+        self.stopped.lock().remove(id);
+    }
+
+    pub fn stopped(&self, id: &str) -> bool {
+        self.stopped.lock().contains(id)
+    }
+
+    /// Stop every service of a checkout (removed: a new one of its name starts fresh).
     pub async fn stop_checkout(&self, c: &Checkout) {
         for name in c.services.0.keys() {
-            self.stop(&c.service_id(name)).await;
+            let id = c.service_id(name);
+            self.release(&id);
+            self.stop(&id).await;
         }
     }
 

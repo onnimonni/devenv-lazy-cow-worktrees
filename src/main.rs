@@ -192,6 +192,18 @@ enum ServiceCmd {
     Restart(ServiceArgs),
     /// Print its log file path.
     Log(ServiceArgs),
+    /// Extra environment of its process in this checkout, kept out of git; applied on
+    /// its next start. Without flags: the names set.
+    Env {
+        #[command(flatten)]
+        svc: ServiceArgs,
+        /// KEY=VALUE to set (repeatable).
+        #[arg(long, value_name = "KEY=VALUE")]
+        set: Vec<String>,
+        /// KEY to remove (repeatable).
+        #[arg(long, value_name = "KEY")]
+        unset: Vec<String>,
+    },
 }
 
 #[derive(clap::Args)]
@@ -199,8 +211,23 @@ struct ServiceArgs {
     /// Service [default: the default service].
     #[arg(short, long)]
     service: Option<String>,
-    /// Worktree [default: the one you're in; `.` for the primary checkout].
+    /// Worktree [default and `.`: the checkout you're in].
+    #[arg(conflicts_with = "primary")]
     worktree: Option<String>,
+    /// The primary checkout.
+    #[arg(long)]
+    primary: bool,
+}
+
+impl ServiceArgs {
+    /// The worktree it names (None: the primary), `here` the checkout you're in.
+    fn worktree(&self, here: Option<String>) -> Option<String> {
+        match self.worktree.as_deref() {
+            _ if self.primary => None,
+            None | Some(".") => here,
+            Some(w) => Some(w.to_string()),
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -521,7 +548,10 @@ fn print_status(s: &daemon::Status) {
                 if c.redis { " redis" } else { "" },
             );
             if let Some(e) = &c.migrate_error {
-                println!("    {e}");
+                // Its first lines; the rest is the log's tail.
+                for l in e.lines().take(4) {
+                    println!("    {l}");
+                }
             }
             for s in &c.services {
                 println!(
@@ -529,7 +559,13 @@ fn print_status(s: &daemon::Status) {
                     s.name,
                     s.port,
                     s.url.as_deref().unwrap_or("(no http)"),
-                    if s.running { "running" } else { "-" }
+                    if s.running {
+                        "running"
+                    } else if s.stopped {
+                        "stopped (until `service start`)"
+                    } else {
+                        "-"
+                    }
                 );
             }
         }
@@ -703,11 +739,7 @@ async fn main() -> Result<()> {
             if wanted.is_empty() {
                 anyhow::bail!("no lazyCowTree.tls.domain (LAZY_COW_TREE_TLS_DOMAIN)");
             }
-            let gh = tls::trusted::repo_client(
-                &p.root,
-                &p.settings.remote,
-                p.settings.tls_github_repository.as_deref(),
-            )?;
+            let gh = tls::trusted::repo_client(&p)?;
             let now = tls::trusted::now();
             let mut have = Vec::new();
             match tls::trusted::fetch(&gh).await? {
@@ -770,11 +802,7 @@ async fn main() -> Result<()> {
             let (root, here, _) = config::locate(&cwd)?;
             let req = |a: &ServiceArgs| daemon::ServiceReq {
                 root: root.clone(),
-                worktree: match a.worktree.as_deref() {
-                    Some(".") => None,
-                    Some(w) => Some(w.to_string()),
-                    None => here.clone(),
-                },
+                worktree: a.worktree(here.clone()),
                 service: a.service.clone(),
             };
             match cmd {
@@ -798,6 +826,31 @@ async fn main() -> Result<()> {
                 ServiceCmd::Log(a) => {
                     let r: Value = client::post("/service/log", &req(&a)).await?;
                     println!("{}", r["log"].as_str().unwrap_or_default());
+                }
+                ServiceCmd::Env { svc, set, unset } => {
+                    let r: Value = client::post(
+                        "/service/env",
+                        &daemon::ServiceEnvReq {
+                            service: req(&svc),
+                            set,
+                            unset,
+                        },
+                    )
+                    .await?;
+                    // Names only: values may be secrets.
+                    for k in r["keys"].as_array().into_iter().flatten() {
+                        println!("{}", k.as_str().unwrap_or_default());
+                    }
+                    if r["changed"].as_bool() == Some(true) && r["running"].as_bool() == Some(true)
+                    {
+                        eprintln!(
+                            "applied on its next start: `lazy-cow-tree service restart{}`",
+                            svc.service
+                                .as_deref()
+                                .map(|s| format!(" -s {s}"))
+                                .unwrap_or_default()
+                        );
+                    }
                 }
             }
             Ok(())
@@ -878,6 +931,32 @@ mod tests {
         assert_eq!(rm_target(d.path(), "./wt").unwrap(), abs);
         assert_eq!(rm_target(Path::new("/"), &abs).unwrap(), abs);
         assert!(rm_target(d.path(), "./missing").is_err());
+    }
+
+    #[test]
+    fn service_worktree_dot_is_the_checkout_you_are_in() {
+        let wt = |args: &[&str], here: Option<&str>| {
+            let cli = Cli::try_parse_from(
+                ["lazy-cow-tree", "service", "stop", "-s", "care"]
+                    .iter()
+                    .chain(args),
+            )
+            .unwrap();
+            let Cmd::Service(ServiceCmd::Stop(a)) = cli.command else {
+                panic!("not service stop");
+            };
+            a.worktree(here.map(str::to_string))
+        };
+        let here = Some("feat-x");
+        assert_eq!(wt(&[], here).as_deref(), here);
+        assert_eq!(wt(&["."], here).as_deref(), here);
+        assert_eq!(wt(&["other"], here).as_deref(), Some("other"));
+        assert_eq!(wt(&["--primary"], here), None);
+        // In the primary checkout.
+        assert_eq!(wt(&["."], None), None);
+        assert!(
+            Cli::try_parse_from(["lazy-cow-tree", "service", "stop", "x", "--primary"]).is_err()
+        );
     }
 
     #[test]

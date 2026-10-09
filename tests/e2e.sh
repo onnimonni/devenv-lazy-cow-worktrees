@@ -49,7 +49,7 @@ web="sh -c '$python -m http.server \"\$DEBUGGER_PORT\" --bind 127.0.0.1 & exec $
 mkdir "$home/bin"
 cat >"$home/bin/mix" <<EOF
 #!/usr/bin/env bash
-echo started >> "$home/mix-starts.log"
+echo "started \${GREETING:-}" >> "$home/mix-starts\${LAZY_COW_TREE_WORKTREE:+-\$LAZY_COW_TREE_WORKTREE}.log"
 exec $python -m http.server "\$PORT" --bind 127.0.0.1
 EOF
 chmod +x "$home/bin/mix"
@@ -180,6 +180,29 @@ out=$(curl_lf "https://feat-a.web.demo.localhost:8443/" 2>&1) || true
 [[ $out == primary ]] || { cat "$web_log" >&2; fail "https service not served: $out"; }
 pass "https://feat-a.web.demo.localhost served"
 
+(cd "$wt" && "$bin" service env -s phx --set GREETING=hi --set TOKEN=secret >/dev/null) || fail "service env --set"
+out=$(cd "$wt" && "$bin" service env -s phx)
+[[ $out == $'GREETING\nTOKEN' ]] || fail "service env lists names only: $out"
+curl_lf -f -o /dev/null "https://feat-a.phx.demo.localhost:8443/" || fail "feat-a's phx did not start"
+[[ $(cat "$home/mix-starts-feat-a.log") == "started hi" ]] || fail "env override not applied: $(cat "$home/mix-starts-feat-a.log")"
+[[ $("$bin" status) != *secret* ]] || fail "status shows an override's value"
+pass "service env: per-checkout overrides applied, values not shown"
+
+# `.` is the worktree you're in; a stopped service stays down for a foreground run.
+(cd "$wt" && "$bin" service stop -s phx .) || fail "service stop ."
+code=$(curl_lf -o "$work/stopped.txt" -w '%{http_code}' "https://feat-a.phx.demo.localhost:8443/")
+[[ $code == 502 ]] && grep -q "stopped by" "$work/stopped.txt" ||
+  fail "stopped service started on demand: $code $(cat "$work/stopped.txt")"
+[[ $("$bin" status) == *"stopped (until"* ]] || fail "status doesn't show it stopped"
+phx_port=$(env_of "$wt" LAZY_COW_TREE_PHX_PORT)
+$python -m http.server "$phx_port" --bind 127.0.0.1 --directory "$wt" >/dev/null 2>&1 &
+fg=$!
+eventually 20 curl_lf -f -o /dev/null "https://feat-a.phx.demo.localhost:8443/" || fail "foreground run not proxied"
+kill "$fg"; wait "$fg" 2>/dev/null || true
+(cd "$wt" && "$bin" service start -s phx >/dev/null 2>&1) || fail "service start after stop"
+curl_lf -f -o /dev/null "https://feat-a.phx.demo.localhost:8443/" || fail "phx not back after start"
+pass "service stop .: this worktree's, stays down until service start"
+
 start=$SECONDS
 code=$(curl_lf -o "$work/idle.txt" -w '%{http_code}' "https://feat-a.idle.demo.localhost:8443/")
 [[ $code == 502 ]] && grep -q "doesn't listen on its idle port" "$work/idle.txt" && ((SECONDS - start < 20)) ||
@@ -193,6 +216,8 @@ pass "worktree clean"
 [[ $("$bin" status) == *"migrations failed"* ]] || fail "failed migration not in status"
 out=$(curl_lf "https://broken.web.demo.localhost:8443/" 2>&1) || true
 [[ $out == *"migrations failed"* ]] || fail "failed migration not on its page: $out"
+[[ $out == *"migration broke"* && $out == *"migrate.sh"* && $out == *".claude/worktrees/broken"* ]] ||
+  fail "502 page lacks the migration's log, command or worktree: $out"
 [[ ! -f $(git -C .claude/worktrees/broken rev-parse --absolute-git-dir)/lazy-cow-tree-migrated ]] ||
   fail "failed migration marked done"
 "$bin" worktree rm --force broken
