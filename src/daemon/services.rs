@@ -230,6 +230,7 @@ impl Daemon {
                         url: s.http.then(|| format!("https://{}", c.service_host(name))),
                         port: c.service_port(name),
                         running: self.servers.running(&c.service_id(name)).await,
+                        stopped: self.servers.stopped(&c.service_id(name)),
                     });
                 }
                 statuses.push(CheckoutStatus {

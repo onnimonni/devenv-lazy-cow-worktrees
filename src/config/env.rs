@@ -2,7 +2,81 @@
 //! framework accept its hostname, and paths of the primary checkout moved to a
 //! worktree.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
+
+use anyhow::{Result, bail};
+use git2::Repository;
+
+/// A checkout's extra environment for a service (`lazy-cow-tree service env`): in
+/// its git admin dir, so out of git and gone with a worktree.
+fn env_overrides_path(checkout: &Path, service: &str) -> Result<PathBuf> {
+    let admin = Repository::open(checkout)?.path().to_path_buf();
+    Ok(admin
+        .join("lazy-cow-tree-env")
+        .join(format!("{service}.env")))
+}
+
+/// `KEY=VALUE` lines; a missing or unreadable file is none.
+pub fn env_overrides(checkout: &Path, service: &str) -> Vec<(String, String)> {
+    let Ok(text) =
+        env_overrides_path(checkout, service).and_then(|p| Ok(std::fs::read_to_string(p)?))
+    else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+/// Set (`KEY=VALUE`) and remove variables of a checkout's service; the names now set.
+pub fn edit_env_overrides(
+    checkout: &Path,
+    service: &str,
+    set: &[String],
+    unset: &[String],
+) -> Result<Vec<String>> {
+    let valid = |k: &str| {
+        k.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+    let mut env: BTreeMap<String, String> = env_overrides(checkout, service).into_iter().collect();
+    for kv in set {
+        let Some((k, v)) = kv.split_once('=') else {
+            bail!("{kv}: not KEY=VALUE");
+        };
+        if !valid(k) {
+            bail!("{k}: not a variable name");
+        }
+        if v.contains('\n') {
+            bail!("{k}: a value of one line only");
+        }
+        env.insert(k.to_string(), v.to_string());
+    }
+    for k in unset {
+        env.remove(k);
+    }
+    if !set.is_empty() || !unset.is_empty() {
+        let path = env_overrides_path(checkout, service)?;
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        let text: String = env.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
+        // Values may be secrets.
+        use std::{io::Write, os::unix::fs::OpenOptionsExt};
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)?
+            .write_all(text.as_bytes())?;
+    }
+    Ok(env.into_keys().collect())
+}
 
 /// Variables that make the framework of the app in `dir` accept its
 /// https://…localhost hostname, detected from its manifests:

@@ -297,6 +297,9 @@ pub struct ServiceStatus {
     pub port: u16,
     /// Started by lazy-cow-tree and running.
     pub running: bool,
+    /// Down since `lazy-cow-tree service stop`: nothing starts it but `service start`.
+    #[serde(default)]
+    pub stopped: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -357,6 +360,14 @@ pub struct ServiceReq {
     pub worktree: Option<String>,
     /// None: the default service.
     pub service: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ServiceEnvReq {
+    pub service: ServiceReq,
+    /// KEY=VALUE.
+    pub set: Vec<String>,
+    pub unset: Vec<String>,
 }
 
 // ---------- daemon

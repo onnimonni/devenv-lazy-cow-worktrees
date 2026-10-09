@@ -400,6 +400,13 @@ Service options:
 Commands are split like a shell would, then run directly (no shell) with the
 service's environment and the project's `PATH`. Logs: `lazy-cow-tree service log -s <name>`.
 
+For a foreground debug run, `lazy-cow-tree service stop -s <name>` in the checkout: it
+stays down (requests, dependents and `up` don't start it; `status` says `stopped`) until
+`lazy-cow-tree service start`, so your own process can take its `PORT`, and the proxy
+sends its hostname there. Daemon restarts forget it. For extra variables (feature flags,
+a local simulator's URL), `lazy-cow-tree service env -s <name> --set KEY=VALUE` keeps the
+service managed instead.
+
 A running service is restarted when the content of a `restartOnChange` file changes
 (a pull, a dependency update, an agent's edit), once nothing in its checkout changed for
 a second, and not while the checkout pulls or migrates (then after). When a dependency
@@ -553,7 +560,12 @@ lazy-cow-tree serve                        # daemon (devenv process)
 lazy-cow-tree worktree new <name> [--base <ref>]
 lazy-cow-tree worktree rm <name> [--force] # without --force only when nothing would be lost
 lazy-cow-tree worktree list
-lazy-cow-tree service start|stop|restart|log [-s <service>] [<worktree> | .]
+lazy-cow-tree service start|stop|restart|log [-s <service>] [<worktree> | . | --primary]
+                                           # default and `.`: the checkout you're in; a stopped
+                                           # service stays down (no on-demand start) until `start`
+lazy-cow-tree service env [-s <service>] [--set KEY=VALUE]... [--unset KEY]...
+                                           # this checkout's extra env for it, out of git
+                                           # (its git dir, 0600); next start; prints names only
 lazy-cow-tree status                       # projects, worktrees, services, databases
 lazy-cow-tree sync                         # pull, merge, remove merged, migrate now
 lazy-cow-tree snapshot                     # template := the primary's dev database
