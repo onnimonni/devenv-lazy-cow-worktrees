@@ -386,7 +386,14 @@ impl Daemon {
     /// the password): a checkout's role may open its own databases (its dev database is
     /// created on the spot) and the maintenance ones, unless another checkout's role
     /// made it. Every other user is refused.
-    pub(super) async fn resolve_pg(&self, user: &str, db: &str) -> Result<()> {
+    pub(super) async fn resolve_pg(&self, user: &str, db: &str, client_port: u16) -> Result<()> {
+        if let Some(e) = self
+            .primary_misused(user, client_port, self.global.pg_port, "DATABASE_URL")
+            .await
+        {
+            warn!("{e}");
+            anyhow::bail!("{e}");
+        }
         let projects: Vec<Arc<ProjectRt>> = self.projects.lock().values().cloned().collect();
         let found = projects.into_iter().find_map(|rt| {
             let primary = rt.primary();
@@ -415,6 +422,47 @@ impl Daemon {
             }
         }
         Ok(())
+    }
+
+    /// A process in one of a project's worktrees connecting (from `client_port` to the
+    /// proxy on `server_port`) as its primary checkout `id`: a copied `.env` or settings
+    /// naming the primary's database. The error to refuse it with, naming `var` (the
+    /// variable it should use). Only looked into while the project has worktrees.
+    pub(super) async fn primary_misused(
+        &self,
+        id: &str,
+        client_port: u16,
+        server_port: u16,
+        var: &str,
+    ) -> Option<String> {
+        let worktrees: Vec<(String, PathBuf)> = self
+            .projects
+            .lock()
+            .values()
+            .find(|rt| rt.primary().id() == id)?
+            .known
+            .lock()
+            .iter()
+            .map(|(name, c)| (name.clone(), c.path.clone()))
+            .collect();
+        if worktrees.is_empty() {
+            return None;
+        }
+        let (id, var) = (id.to_string(), var.to_string());
+        tokio::task::spawn_blocking(move || {
+            let pid = worktree::tcp_client_pid(client_port, server_port)?;
+            let dirs: Vec<PathBuf> = worktrees.iter().map(|(_, p)| p.clone()).collect();
+            let (i, cmd) = worktree::pid_inside(pid, &dirs)?;
+            Some(format!(
+                "`{cmd}` (pid {pid}) runs in worktree {} but connects as the primary \
+                 checkout ({id}): use ${var} (a .env copied from the primary, or settings \
+                 that name its database?)",
+                worktrees[i].0
+            ))
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// Every registered checkout, without their runtimes.

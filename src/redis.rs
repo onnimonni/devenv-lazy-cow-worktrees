@@ -27,7 +27,20 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 
+/// Called with (checkout id, the client's port) once a client authenticates: Some(why)
+/// refuses it (a worktree's process using the primary's password).
+pub type Check = Arc<
+    dyn Fn(
+            String,
+            u16,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>
+        + Send
+        + Sync,
+>;
+
 pub struct Redis {
+    /// Set once the daemon is up.
+    pub check: std::sync::OnceLock<Check>,
     dir: PathBuf,
     /// Checkout ids (passwords) that may connect -> the redis-server they reach (the
     /// checkout's own, or its project's shared one).
@@ -43,6 +56,7 @@ pub struct Redis {
 impl Redis {
     pub fn new(dir: PathBuf, server: Option<PathBuf>) -> Self {
         Self {
+            check: Default::default(),
             dir,
             known: RwLock::default(),
             procs: Mutex::default(),
@@ -296,6 +310,15 @@ impl Redis {
                 }
             };
             let id = String::from_utf8_lossy(&password).into_owned();
+            let client_port = client.peer_addr().map_or(0, |a| a.port());
+            if let Some(check) = self.check.get()
+                && let Some(why) = check(id.clone(), client_port).await
+            {
+                client
+                    .write_all(format!("-ERR {why}\r\n").as_bytes())
+                    .await?;
+                return Ok(());
+            }
             let backend = self.known.read().get(&id).cloned();
             let Some(backend) = backend else {
                 client

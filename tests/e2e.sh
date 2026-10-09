@@ -161,6 +161,17 @@ primary_redis=$(env_of "$work/app" REDIS_URL)
 [[ $(redis-cli --no-auth-warning -u "$REDIS_URL" get k) == worktree ]] || fail "redis lost the key"
 pass "redis isolated per checkout"
 
+# A worktree's process with the primary's credentials (a copied .env): refused.
+primary_db=$(env_of "$work/app" DATABASE_URL)
+if out=$(cd "$wt" && psql "$primary_db" -tAc "select 1" 2>&1); then fail "worktree process reached the primary's database: $out"; fi
+[[ $out == *"runs in worktree feat-a"*'$DATABASE_URL'* ]] || fail "primary's credentials from a worktree not explained: $out"
+out=$(cd "$wt" && redis-cli --no-auth-warning -u "$primary_redis" get k 2>&1) || true
+[[ $out == *"runs in worktree feat-a"*'$REDIS_URL'* ]] || fail "primary's redis password from a worktree not refused: $out"
+# The primary's shell hook closes the worktree's marker this script holds.
+[[ $(cd "$work/app" && unset LAZY_COW_TREE_SHELL && eval "$("$bin" shell-hook)" && psql "$primary_db" -tAc "select 1") == 1 ]] ||
+  fail "primary refused its own database"
+pass "primary's credentials refused from a worktree's processes"
+
 base=$(env_of "$wt" PORT)
 [[ $DEBUGGER_PORT == $((base + 9)) && $TEST_PORT == $((base + 8)) ]] ||
   fail "named ports: DEBUGGER_PORT=$DEBUGGER_PORT TEST_PORT=$TEST_PORT (base $base)"

@@ -23,10 +23,11 @@ const SSL_REQUEST: i32 = 80877103;
 const GSSENC_REQUEST: i32 = 80877104;
 const CANCEL_REQUEST: i32 = 80877102;
 
-/// Called with (user, database) before connecting: Ok to go ahead (after creating the
-/// database if needed), Err to refuse.
-pub type Resolve =
-    Arc<dyn Fn(String, String) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync>;
+/// Called with (user, database, the client's port) before connecting: Ok to go ahead
+/// (after creating the database if needed), Err to refuse.
+pub type Resolve = Arc<
+    dyn Fn(String, String, u16) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync,
+>;
 
 pub async fn serve(port: u16, backend: PathBuf, resolve: Resolve) -> Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", port))
@@ -123,7 +124,8 @@ async fn connection(mut client: TcpStream, backend: &PathBuf, resolve: &Resolve)
     };
     let user = get("user").unwrap_or_default();
     let database = get("database").unwrap_or_else(|| user.clone());
-    if let Err(e) = resolve(user, database).await {
+    let client_port = client.peer_addr().map_or(0, |a| a.port());
+    if let Err(e) = resolve(user, database, client_port).await {
         client.write_all(&error("3D000", &format!("{e:#}"))).await?;
         return Ok(());
     }

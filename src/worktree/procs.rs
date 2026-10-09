@@ -79,37 +79,134 @@ pub(super) fn processes() -> Vec<Proc> {
         return Vec::new();
     }
     pids.truncate(n as usize);
-    pids.into_iter()
-        .filter_map(|pid| {
-            let bsd = bsdinfo(pid)?;
-            let mut vn: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
-            let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as i32;
-            let got = unsafe {
-                libc::proc_pidinfo(
-                    pid,
-                    libc::PROC_PIDVNODEPATHINFO,
-                    0,
-                    (&mut vn as *mut libc::proc_vnodepathinfo).cast(),
-                    size,
-                )
-            };
-            let cwd = if got == size {
-                c_path(&vn.pvi_cdir.vip_path)
-            } else {
-                Vec::new()
-            };
-            let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
-            let len = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
-            buf.truncate(len.max(0) as usize);
-            Some(Proc {
-                pid,
-                ppid: bsd.pbi_ppid as i32,
-                cwd,
-                exe: buf,
-                start: start_of(&bsd),
+    pids.into_iter().filter_map(process).collect()
+}
+
+/// One process.
+#[cfg(target_os = "macos")]
+pub(super) fn process(pid: i32) -> Option<Proc> {
+    let bsd = bsdinfo(pid)?;
+    let mut vn: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as i32;
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            (&mut vn as *mut libc::proc_vnodepathinfo).cast(),
+            size,
+        )
+    };
+    let cwd = if got == size {
+        c_path(&vn.pvi_cdir.vip_path)
+    } else {
+        Vec::new()
+    };
+    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let len = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    buf.truncate(len.max(0) as usize);
+    Some(Proc {
+        pid,
+        ppid: bsd.pbi_ppid as i32,
+        cwd,
+        exe: buf,
+        start: start_of(&bsd),
+    })
+}
+
+/// sys/proc_info.h's `struct socket_fdinfo` (not in libc), up to the TCP ports: a
+/// `proc_fileinfo`, then `socket_info` whose `soi_proto` union is 528 bytes.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct SocketFdInfo {
+    pfi: [u8; 24],
+    /// `vinfo_stat`.
+    soi_stat: [u64; 17],
+    soi_so: u64,
+    soi_pcb: u64,
+    soi_type: i32,
+    soi_protocol: i32,
+    soi_family: i32,
+    /// options, linger, state, qlen, incqlen, qlimit, timeo, error.
+    soi_shorts: [u16; 8],
+    soi_oobmark: u32,
+    /// `sockbuf_info` rcv and snd.
+    soi_bufs: [u32; 12],
+    soi_kind: i32,
+    rfu_1: u32,
+    /// For TCP: `in_sockinfo`'s foreign then local port first (network order, low 16 bits).
+    soi_proto: [u64; 66],
+}
+
+#[cfg(target_os = "macos")]
+const PROC_PIDFDSOCKETINFO: i32 = 3;
+#[cfg(target_os = "macos")]
+const SOCKINFO_TCP: i32 = 2;
+
+/// The process whose TCP connection from 127.0.0.1:`client_port` reaches local
+/// `server_port` (a client of the daemon's proxies).
+#[cfg(target_os = "macos")]
+pub fn tcp_client_pid(client_port: u16, server_port: u16) -> Option<i32> {
+    let mut pids = vec![0i32; 16384];
+    let n = unsafe {
+        libc::proc_listallpids(
+            pids.as_mut_ptr().cast(),
+            (pids.len() * std::mem::size_of::<i32>()) as i32,
+        )
+    };
+    pids.truncate(n.max(0) as usize);
+    let port = |v: i32| (v as u32 as u16).swap_bytes();
+    pids.into_iter().find(|&pid| {
+        fds_of(pid)
+            .iter()
+            .filter(|f| f.proc_fdtype == libc::PROX_FDTYPE_SOCKET as u32)
+            .any(|f| {
+                let mut info: SocketFdInfo = unsafe { std::mem::zeroed() };
+                let size = std::mem::size_of::<SocketFdInfo>() as i32;
+                let got = unsafe {
+                    libc::proc_pidfdinfo(
+                        pid,
+                        f.proc_fd,
+                        PROC_PIDFDSOCKETINFO,
+                        (&mut info as *mut SocketFdInfo).cast(),
+                        size,
+                    )
+                };
+                let words = info.soi_proto[0];
+                let (fport, lport) = (words as u32 as i32, (words >> 32) as u32 as i32);
+                got == size
+                    && info.soi_kind == SOCKINFO_TCP
+                    && port(lport) == client_port
+                    && port(fport) == server_port
             })
-        })
-        .collect()
+    })
+}
+
+/// `pid`'s open fds.
+#[cfg(target_os = "macos")]
+fn fds_of(pid: i32) -> Vec<libc::proc_fdinfo> {
+    let entry = std::mem::size_of::<libc::proc_fdinfo>();
+    let size =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+    if size <= 0 {
+        return Vec::new();
+    }
+    // Room for a few opened meanwhile.
+    let mut fds: Vec<libc::proc_fdinfo> = Vec::with_capacity(size as usize / entry + 16);
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDLISTFDS,
+            0,
+            fds.as_mut_ptr().cast(),
+            (fds.capacity() * entry) as i32,
+        )
+    };
+    if got <= 0 {
+        return Vec::new();
+    }
+    unsafe { fds.set_len(got as usize / entry) };
+    fds
 }
 
 #[cfg(target_os = "macos")]
@@ -165,28 +262,8 @@ const PROC_PIDFDVNODEPATHINFO: i32 = 2;
 /// Paths of the files `pid` holds open on fds a marker can be on.
 #[cfg(target_os = "macos")]
 fn open_files(pid: i32) -> Vec<Vec<u8>> {
-    let entry = std::mem::size_of::<libc::proc_fdinfo>();
-    let size =
-        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
-    if size <= 0 {
-        return Vec::new();
-    }
-    // Room for a few opened meanwhile.
-    let mut fds: Vec<libc::proc_fdinfo> = Vec::with_capacity(size as usize / entry + 16);
-    let got = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDLISTFDS,
-            0,
-            fds.as_mut_ptr().cast(),
-            (fds.capacity() * entry) as i32,
-        )
-    };
-    if got <= 0 {
-        return Vec::new();
-    }
-    unsafe { fds.set_len(got as usize / entry) };
-    fds.iter()
+    fds_of(pid)
+        .iter()
         .filter(|f| f.proc_fd >= MARKER_MIN_FD && f.proc_fdtype == libc::PROX_FDTYPE_VNODE as u32)
         .filter_map(|f| {
             let mut info: VnodeFdInfoWithPath = unsafe { std::mem::zeroed() };
@@ -275,6 +352,52 @@ pub(super) fn processes() -> Vec<Proc> {
         .collect()
 }
 
+/// One process.
+#[cfg(not(target_os = "macos"))]
+pub(super) fn process(pid: i32) -> Option<Proc> {
+    let (ppid, start) = stat(pid)?;
+    let link = |n: &str| {
+        std::fs::read_link(format!("/proc/{pid}/{n}"))
+            .map(|p| p.as_os_str().as_bytes().to_vec())
+            .unwrap_or_default()
+    };
+    Some(Proc {
+        pid,
+        ppid,
+        cwd: link("cwd"),
+        exe: link("exe"),
+        start,
+    })
+}
+
+/// The process whose TCP connection from 127.0.0.1:`client_port` reaches local
+/// `server_port` (a client of the daemon's proxies): the socket's inode in
+/// /proc/net/tcp{,6}, then the process holding it.
+#[cfg(not(target_os = "macos"))]
+pub fn tcp_client_pid(client_port: u16, server_port: u16) -> Option<i32> {
+    let port = |a: &str| u16::from_str_radix(a.rsplit_once(':')?.1, 16).ok();
+    let inode = ["/proc/net/tcp", "/proc/net/tcp6"].iter().find_map(|f| {
+        std::fs::read_to_string(f)
+            .ok()?
+            .lines()
+            .skip(1)
+            .find_map(|l| {
+                let cols: Vec<&str> = l.split_whitespace().collect();
+                (port(cols.get(1)?)? == client_port && port(cols.get(2)?)? == server_port)
+                    .then(|| cols.get(9).map(|i| i.to_string()))?
+            })
+    })?;
+    let want = format!("socket:[{inode}]");
+    std::fs::read_dir("/proc").ok()?.flatten().find_map(|e| {
+        let pid: i32 = e.file_name().to_str()?.parse().ok()?;
+        (std::fs::read_dir(e.path().join("fd"))
+            .ok()?
+            .flatten()
+            .any(|f| std::fs::read_link(f.path()).is_ok_and(|l| l.as_os_str() == want.as_str())))
+        .then_some(pid)
+    })
+}
+
 /// (parent pid, start time) from /proc/<pid>/stat: pid (comm) state ppid ... starttime (22nd).
 #[cfg(not(target_os = "macos"))]
 fn stat(pid: i32) -> Option<(i32, u64)> {
@@ -343,6 +466,17 @@ fn runs_inside(p: &Proc, dir: &[u8], marker: &[u8]) -> bool {
         return true;
     }
     !marker.is_empty() && open_files(p.pid).iter().any(|f| f == marker)
+}
+
+/// Which of `dirs` (worktrees) `pid` runs inside (`runs_inside`), with its command.
+pub fn pid_inside(pid: i32, dirs: &[PathBuf]) -> Option<(usize, String)> {
+    let p = process(pid)?;
+    let i = dirs.iter().position(|d| {
+        let marker = marker_path(d).unwrap_or_default();
+        runs_inside(&p, d.as_os_str().as_bytes(), marker.as_os_str().as_bytes())
+    })?;
+    let cmd = command(pid).unwrap_or_else(|| String::from_utf8_lossy(&p.exe).into_owned());
+    Some((i, cmd))
 }
 
 /// Processes running in `dir` (`runs_inside`: the BEAM, esbuild, tailwind, node, what a
