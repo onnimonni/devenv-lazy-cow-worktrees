@@ -152,10 +152,23 @@ impl Redis {
             .args([
                 "--unixsocketperm",
                 "700",
+                // Dev data: never on disk.
                 "--save",
                 "",
                 "--appendonly",
                 "no",
+                // Free memory in a background thread (Redis >= 6.2): DEL, FLUSHALL /
+                // FLUSHDB (test cleanups), expiry and eviction don't block.
+                "--lazyfree-lazy-user-del",
+                "yes",
+                "--lazyfree-lazy-user-flush",
+                "yes",
+                "--lazyfree-lazy-expire",
+                "yes",
+                "--lazyfree-lazy-eviction",
+                "yes",
+                "--lazyfree-lazy-server-del",
+                "yes",
             ])
             .arg("--dir")
             .arg(&self.dir)
