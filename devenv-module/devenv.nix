@@ -144,10 +144,21 @@ let
       [
         (lib.getExe cfg.git.package)
         "${cfg.package}/bin/lazy-cow-tree-cow"
-        (lib.getExe pkgs.gh)
+        (lib.getExe cfg.gh.package)
         exe
       ]
       (builtins.readFile ./git.sh)
+  );
+  # hiPrio in packages: wins over cfg.gh.package's bin/gh.
+  ghWrapper = pkgs.writeShellScriptBin "gh" (
+    builtins.replaceStrings
+      [ "@gh@" "@git@" "@lazyCowTree@" ]
+      [
+        (lib.getExe cfg.gh.package)
+        (lib.getExe cfg.git.package)
+        exe
+      ]
+      (builtins.readFile ./gh.sh)
   );
   # `<binary>` of a supported language server (`lspServers`): starts as a language server behind
   # `lazy-cow-tree lsp`; hiPrio in packages, over a real one in the shell.
@@ -982,6 +993,17 @@ in
         defaultText = lib.literalExpression "pkgs.git";
         description = "The real git the wrapper runs.";
       };
+      gh.enable = mkOption {
+        type = types.bool;
+        default = true;
+        description = "Replace `gh` in the shell with a wrapper: after `gh pr merge` or `gh pr close` leaves the pull request merged or closed, the worktree with its branch is removed (`lazy-cow-tree worktree rm`; one with uncommitted changes stays). Everything else is the real gh.";
+      };
+      gh.package = mkOption {
+        type = types.package;
+        default = pkgs.gh;
+        defaultText = lib.literalExpression "pkgs.gh";
+        description = "The real gh the wrappers run.";
+      };
       codex = {
         lsp = mkOption {
           type = types.bool;
@@ -1089,6 +1111,10 @@ in
     ++ lib.optionals cfg.git.enable [
       (lib.hiPrio gitWrapper)
       cfg.git.package
+    ]
+    ++ lib.optionals cfg.gh.enable [
+      (lib.hiPrio ghWrapper)
+      cfg.gh.package
     ]
     ++ lib.mapAttrsToList (_: s: lib.hiPrio (lspWrapper s.cmd)) lspServers;
 

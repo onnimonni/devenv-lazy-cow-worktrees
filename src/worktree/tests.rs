@@ -120,6 +120,28 @@ fn names_are_unique() {
 }
 
 #[test]
+fn slash_branches_get_dashed_names_that_never_collide() {
+    let (_d, project, syncer) = fixture();
+    let wt = create(&project, &syncer, "feat/login", None).unwrap();
+    assert_eq!(wt.file_name().unwrap(), "feat-login");
+    let i = list(&project.root).unwrap();
+    assert_eq!(i[0].name, "feat-login");
+    assert_eq!(i[0].branch.as_deref(), Some("feat/login"));
+    // Again: the same worktree.
+    assert_eq!(create(&project, &syncer, "feat/login", None).unwrap(), wt);
+    // Its dashed twin would share its hostnames and databases, either way round.
+    let err = create(&project, &syncer, "feat-login", None).unwrap_err();
+    assert!(err.to_string().contains("branch feat/login"), "{err}");
+    create(&project, &syncer, "fix-db", None).unwrap();
+    let err = create(&project, &syncer, "fix/db", None).unwrap_err();
+    assert!(err.to_string().contains("branch fix-db"), "{err}");
+    for bad in ["feat/", "/feat", "feat//x", "Feat/x", "feat/x_y"] {
+        assert!(name_of_branch(bad).is_err(), "{bad}");
+    }
+    assert_eq!(name_of_branch("a/b/c").unwrap(), "a-b-c");
+}
+
+#[test]
 fn primary_files_are_told_from_worktrees() {
     let (d, project, syncer) = fixture();
     let wt = create(&project, &syncer, "feat", None).unwrap();
