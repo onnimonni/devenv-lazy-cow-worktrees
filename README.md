@@ -222,7 +222,8 @@ it (and always with `instance = "unique"`) they are created empty, then migrated
 seeded. Setting both `instance = "unique"` and `copyOnWrite.enable = true` is an error.
 
 `dangerouslyDisableDurabilityForSpeed` runs PostgreSQL on a RAM disk with `fsync`,
-`synchronous_commit` and `full_page_writes` off. **Every database is lost on a reboot,
+`synchronous_commit` and `full_page_writes` off and the least WAL PostgreSQL allows
+(`wal_level = minimal`, no WAL senders or archiving, `max_wal_size` 64 MB). **Every database is lost on a reboot,
 on `lazy-cow-tree down --eject`, and on a crash, which can also corrupt the cluster.**
 Only for data you can recreate (migrations and seeds). Off by default: the cluster is
 then on disk with PostgreSQL's normal durability.

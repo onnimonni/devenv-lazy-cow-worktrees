@@ -41,9 +41,16 @@ fn cluster_settings(
             ("fsync", "off".into()),
             ("synchronous_commit", "off".into()),
             ("full_page_writes", "off".into()),
-            // The default max_wal_size (1 GB) would crowd the RAM disk.
+            // As little WAL as PostgreSQL allows (it can't be off): crash recovery
+            // only, none for rows of tables created or truncated in the same
+            // transaction. No replication or point-in-time recovery to keep it for.
+            ("wal_level", "minimal".into()),
+            ("max_wal_senders", "0".into()),
+            ("archive_mode", "off".into()),
+            // The default max_wal_size (1 GB) would crowd the RAM disk; checkpoints
+            // are cheap without fsync.
             ("min_wal_size", "32MB".into()),
-            ("max_wal_size", "256MB".into()),
+            ("max_wal_size", "64MB".into()),
         ]);
     }
     settings
