@@ -164,6 +164,8 @@ redis-cli --no-auth-warning -u "$REDIS_URL" set k worktree >/dev/null
 primary_redis=$(env_of "$work/app" REDIS_URL)
 [[ $(in_primary redis-cli --no-auth-warning -u "$primary_redis" get k 2>&1) == "" ]] || fail "redis not isolated"
 [[ $(redis-cli --no-auth-warning -u "$REDIS_URL" get k) == worktree ]] || fail "redis lost the key"
+[[ $(redis-cli --no-auth-warning -u "$REDIS_URL" config get lazyfree-lazy-user-flush | tail -1) == yes &&
+  $(redis-cli --no-auth-warning -u "$REDIS_URL" config get save | tail -1) == "" ]] || fail "redis-server settings"
 pass "redis isolated per checkout"
 
 # A worktree's process with the primary's credentials (a copied .env): refused.
