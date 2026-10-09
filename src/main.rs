@@ -25,6 +25,7 @@ mod proxy;
 mod ramdisk;
 mod redis;
 mod server;
+mod slot;
 mod sync;
 mod tls;
 mod worktree;
@@ -134,6 +135,24 @@ enum Cmd {
     /// Claude Code hooks (JSON on stdin).
     #[command(subcommand)]
     Hook(HookCmd),
+    /// Test slots, for the devenv module's test command wrappers.
+    #[command(subcommand, hide = true)]
+    Slot(SlotCmd),
+}
+
+#[derive(Subcommand)]
+enum SlotCmd {
+    /// Print `<count> <dir>`: the wrapper opens `<dir>/<i>.lock` for i < count.
+    Info,
+    /// Lock one of the inherited slot fds (waiting for one); prints it.
+    Acquire {
+        /// The fds the wrapper opened.
+        #[arg(long, value_delimiter = ',', required = true)]
+        fds: Vec<i32>,
+        /// What runs (shown to those waiting).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -863,6 +882,19 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            Ok(())
+        }
+        Cmd::Slot(SlotCmd::Info) => {
+            println!("{} {}", slot::count(), slot::dir()?.display());
+            Ok(())
+        }
+        Cmd::Slot(SlotCmd::Acquire { fds, command }) => {
+            let here = std::env::var("LAZY_COW_TREE_WORKTREE")
+                .ok()
+                .filter(|w| !w.is_empty())
+                .unwrap_or_else(|| "primary".into());
+            let what = format!("{here}: {}", command.join(" "));
+            println!("{}", slot::acquire(&fds, &what)?);
             Ok(())
         }
         Cmd::Lsp { command } => {

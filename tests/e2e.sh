@@ -294,6 +294,32 @@ out=$(gh_wrapper "$PWD" "CLOSED closed-x" pr close closed-x)
 "$bin" worktree rm --force dirty-x >/dev/null
 pass "gh wrapper: merged/closed PR's worktree removed; open or dirty kept, unpushed commits kept; dirty merge refused"
 
+# The module's test slot wrapper over a fake runner logging when each run starts and ends.
+mkdir -p "$home/real" "$home/wrapped"
+cat >"$home/real/faketest" <<EOF
+#!/usr/bin/env bash
+echo "start \$1 \$\$" >>"$home/runs.log"; sleep 1; echo "end \$1 \$\$" >>"$home/runs.log"
+EOF
+chmod +x "$home/real/faketest"
+sed -e "s|@name@|faketest|" -e "s|@lazyCowTree@|$bin|" -e "s|@patterns@|'test'|" \
+  "$src/devenv-module/test-slot.sh" >"$home/wrapped/faketest"
+chmod +x "$home/wrapped/faketest"
+slotted() { PATH="$home/wrapped:$home/real:$PATH" LAZY_COW_TREE_TEST_SLOTS=1 faketest "$@"; }
+slotted test 2>"$work/slot1.err" & a=$!
+sleep 0.3
+slotted test 2>"$work/slot2.err" & b=$!
+slotted other 2>/dev/null
+wait "$a" "$b"
+[[ $(grep -c . "$home/runs.log") == 6 ]] || fail "test runs: $(cat "$home/runs.log")"
+# The two test runs one after the other; `other` didn't wait.
+[[ $(grep -v other "$home/runs.log" | awk '{print $1}' | tr '\n' ' ') == "start end start end " ]] ||
+  fail "test runs overlapped: $(cat "$home/runs.log")"
+[[ $(head -1 "$home/runs.log") == "start test"* && $(sed -n 2p "$home/runs.log") == "start other"* ]] ||
+  fail "non-test run waited: $(cat "$home/runs.log")"
+grep -q "waiting for a test slot (1 run at once: feat-a: faketest test)" "$work/slot2.err" ||
+  fail "no waiting message: $(cat "$work/slot2.err")"
+pass "test slots: test runs wait for each other, other runs don't"
+
 "$bin" worktree new broken >/dev/null 2>&1 || fail "worktree new failed on a failing migration"
 [[ $("$bin" status) == *"migrations failed"* ]] || fail "failed migration not in status"
 out=$(curl_lf "https://broken.web.demo.localhost:8443/" 2>&1) || true

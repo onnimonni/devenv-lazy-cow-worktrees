@@ -149,6 +149,54 @@ let
       ]
       (builtins.readFile ./git.sh)
   );
+  # `<program>` wrappers for `testSlots.commands`, by program: their test runs wait for
+  # a test slot. hiPrio in packages, over the real ones.
+  testSlotWrappers = lib.mapAttrsToList (
+    name: cmds:
+    lib.hiPrio (
+      pkgs.writeShellScriptBin name (
+        builtins.replaceStrings
+          [ "@name@" "@lazyCowTree@" "@patterns@" ]
+          [
+            name
+            exe
+            (lib.escapeShellArg (
+              lib.concatMapStringsSep "\n" (c: lib.concatStringsSep " " (lib.tail (lib.splitString " " c))) cmds
+            ))
+          ]
+          (builtins.readFile ./test-slot.sh)
+      )
+    )
+  ) (lib.groupBy (c: lib.head (lib.splitString " " c)) cfg.testSlots.commands);
+  # Test commands of the enabled `languages.*`.
+  defaultTestCommands =
+    let
+      on = l: config.languages.${l}.enable or false;
+    in
+    lib.optionals (on "elixir") [ "mix test" ]
+    ++ lib.optionals (on "rust") [
+      "cargo test"
+      "cargo nextest"
+    ]
+    ++ lib.optionals (on "go") [ "go test" ]
+    ++ lib.optionals (on "python") [ "pytest" ]
+    ++ lib.optionals (on "ruby") [
+      "rspec"
+      "bundle exec rspec"
+      "rails test"
+    ]
+    ++ lib.optionals (on "javascript" || on "typescript") [
+      "npm test"
+      "npm run test*"
+      "pnpm test"
+      "pnpm run test*"
+      "yarn test"
+      "bun test"
+      "bun run test*"
+      "npx vitest"
+      "npx jest"
+      "npx playwright test"
+    ];
   # hiPrio in packages: wins over cfg.gh.package's bin/gh.
   ghWrapper = pkgs.writeShellScriptBin "gh" (
     builtins.replaceStrings
@@ -1003,6 +1051,23 @@ in
         default = true;
         description = "Replace `gh` in the shell with a wrapper: after `gh pr merge` or `gh pr close` leaves the pull request merged or closed, the worktree with its branch is removed (`lazy-cow-tree worktree rm`; one with uncommitted changes stays), and `gh pr merge` refuses while that worktree has uncommitted changes (`FORCE_ALLOW_DIRTY_MERGE=1` merges anyway). Everything else is the real gh.";
       };
+      testSlots = {
+        count = mkOption {
+          type = types.nullOr types.ints.unsigned;
+          default = null;
+          description = "Test suites that run at once across every checkout (`testSlots.commands`); the others wait for a slot, printing who holds them. null: a quarter of the CPUs, at least 2; 0: no waiting (the commands aren't wrapped).";
+        };
+        commands = mkOption {
+          type = types.listOf types.str;
+          default = defaultTestCommands;
+          defaultText = lib.literalMD "the test commands of the enabled `languages.*` (`mix test`, `cargo test`, `pytest`, `npm test`, `npm run test*`, `bun test`, `npx vitest`, …)";
+          example = [
+            "mix test"
+            "npm run test*"
+          ];
+          description = "Commands that run test suites: a program and the leading arguments (globs) that make it a test run; a program alone counts every run. Each program in the devenv shell becomes a wrapper that waits for a test slot for those runs and is the real one otherwise.";
+        };
+      };
       gh.package = mkOption {
         type = types.package;
         default = pkgs.gh;
@@ -1121,6 +1186,7 @@ in
       (lib.hiPrio ghWrapper)
       cfg.gh.package
     ]
+    ++ lib.optionals (cfg.testSlots.count != 0) testSlotWrappers
     ++ lib.mapAttrsToList (_: s: lib.hiPrio (lspWrapper s.cmd)) lspServers;
 
     env = {
@@ -1134,6 +1200,7 @@ in
       LAZY_COW_TREE_POSTGRES_BIN = "${postgres}/bin";
       LAZY_COW_TREE_POSTGRES_SETTINGS = builtins.toJSON cfg.postgres.settings;
       LAZY_COW_TREE_POSTGRES_ROLE_CONNECTIONS = toString cfg.postgres.connectionsPerCheckout;
+      LAZY_COW_TREE_TEST_SLOTS = lib.mkIf (cfg.testSlots.count != null) (toString cfg.testSlots.count);
       LAZY_COW_TREE_POSTGRES_EXTENSIONS = lib.concatStringsSep "," cfg.postgres.createExtensions;
       LAZY_COW_TREE_REDIS_SERVER = lib.getExe' cfg.redis "redis-server";
       LAZY_COW_TREE_POSTGRES_DURABLE =
