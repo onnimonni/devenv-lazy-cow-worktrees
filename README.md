@@ -515,7 +515,12 @@ All services of a checkout share its `DATABASE_URL` and `REDIS_URL` for now
 ## New worktrees, however they're made
 
 In the devenv shell `git` is the module's wrapper (`lazyCowTree.git.enable`):
-`git worktree add` (any options; `--no-checkout` and `--orphan` pass through) makes
+`git worktree add` first fetches the base branch (`$LAZY_COW_TREE_BASE`, else the
+remote's default branch, else `main`; offline: only a warning). A new branch without a
+start point (`-b x path`, or git's implicit one named after the directory) then starts
+at `origin/<base>` instead of a stale local `HEAD`, without tracking it; a `HEAD` with
+commits of its own (a feature branch, unpushed work) stays the start, like git's. It
+(any options; `--no-checkout` and `--orphan` pass through) makes
 the worktree with git, locked as `initializing`, and `lazy-cow-tree-cow populate`
 fills it like `lazy-cow-tree worktree new`: copy-on-write clones of the primary,
 gitignored caches (`deps/`, `_build/`, `node_modules/`, …) included and a carried Mix
