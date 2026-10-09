@@ -10,7 +10,13 @@ impl Daemon {
         if let Err(e) = self.migrate_role(c).await {
             warn!("{}: taking over its old role: {e:#}", c.id());
         }
-        self.pg.ensure_role(&c.id(), &c.pg_password()?).await?;
+        self.pg
+            .ensure_role(
+                &c.id(),
+                &c.pg_password()?,
+                self.global.postgres_role_connections,
+            )
+            .await?;
         let mut created = false;
         if c.worktree.is_none() {
             let extensions = self.global.postgres_extensions();
@@ -126,7 +132,13 @@ impl Daemon {
                 info!("moved role {old}'s objects to {new}");
             }
             (true, _) => {
-                self.pg.ensure_role(&new, &c.pg_password()?).await?;
+                self.pg
+                    .ensure_role(
+                        &new,
+                        &c.pg_password()?,
+                        self.global.postgres_role_connections,
+                    )
+                    .await?;
                 self.pg.grant_role(&old, &new).await?;
                 info!("{new}: member of {old}, which another checkout also used");
             }

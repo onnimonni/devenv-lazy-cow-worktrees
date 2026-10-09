@@ -831,6 +831,11 @@ in
           };
           description = "Extra postgresql.conf settings (passed as `-c name=value`), as in devenv's services.postgres.settings.";
         };
+        connectionsPerCheckout = mkOption {
+          type = types.ints.positive;
+          default = 200;
+          description = "Connections one checkout's role may hold at once (`CONNECTION LIMIT`; the cluster allows 1000), so one checkout's test suite can't starve the others: it gets `too many connections for role` instead. Daemon-wide: the daemon's own setting applies.";
+        };
         ramdiskMB = mkOption {
           type = types.ints.positive;
           default = 4096;
@@ -1128,6 +1133,7 @@ in
       LAZY_COW_TREE_RAMDISK_MB = toString cfg.postgres.ramdiskMB;
       LAZY_COW_TREE_POSTGRES_BIN = "${postgres}/bin";
       LAZY_COW_TREE_POSTGRES_SETTINGS = builtins.toJSON cfg.postgres.settings;
+      LAZY_COW_TREE_POSTGRES_ROLE_CONNECTIONS = toString cfg.postgres.connectionsPerCheckout;
       LAZY_COW_TREE_POSTGRES_EXTENSIONS = lib.concatStringsSep "," cfg.postgres.createExtensions;
       LAZY_COW_TREE_REDIS_SERVER = lib.getExe' cfg.redis "redis-server";
       LAZY_COW_TREE_POSTGRES_DURABLE =

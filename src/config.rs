@@ -44,6 +44,10 @@ fn default_https_port() -> u16 {
     }
 }
 
+fn default_role_connections() -> u32 {
+    200
+}
+
 /// 80 where it may be bound without root, else off.
 fn default_http_port() -> u16 {
     if unprivileged_port_start() <= 80 {
@@ -134,6 +138,11 @@ pub struct Global {
     #[arg(long, env = "LAZY_COW_TREE_POSTGRES_DURABLE", global = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new())]
     #[serde(default)]
     pub postgres_durable: bool,
+    /// Connections one checkout's role may hold (CONNECTION LIMIT), so one test suite
+    /// can't take the whole cluster's (max_connections 1000) from the others.
+    #[arg(long, env = "LAZY_COW_TREE_POSTGRES_ROLE_CONNECTIONS", global = true, default_value_t = default_role_connections())]
+    #[serde(default = "default_role_connections")]
+    pub postgres_role_connections: u32,
     /// Stop a per-checkout redis-server after this many seconds without connections
     /// (it starts again on the next one).
     #[arg(long, env = "LAZY_COW_TREE_REDIS_IDLE_TIMEOUT", global = true)]

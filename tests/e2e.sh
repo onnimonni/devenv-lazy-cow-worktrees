@@ -97,6 +97,8 @@ admin_psql() { PGUSER=postgres psql -h "$home/pg" -p 55500 -d postgres -tAc "$1"
 g() { git -c user.name=t -c user.email=t@t "$@"; }
 # `lazy-cow-tree shell-hook`'s value of <var> in <dir>.
 env_of() { (cd "$1" && unset LAZY_COW_TREE_SHELL && eval "$("$bin" shell-hook)" && printenv "$2"); }
+# Run in the primary checkout, its shell hook closing the worktree marker this script holds.
+in_primary() { (cd "$work/app" && unset LAZY_COW_TREE_SHELL && eval "$("$bin" shell-hook)" && "$@"); }
 
 cd "$work"
 git init -q --bare -b main origin.git
@@ -154,10 +156,13 @@ for sql in "DROP DATABASE demo_dev" "ALTER ROLE demo SUPERUSER" "COPY (SELECT 1)
 done
 [[ $(admin_psql "select 1 from pg_database where datname = 'demo_dev'") == 1 ]] || fail "primary's database gone"
 pass "worktree role owns its clone, can't touch other checkouts"
+[[ $(admin_psql "select rolconnlimit from pg_roles where rolname = 'demo--feat-a'") == 200 &&
+  $(admin_psql "show max_connections") == 1000 ]] || fail "connection limits not set"
+pass "connection limit per checkout role"
 
 redis-cli --no-auth-warning -u "$REDIS_URL" set k worktree >/dev/null
 primary_redis=$(env_of "$work/app" REDIS_URL)
-[[ -z $(redis-cli --no-auth-warning -u "$primary_redis" get k) ]] || fail "redis not isolated"
+[[ $(in_primary redis-cli --no-auth-warning -u "$primary_redis" get k 2>&1) == "" ]] || fail "redis not isolated"
 [[ $(redis-cli --no-auth-warning -u "$REDIS_URL" get k) == worktree ]] || fail "redis lost the key"
 pass "redis isolated per checkout"
 
@@ -167,9 +172,7 @@ if out=$(cd "$wt" && psql "$primary_db" -tAc "select 1" 2>&1); then fail "worktr
 [[ $out == *"runs in worktree feat-a"*'$DATABASE_URL'* ]] || fail "primary's credentials from a worktree not explained: $out"
 out=$(cd "$wt" && redis-cli --no-auth-warning -u "$primary_redis" get k 2>&1) || true
 [[ $out == *"runs in worktree feat-a"*'$REDIS_URL'* ]] || fail "primary's redis password from a worktree not refused: $out"
-# The primary's shell hook closes the worktree's marker this script holds.
-[[ $(cd "$work/app" && unset LAZY_COW_TREE_SHELL && eval "$("$bin" shell-hook)" && psql "$primary_db" -tAc "select 1") == 1 ]] ||
-  fail "primary refused its own database"
+[[ $(in_primary psql "$primary_db" -tAc "select 1") == 1 ]] || fail "primary refused its own database"
 pass "primary's credentials refused from a worktree's processes"
 
 base=$(env_of "$wt" PORT)
