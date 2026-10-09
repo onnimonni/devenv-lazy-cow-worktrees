@@ -343,6 +343,22 @@ wgit worktree add -q -b manual .claude/worktrees/manual
 [[ -z $(git -C .claude/worktrees/manual status --porcelain) ]] || fail "wrapper's worktree not clean"
 eventually 30 grep -q manual "$home/setup.log" || fail "setup did not run"
 pass "git wrapper: worktree add populated, provisioned, setup ran"
+
+# Someone else pushed to main: a new worktree starts at it, not at the primary's stale main.
+git clone -q "$work/origin.git" "$work/other" 2>/dev/null
+echo upstream >"$work/other/upstream.txt"
+g -C "$work/other" add upstream.txt && g -C "$work/other" commit -qm upstream && git -C "$work/other" push -q origin main
+tip=$(git -C "$work/other" rev-parse HEAD)
+wgit worktree add -q -b fresh .claude/worktrees/fresh
+wgit worktree add -q .claude/worktrees/fresh2
+for w in fresh fresh2; do
+  [[ $(git -C ".claude/worktrees/$w" rev-parse HEAD) == "$tip" ]] || fail "worktree $w not at the fetched origin/main"
+  [[ $(git -C ".claude/worktrees/$w" branch --show-current) == "$w" ]] || fail "worktree $w not on branch $w"
+  [[ -z $(git -C ".claude/worktrees/$w" rev-parse -q --verify '@{upstream}' 2>/dev/null) ]] || fail "$w tracks origin/main"
+done
+wgit worktree remove .claude/worktrees/fresh && wgit worktree remove .claude/worktrees/fresh2
+git branch -q -D fresh fresh2
+pass "git wrapper: worktree add fetches and starts at origin/main"
 eventually 30 test -f "$(git -C .claude/worktrees/manual rev-parse --absolute-git-dir)/lazy-cow-tree-setup" ||
   fail "setup not marked done"
 out=$("$bin" worktree rm --force manual 2>&1) || fail "rm of a fresh worktree failed: $out"

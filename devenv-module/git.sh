@@ -119,6 +119,9 @@ shift 2
 # keep the caller's --lock / --reason for after the fill
 args=()
 path=
+commitish=
+new_branch=
+detach=
 quiet=
 lock=
 reason=
@@ -131,12 +134,50 @@ while (($#)); do
     --reason) reason=$2; shift 2 ;;
     --reason=*) reason=${1#--reason=}; shift ;;
     -q | --quiet) quiet=1; args+=("$1"); shift ;;
-    -b | -B) args+=("$1" "$2"); shift 2 ;;
-    --) args+=("$@"); [[ -z $path ]] && path=${2:-}; break ;;
+    -b | -B) new_branch=$2; args+=("$1" "$2"); shift 2 ;;
+    -d | --detach) detach=1; args+=("$1"); shift ;;
+    --)
+      shift
+      [[ -z $path ]] && { path=${1:-}; shift; }
+      commitish=${1:-}
+      args+=(-- "$path" "$@")
+      break ;;
     -*) args+=("$1"); shift ;;
-    *) [[ -z $path ]] && path=$1; args+=("$1"); shift ;;
+    *)
+      if [[ -z $path ]]; then path=$1; else commitish=$1; fi
+      args+=("$1"); shift ;;
   esac
 done
+
+# A new branch with no start point would start at HEAD, which may lag the remote: fetch
+# the base branch (like `lazy-cow-tree worktree new`) and start at <remote>/<base> when
+# HEAD is that or behind it (HEAD's own commits keep it: a feature branch, unpushed work).
+remote=${LAZY_COW_TREE_REMOTE:-origin}
+if [[ -z $commitish && -z $detach ]] &&
+  "$real_git" "${globals[@]}" remote get-url "$remote" >/dev/null 2>&1; then
+  base_branch=${LAZY_COW_TREE_BASE:-}
+  if [[ -z $base_branch ]]; then
+    base_branch=$("$real_git" "${globals[@]}" symbolic-ref -q --short "refs/remotes/$remote/HEAD" 2>/dev/null)
+    base_branch=${base_branch#"$remote"/}
+  fi
+  base_branch=${base_branch:-main}
+  "$real_git" "${globals[@]}" fetch -q "$remote" "$base_branch" ||
+    echo "warning: fetching $remote $base_branch failed; using local refs" >&2
+  # git's own default: a new branch named after the directory, unless one exists.
+  if [[ -z $new_branch ]] &&
+    ! "$real_git" "${globals[@]}" show-ref -q --verify "refs/heads/${path##*/}" &&
+    [[ -z $("$real_git" "${globals[@]}" for-each-ref "refs/remotes/*/${path##*/}") ]]; then
+    new_branch=${path##*/}
+    args=(-b "$new_branch" "${args[@]}")
+  fi
+  upstream=refs/remotes/$remote/$base_branch
+  if [[ -n $new_branch ]] &&
+    "$real_git" "${globals[@]}" rev-parse -q --verify "$upstream" >/dev/null &&
+    "$real_git" "${globals[@]}" merge-base --is-ancestor HEAD "$upstream" 2>/dev/null; then
+    # Not tracking <remote>/<base>: `git push` would aim at it.
+    args=(--no-track "${args[@]}" "$remote/$base_branch")
+  fi
+fi
 
 "$real_git" "${globals[@]}" worktree add --no-checkout \
   --lock --reason "initializing (lazy-cow-tree)" "${args[@]}" || exit $?
