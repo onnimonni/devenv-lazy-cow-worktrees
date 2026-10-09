@@ -212,6 +212,42 @@ pass "unbound named port answers 502 after a short grace"
 [[ -z $(git -C "$wt" status --porcelain) ]] || fail "worktree not clean"
 pass "worktree clean"
 
+out=$("$bin" worktree new feat/slash 2>&1) || fail "worktree new feat/slash: $out"
+[[ $out == *"https://feat-slash."* && $(git -C .claude/worktrees/feat-slash branch --show-current) == feat/slash ]] ||
+  fail "feat/slash not worktree feat-slash on its branch: $out"
+if out=$("$bin" worktree new feat-slash 2>&1); then fail "feat-slash shared feat/slash's worktree"; fi
+[[ $out == *"branch feat/slash"* ]] || fail "collision not explained: $out"
+"$bin" worktree rm --force feat/slash >/dev/null || fail "worktree rm feat/slash"
+pass "worktree new feat/slash: worktree feat-slash; feat-slash refused"
+
+# The module's gh wrapper over a fake gh: the PR is in FAKE_PR ("<state> <branch>").
+cat >"$home/fake-gh" <<'EOF'
+#!/usr/bin/env bash
+[[ "$1 $2" == "pr view" ]] && echo "$FAKE_PR"
+exit 0
+EOF
+chmod +x "$home/fake-gh"
+sed -e "s|@gh@|$home/fake-gh|" -e "s|@git@|$(command -v git)|" -e "s|@lazyCowTree@|$bin|" \
+  "$src/devenv-module/gh.sh" >"$home/gh"
+chmod +x "$home/gh"
+gh_wrapper() { (cd "$1" && FAKE_PR=$2 "$home/gh" "${@:3}" 2>&1); }
+merged=$("$bin" worktree new feat/gh 2>/dev/null | tail -1)
+out=$(gh_wrapper "$merged" "OPEN feat/gh" pr merge --auto --squash)
+[[ -d $merged ]] || fail "open PR's worktree removed: $out"
+out=$(gh_wrapper "$merged" "MERGED feat/gh" pr merge --squash)
+[[ ! -d $merged && $out == *"you were in it"* ]] || fail "merged PR's worktree not removed: $out"
+closed=$("$bin" worktree new closed-x 2>/dev/null | tail -1)
+echo x >"$closed/x.txt" && g -C "$closed" add x.txt && g -C "$closed" commit -qm x
+dirty=$("$bin" worktree new dirty-x 2>/dev/null | tail -1)
+echo y >"$dirty/y.txt"
+out=$(gh_wrapper "$PWD" "CLOSED dirty-x" pr close 7 --comment "no -R")
+[[ -d $dirty && $out == *"uncommitted changes"* ]] || fail "dirty worktree of a closed PR removed: $out"
+out=$(gh_wrapper "$PWD" "CLOSED closed-x" pr close closed-x)
+[[ ! -d $closed ]] || fail "closed PR's worktree not removed: $out"
+[[ -n $(git branch --list 'closed-x-kept-*') ]] || fail "closed PR's unpushed commit not kept: $out"
+"$bin" worktree rm --force dirty-x >/dev/null
+pass "gh wrapper: merged/closed PR's worktree removed; open or dirty kept, unpushed commits kept"
+
 "$bin" worktree new broken >/dev/null 2>&1 || fail "worktree new failed on a failing migration"
 [[ $("$bin" status) == *"migrations failed"* ]] || fail "failed migration not in status"
 out=$(curl_lf "https://broken.web.demo.localhost:8443/" 2>&1) || true

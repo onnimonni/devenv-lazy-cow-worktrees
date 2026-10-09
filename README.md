@@ -47,7 +47,7 @@ get the environment of the worktree they're in.
 
 | | |
 |---|---|
-| **Worktrees** | `git worktree add` without a checkout, then filled with copy-on-write clones of the primary checkout, build caches included ([git-cow](https://github.com/onnimonni/git-cow)): ~0 disk, nothing to recompile. In `.claude/worktrees/<name>`, where Claude Code puts its own. A worktree's name (hostname, databases, role, Redis, port) is its git admin dir's (`.git/worktrees/<name>`, unique per repository); one that isn't a DNS label of at most 32 characters is shortened and gets a hash suffix, so two names never share a worktree. Database and role names are kept within PostgreSQL's 63 bytes the same way (test partitions included). |
+| **Worktrees** | `git worktree add` without a checkout, then filled with copy-on-write clones of the primary checkout, build caches included ([git-cow](https://github.com/onnimonni/git-cow)): ~0 disk, nothing to recompile. In `.claude/worktrees/<name>`, where Claude Code puts its own. A worktree's name (hostname, databases, role, Redis, port) is its git admin dir's (`.git/worktrees/<name>`, unique per repository); one that isn't a DNS label of at most 32 characters is shortened and gets a hash suffix, so two names never share a worktree. `worktree new feat/login` (and Claude Code's `feat/login`) makes worktree `feat-login` on branch `feat/login`, unless a worktree of another branch already has that name. Database and role names are kept within PostgreSQL's 63 bytes the same way (test partitions included). |
 | **Two binaries** | `lazy-cow-tree-cow` fills new worktrees (run by the devenv module's `git` wrapper, no daemon needed); `lazy-cow-tree` is the daemon (HTTPS, PostgreSQL and Redis proxies, services, migrations, GitHub sync) and its CLI. |
 | **Worktrees, however made** | `lazy-cow-tree worktree new`, `git worktree add` in the devenv shell (the module's `git` wrapper) and Claude Code (its WorktreeCreate hook) all make copy-on-write worktrees. The daemon provisions new worktrees and cleans up removed ones when the wrapper or a hook asks, on start and every minute. |
 | **Services** | Every checkout runs the project's services (`lazyCowTree.services`), each with its own port and `https://<worktree>.<service>.<project>.localhost` (`<service>.<project>.localhost` in the primary). The first request to a service starts it, after the services it depends on; workers without http run as dependencies. |
@@ -368,6 +368,8 @@ FIXME: other language servers. devenv's `languages.*.lsp` has only `enable` and
 | `lazyCowTree.processMarkerShim.enable` | `true` | macOS: children of node, bun, python and erlang keep the worktree process marker, so `git worktree remove` finds them (`DYLD_INSERT_LIBRARIES`) |
 | `lazyCowTree.git.enable` | `true` | `git` in the shell is a wrapper: `git worktree add` fills the worktree like `lazy-cow-tree worktree new` (copy-on-write clones of the primary, build caches included; locked as initializing meanwhile); `LAZY_COW_TREE_GIT_DISABLE=1` for plain git. Don't also import git-cow's module |
 | `lazyCowTree.git.package` | `pkgs.git` | the real git it runs |
+| `lazyCowTree.gh.enable` | `true` | `gh` in the shell is a wrapper: after `gh pr merge` / `gh pr close` leaves the PR merged or closed, the worktree with its branch is removed (see below); `LAZY_COW_TREE_GH_DISABLE=1` for plain gh |
+| `lazyCowTree.gh.package` | `pkgs.gh` | the real gh the wrappers run |
 | `lazyCowTree.claude.lsp` | `true` | the language servers as Claude Code plugin `lazy-cow-tree-lsp` from a local marketplace in `.claude/settings.local.json` (step 8) |
 | `lazyCowTree.codex.lsp` | `true` | each supported language server as Codex MCP server `lsp-<binary>` (mcp-language-server) in `.codex/config.toml` (step 8) |
 | `lazyCowTree.codex.mcpLanguageServer` | `pkgs.mcp-language-server` | the LSP-to-MCP bridge (Codex and pi) |
@@ -539,6 +541,14 @@ Best effort: hardened-runtime binaries that don't allow `DYLD_*` (most notarized
 apps) ignore it, and daemons that close every fd lose the marker.
 `lazy-cow-tree worktree procs <path> [--kill]` lists (kills) them by hand.
 
+`gh` is the module's wrapper too (`lazyCowTree.gh.enable`): when `gh pr merge` or
+`gh pr close` (a number, URL, branch, or the current branch's PR) leaves the PR merged
+or closed, the worktree with its branch goes right away (`lazy-cow-tree worktree rm`),
+without waiting for the daemon's merged-PR sweep. `gh pr merge --auto` waits for that
+sweep. One with uncommitted changes stays (the command to delete them is printed); a
+closed PR's commits that aren't pushed stay as branch `<name>-kept-<sha>`. With
+`-R` it acts only when that is this repository.
+
 Nothing watches the filesystem: a worktree made or deleted outside the wrapper (plain
 git elsewhere, `rm -rf`) is picked up by the daemon within a minute, and one made by
 plain git has no caches.
@@ -613,7 +623,8 @@ ws; at most 500 names in all, 100 per certificate), so a new service rarely need
 
 ```sh
 lazy-cow-tree serve                        # daemon (devenv process)
-lazy-cow-tree worktree new <name> [--base <ref>]
+lazy-cow-tree worktree new <branch> [--base <ref>]  # feat/login: worktree feat-login; refused if
+                                           # another branch's worktree has that name (feat-login)
 lazy-cow-tree worktree rm <name> [--force] # without --force only when nothing would be lost
 lazy-cow-tree worktree list
 lazy-cow-tree service start|stop|restart|log [-s <service>] [<worktree> | . | --primary]

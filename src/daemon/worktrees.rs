@@ -95,7 +95,9 @@ impl Daemon {
             self.create_locked(&rt, &req.name, req.base.clone()).await?
         };
         // Before its URL is handed out; a failure shows in status and on its pages.
-        let c = rt.known.lock().get(&req.name).cloned();
+        let c = worktree::name_of_branch(&req.name)
+            .ok()
+            .and_then(|n| rt.known.lock().get(&n).cloned());
         if let Some(c) = c
             && let Err(e) = self.migrate_worktree(&rt, &c, false).await
         {
@@ -112,20 +114,20 @@ impl Daemon {
     ) -> Result<CreateResp> {
         let project = rt.project.clone();
         let syncer = rt.syncer();
-        let n = name.to_string();
+        let branch = name.to_string();
         let path = tokio::task::spawn_blocking(move || {
-            worktree::create(&project, &syncer, &n, base.as_deref())
+            worktree::create(&project, &syncer, &branch, base.as_deref())
         })
         .await??;
         let info = worktree::Info {
-            name: name.to_string(),
+            name: worktree::name_of_branch(name)?,
             path: path.clone(),
             branch: Some(name.to_string()),
         };
         let ports = self.assign_ports().await?;
         let c = checkout_with(&rt.project, &info, &ports);
         self.provision(&c).await?;
-        rt.known.lock().insert(name.to_string(), c.clone());
+        rt.known.lock().insert(info.name.clone(), c.clone());
         self.run_setup(rt, &c).await;
         Ok(CreateResp {
             path,
@@ -144,6 +146,8 @@ impl Daemon {
             .iter()
             .find(|i| {
                 i.name == req.name
+                    // `rm feat/login`: by its branch.
+                    || (req.name.contains('/') && i.branch.as_deref() == Some(req.name.as_str()))
                     || (target.is_absolute() && target.canonicalize().is_ok_and(|p| p == i.path))
             })
             .cloned()

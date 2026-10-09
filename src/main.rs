@@ -487,11 +487,12 @@ fn rm_target(cwd: &Path, name: &str) -> Result<String> {
     if config::valid_label(name) {
         return Ok(name.to_string());
     }
-    let path = cwd
-        .join(name)
-        .canonicalize()
-        .with_context(|| format!("no worktree {name}"))?;
-    Ok(path.to_string_lossy().into_owned())
+    match cwd.join(name).canonicalize() {
+        Ok(path) => Ok(path.to_string_lossy().into_owned()),
+        // A branch: `feat/login`.
+        Err(_) if worktree::name_of_branch(name).is_ok() => Ok(name.to_string()),
+        Err(_) => anyhow::bail!("no worktree {name}"),
+    }
 }
 
 async fn remove(root: PathBuf, name: String, force: bool) -> Result<()> {
@@ -880,7 +881,12 @@ async fn main() -> Result<()> {
             match h {
                 HookCmd::WorktreeCreate => {
                     let name = v["name"].as_str().context("no name in hook input")?;
-                    let r = create(root_of(&dir)?, config::worktree_label(name), None).await?;
+                    // `feat/login` stays its branch; anything else becomes a label.
+                    let name = match worktree::name_of_branch(name) {
+                        Ok(_) => name.to_string(),
+                        Err(_) => config::worktree_label(name),
+                    };
+                    let r = create(root_of(&dir)?, name, None).await?;
                     println!("{}", r.path.display());
                 }
                 HookCmd::WorktreeRemove => {
@@ -931,6 +937,7 @@ mod tests {
         assert_eq!(rm_target(d.path(), "./wt").unwrap(), abs);
         assert_eq!(rm_target(Path::new("/"), &abs).unwrap(), abs);
         assert!(rm_target(d.path(), "./missing").is_err());
+        assert_eq!(rm_target(d.path(), "feat/x").unwrap(), "feat/x");
     }
 
     #[test]

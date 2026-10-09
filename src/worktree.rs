@@ -309,28 +309,47 @@ fn add_no_checkout(root: &Path, admin_name: &str, path: &Path, branch: &str) -> 
     Ok(())
 }
 
-/// Create worktree `name` on a new branch `name` from `base` (default: the freshly
-/// fetched base branch, or the local one when it only adds commits on top).
+/// The worktree name (directory, hostname, databases) of branch `branch`: its `/`s
+/// as `-` (`feat/login` -> `feat-login`). Two branches may share one, so `create`
+/// refuses a name another branch's worktree has.
+pub fn name_of_branch(branch: &str) -> Result<String> {
+    let name = branch.replace('/', "-");
+    if branch.split('/').any(str::is_empty) || !valid_label(&name) {
+        bail!(
+            "{branch}: use at most 32 of a-z, 0-9, '-' and '/' ('/' becomes '-' in its hostname)"
+        );
+    }
+    Ok(name)
+}
+
+/// Create a worktree on a new branch `branch` from `base` (default: the freshly
+/// fetched base branch, or the local one when it only adds commits on top), named
+/// `name_of_branch`.
 pub fn create(
     project: &Project,
     syncer: &Syncer,
-    name: &str,
+    branch: &str,
     base: Option<&str>,
 ) -> Result<PathBuf> {
-    if !valid_label(name) {
-        bail!(
-            "{name}: use at most 32 of a-z, 0-9 and '-'; it becomes {name}.{}.localhost",
-            project.name
-        );
-    }
+    let name = &name_of_branch(branch)?;
     let root = &project.root;
     let dir = project.worktrees_dir();
     let path = dir.join(name);
+    let infos = list(root)?;
+    // `feat/login` and `feat-login` would share hostnames and databases.
+    if let Some(i) = infos.iter().find(|i| i.name == *name)
+        && let Some(other) = i.branch.as_deref().filter(|b| *b != branch)
+    {
+        bail!(
+            "worktree {name} (branch {other}) would share its name, hostnames and databases \
+             with branch {branch}; pick another name"
+        );
+    }
     if path.join(".git").exists() {
         let existing = path.canonicalize()?;
         // Only the worktree of this very name: never hand out another's checkout.
-        match list(root)?.iter().find(|i| i.path == existing) {
-            Some(i) if i.name == name => {
+        match infos.iter().find(|i| i.path == existing) {
+            Some(i) if i.name == *name => {
                 info!("worktree {name} already exists");
                 return Ok(existing);
             }
@@ -342,7 +361,7 @@ pub fn create(
         bail!("{} already exists", path.display());
     }
     // E.g. git numbered a `feat` elsewhere's admin dir `feat1`.
-    if let Some(i) = list(root)?.iter().find(|i| i.name == name) {
+    if let Some(i) = infos.iter().find(|i| i.name == *name) {
         bail!(
             "worktree name {name} is taken by {} (its git admin dir); pick another name",
             i.path.display()
@@ -350,12 +369,12 @@ pub fn create(
     }
 
     let repo = Repository::open(root)?;
-    let branch_exists = repo.find_branch(name, BranchType::Local).is_ok();
+    let branch_exists = repo.find_branch(branch, BranchType::Local).is_ok();
     if branch_exists {
         if base.is_some() {
-            bail!("branch {name} already exists; drop the base to check it out");
+            bail!("branch {branch} already exists; drop the base to check it out");
         }
-        info!("checking out existing branch {name}");
+        info!("checking out existing branch {branch}");
     } else {
         let commit = match base {
             Some(b) => repo
@@ -387,7 +406,7 @@ pub fn create(
                 }
             }
         };
-        repo.branch(name, &commit, false)?;
+        repo.branch(branch, &commit, false)?;
     }
 
     // A stale admin dir (worktree deleted by hand) would make the add fail.
@@ -397,7 +416,7 @@ pub fn create(
         wt.prune(Some(WorktreePruneOptions::new().working_tree(true)))?;
     }
     std::fs::create_dir_all(&dir)?;
-    add_no_checkout(root, name, &path, name)?;
+    add_no_checkout(root, name, &path, branch)?;
     cow::populate(root, &path, name)?;
     Ok(path.canonicalize()?)
 }
