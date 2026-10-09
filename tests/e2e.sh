@@ -192,6 +192,8 @@ pass "worktree clean"
 [[ $("$bin" status) == *"migrations failed"* ]] || fail "failed migration not in status"
 out=$(curl_lf "https://broken.web.demo.localhost:8443/" 2>&1) || true
 [[ $out == *"migrations failed"* ]] || fail "failed migration not on its page: $out"
+[[ $out == *"migration broke"* && $out == *"migrate.sh"* && $out == *".claude/worktrees/broken"* ]] ||
+  fail "502 page lacks the migration's log, command or worktree: $out"
 [[ ! -f $(git -C .claude/worktrees/broken rev-parse --absolute-git-dir)/lazy-cow-tree-migrated ]] ||
   fail "failed migration marked done"
 "$bin" worktree rm --force broken

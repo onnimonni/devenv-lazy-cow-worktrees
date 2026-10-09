@@ -441,7 +441,10 @@ fn print_status(s: &daemon::Status) {
                 if c.redis { " redis" } else { "" },
             );
             if let Some(e) = &c.migrate_error {
-                println!("    {e}");
+                // Its first lines; the rest is the log's tail.
+                for l in e.lines().take(4) {
+                    println!("    {l}");
+                }
             }
             for s in &c.services {
                 println!(

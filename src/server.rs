@@ -499,17 +499,31 @@ pub async fn run_logged(
         .stderr(log)
         .kill_on_drop(true)
         .status();
-    let status = tokio::time::timeout(Duration::from_secs(900), status)
-        .await
-        .map_err(|_| anyhow!("`{cmd}` timed out"))??;
+    let status = match tokio::time::timeout(Duration::from_secs(900), status).await {
+        Ok(status) => status?,
+        Err(_) => bail!("{}", failed(cmd, "timed out", cwd, &log_path)),
+    };
     if !status.success() {
-        bail!(
-            "`{cmd}` failed in {id} ({status}); see {}",
-            log_path.display()
-        );
+        bail!("{}", failed(cmd, &status.to_string(), cwd, &log_path));
     }
     info!("{id}: done in {:?}", t.elapsed());
     Ok(())
+}
+
+/// Lines of a failed run's log its error carries (the 502 page, `status`).
+const LOG_TAIL_LINES: usize = 40;
+
+/// A failed run's error: the command, where it ran, and the end of its log.
+fn failed(cmd: &str, why: &str, cwd: &Path, log_path: &Path) -> String {
+    let log = std::fs::read(log_path).unwrap_or_default();
+    let log = String::from_utf8_lossy(&log);
+    let lines: Vec<&str> = log.lines().collect();
+    let tail = lines[lines.len().saturating_sub(LOG_TAIL_LINES)..].join("\n");
+    format!(
+        "`{cmd}` failed ({why})\n  in: {}\n  log: {}\n{tail}",
+        cwd.display(),
+        log_path.display()
+    )
 }
 
 /// The project's setup command (`mix deps.get`) in a checkout whose dependency files

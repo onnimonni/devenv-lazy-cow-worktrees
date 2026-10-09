@@ -142,7 +142,7 @@ impl Daemon {
         if c.worktree.is_some() {
             self.migrate_worktree(rt, c, false)
                 .await
-                .context("migrations failed; not starting its services")?;
+                .context("not starting its services")?;
         } else {
             let lock = rt.migrate_lock(c);
             let _g = lock.lock().await;
@@ -150,7 +150,7 @@ impl Daemon {
             match primary_setup_step(rt.setup_pending(c), failure.as_ref(), false) {
                 SetupStep::BackingOff => {
                     let error = failure.map(|f| f.error).unwrap_or_default();
-                    anyhow::bail!("{error} (retried later); not starting its services");
+                    anyhow::bail!("not starting its services: {error}\n(retried later)");
                 }
                 SetupStep::Run => self
                     .setup_primary(rt, c)

@@ -262,7 +262,7 @@ impl Daemon {
         // Its changed files restart its services after migrating, not during.
         let _hold = self.servers.hold(&c.path);
         if !force && let Some(f) = rt.migrate_failure(c).filter(MigrateFailure::backing_off) {
-            anyhow::bail!("{} (retried later)", f.error);
+            anyhow::bail!("{}\n(retried later)", f.error);
         }
         self.ensure_dev_db(rt, c).await?;
         let oid = self
