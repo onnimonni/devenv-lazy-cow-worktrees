@@ -59,7 +59,7 @@ pub fn exclude_generated(path: &Path, generated: &str) -> Result<Vec<String>> {
     for f in &add {
         text.push_str(&format!("/{f}\n"));
     }
-    std::fs::create_dir_all(file.parent().unwrap())?;
+    std::fs::create_dir_all(repo.commondir().join("info"))?;
     std::fs::write(&file, text)?;
     Ok(add)
 }

@@ -12,11 +12,12 @@ use git2::Repository;
 
 /// A checkout's extra environment for a service (`lazy-cow-tree service env`): in
 /// its git admin dir, so out of git and gone with a worktree.
+fn env_overrides_dir(checkout: &Path) -> Result<PathBuf> {
+    Ok(Repository::open(checkout)?.path().join("lazy-cow-tree-env"))
+}
+
 fn env_overrides_path(checkout: &Path, service: &str) -> Result<PathBuf> {
-    let admin = Repository::open(checkout)?.path().to_path_buf();
-    Ok(admin
-        .join("lazy-cow-tree-env")
-        .join(format!("{service}.env")))
+    Ok(env_overrides_dir(checkout)?.join(format!("{service}.env")))
 }
 
 /// `KEY=VALUE` lines; a missing or unreadable file is none.
@@ -62,8 +63,8 @@ pub fn edit_env_overrides(
         env.remove(k);
     }
     if !set.is_empty() || !unset.is_empty() {
+        std::fs::create_dir_all(env_overrides_dir(checkout)?)?;
         let path = env_overrides_path(checkout, service)?;
-        std::fs::create_dir_all(path.parent().unwrap())?;
         let text: String = env.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
         // Values may be secrets.
         use std::{io::Write, os::unix::fs::OpenOptionsExt};
