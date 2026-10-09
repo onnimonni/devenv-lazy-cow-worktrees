@@ -34,16 +34,26 @@ fn cluster_settings(
         ("listen_addresses", String::new()),
         ("port", port.to_string()),
         ("unix_socket_directories", dir.display().to_string()),
-        ("max_connections", "500".into()),
+        ("max_connections", "1000".into()),
+        // Compiling a query plan costs more than test suites' short queries save.
+        ("jit", "off".into()),
     ];
     if !durable {
         settings.extend([
             ("fsync", "off".into()),
             ("synchronous_commit", "off".into()),
             ("full_page_writes", "off".into()),
-            // The default max_wal_size (1 GB) would crowd the RAM disk.
+            // As little WAL as PostgreSQL allows (it can't be off): crash recovery
+            // only, none for rows of tables created or truncated in the same
+            // transaction. No replication or point-in-time recovery to keep it for.
+            ("wal_level", "minimal".into()),
+            ("max_wal_senders", "0".into()),
+            ("archive_mode", "off".into()),
+            // The default max_wal_size (1 GB) would crowd the RAM disk; fewer
+            // checkpoints during seeds and bulk loads.
             ("min_wal_size", "32MB".into()),
             ("max_wal_size", "256MB".into()),
+            ("checkpoint_timeout", "30min".into()),
         ]);
     }
     settings
@@ -239,6 +249,33 @@ impl Postgres {
         Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 
+    /// Databases with their size in bytes, biggest first.
+    pub async fn sizes(&self) -> Result<Vec<(String, i64)>> {
+        let rows = self
+            .admin()
+            .await?
+            .query(
+                "SELECT datname::text, pg_database_size(oid) FROM pg_database \
+                 WHERE datname NOT IN ('template0', 'template1') ORDER BY 2 DESC",
+                &[],
+            )
+            .await?;
+        Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+    }
+
+    /// (free, total) bytes of the filesystem the cluster is on (the RAM disk).
+    pub fn disk(&self) -> Option<(u64, u64)> {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(self.dir.as_os_str().as_bytes()).ok()?;
+        // statfs, as df: macOS's statvfs has 32-bit counts.
+        let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statfs(path.as_ptr(), &mut st) } != 0 {
+            return None;
+        }
+        let block = st.f_bsize as u64;
+        Some((st.f_bavail as u64 * block, st.f_blocks as u64 * block))
+    }
+
     /// Owner of `db`, None if it doesn't exist.
     pub async fn owner(&self, db: &str) -> Result<Option<String>> {
         Ok(self
@@ -330,12 +367,14 @@ impl Postgres {
     /// of its own databases) and nothing more. Not a superuser, so it can't drop or
     /// alter other checkouts' databases and roles, or run programs (COPY TO PROGRAM).
     /// It owns its databases and, after `adopt`, everything in its cloned dev database;
-    /// trusted extensions (pgcrypto, citext, ...) need only that.
-    pub async fn ensure_role(&self, role: &str, password: &str) -> Result<()> {
+    /// trusted extensions (pgcrypto, citext, ...) need only that. At most `connections`
+    /// at once.
+    pub async fn ensure_role(&self, role: &str, password: &str, connections: u32) -> Result<()> {
         self.upsert_role(
             role,
             &format!(
-                "LOGIN NOSUPERUSER CREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD '{}'",
+                "LOGIN NOSUPERUSER CREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS \
+                 CONNECTION LIMIT {connections} PASSWORD '{}'",
                 password.replace('\'', "''")
             ),
         )
@@ -788,7 +827,7 @@ mod tests {
             .unwrap();
         assert!(supers.is_empty(), "superusers left");
         for role in ["app", "app-x", "app-y"] {
-            pg.ensure_role(role, "pw").await.unwrap();
+            pg.ensure_role(role, "pw", 200).await.unwrap();
         }
         pg.create("app_dev", None, Some("app")).await.unwrap();
         pg.create("app_test", None, Some("app")).await.unwrap();
@@ -874,7 +913,7 @@ mod tests {
 
         // Concurrent adopts queue on pg_database instead of deadlocking.
         for (db, role) in [("app_dev_y", "app-y"), ("app_dev_z", "app-z")] {
-            pg.ensure_role(role, "pw").await.unwrap();
+            pg.ensure_role(role, "pw", 200).await.unwrap();
             pg.create(db, Some("app_template"), Some(role))
                 .await
                 .unwrap();

@@ -10,7 +10,13 @@ impl Daemon {
         if let Err(e) = self.migrate_role(c).await {
             warn!("{}: taking over its old role: {e:#}", c.id());
         }
-        self.pg.ensure_role(&c.id(), &c.pg_password()?).await?;
+        self.pg
+            .ensure_role(
+                &c.id(),
+                &c.pg_password()?,
+                self.global.postgres_role_connections,
+            )
+            .await?;
         let mut created = false;
         if c.worktree.is_none() {
             let extensions = self.global.postgres_extensions();
@@ -126,7 +132,13 @@ impl Daemon {
                 info!("moved role {old}'s objects to {new}");
             }
             (true, _) => {
-                self.pg.ensure_role(&new, &c.pg_password()?).await?;
+                self.pg
+                    .ensure_role(
+                        &new,
+                        &c.pg_password()?,
+                        self.global.postgres_role_connections,
+                    )
+                    .await?;
                 self.pg.grant_role(&old, &new).await?;
                 info!("{new}: member of {old}, which another checkout also used");
             }
@@ -216,6 +228,7 @@ impl Daemon {
         } else {
             None
         };
+        self.ensure_space().await?;
         let t = std::time::Instant::now();
         self.pg
             .create(&dev, source.as_deref(), Some(&c.id()))
@@ -232,6 +245,61 @@ impl Daemon {
                 info!("{dev}: created empty (copy-on-write off)")
             }
             None => info!("{dev}: created empty (no template yet)"),
+        }
+        Ok(())
+    }
+
+    /// Room for another clone on the cluster's disk (the RAM disk, which takes every
+    /// checkout down when full). Under 5% free: an error naming the biggest databases,
+    /// without writing anything (even DROP DATABASE needs WAL room). Under 10%:
+    /// worktrees' test databases nobody is connected to go, biggest first, until 10%
+    /// is free (test runners create them again).
+    pub(super) async fn ensure_space(&self) -> Result<()> {
+        let Some((free, total)) = self.pg.disk() else {
+            return Ok(());
+        };
+        if free * 10 >= total {
+            return Ok(());
+        }
+        let sizes = self.pg.sizes().await?;
+        if free * 20 < total {
+            let biggest: Vec<String> = sizes
+                .iter()
+                .take(5)
+                .map(|(db, b)| format!("{db} {} MB", b >> 20))
+                .collect();
+            anyhow::bail!(
+                "the database disk {} is {}% full ({} of {} MB free); biggest: {}. Remove \
+                 worktrees (`lazy-cow-tree worktree rm`) or raise lazyCowTree.postgres.ramdiskMB",
+                self.pg.dir.display(),
+                100 - free * 100 / total.max(1),
+                free >> 20,
+                total >> 20,
+                biggest.join(", ")
+            );
+        }
+        let checkouts = self.all_checkouts();
+        for (db, bytes) in &sizes {
+            let Some(c) = checkouts.iter().find(|c| {
+                c.worktree.is_some()
+                    && c.owns_db(db)
+                    && !c.db_kinds().any(|k| c.dev_db_of(k) == *db)
+                    && config::db_owner(db, checkouts.iter()).is_some_and(|o| o.same(c))
+            }) else {
+                continue;
+            };
+            if self.pg.connections(db).await? > 0 {
+                continue;
+            }
+            self.pg.drop(db).await?;
+            warn!(
+                "{db}: dropped ({} MB) for room on the database disk; {} creates it again",
+                bytes >> 20,
+                c.id()
+            );
+            if self.pg.disk().is_some_and(|(f, t)| f * 10 >= t) {
+                break;
+            }
         }
         Ok(())
     }
@@ -386,7 +454,14 @@ impl Daemon {
     /// the password): a checkout's role may open its own databases (its dev database is
     /// created on the spot) and the maintenance ones, unless another checkout's role
     /// made it. Every other user is refused.
-    pub(super) async fn resolve_pg(&self, user: &str, db: &str) -> Result<()> {
+    pub(super) async fn resolve_pg(&self, user: &str, db: &str, client_port: u16) -> Result<()> {
+        if let Some(e) = self
+            .primary_misused(user, client_port, self.global.pg_port, "DATABASE_URL")
+            .await
+        {
+            warn!("{e}");
+            anyhow::bail!("{e}");
+        }
         let projects: Vec<Arc<ProjectRt>> = self.projects.lock().values().cloned().collect();
         let found = projects.into_iter().find_map(|rt| {
             let primary = rt.primary();
@@ -417,6 +492,47 @@ impl Daemon {
         Ok(())
     }
 
+    /// A process in one of a project's worktrees connecting (from `client_port` to the
+    /// proxy on `server_port`) as its primary checkout `id`: a copied `.env` or settings
+    /// naming the primary's database. The error to refuse it with, naming `var` (the
+    /// variable it should use). Only looked into while the project has worktrees.
+    pub(super) async fn primary_misused(
+        &self,
+        id: &str,
+        client_port: u16,
+        server_port: u16,
+        var: &str,
+    ) -> Option<String> {
+        let worktrees: Vec<(String, PathBuf)> = self
+            .projects
+            .lock()
+            .values()
+            .find(|rt| rt.primary().id() == id)?
+            .known
+            .lock()
+            .iter()
+            .map(|(name, c)| (name.clone(), c.path.clone()))
+            .collect();
+        if worktrees.is_empty() {
+            return None;
+        }
+        let (id, var) = (id.to_string(), var.to_string());
+        tokio::task::spawn_blocking(move || {
+            let pid = worktree::tcp_client_pid(client_port, server_port)?;
+            let dirs: Vec<PathBuf> = worktrees.iter().map(|(_, p)| p.clone()).collect();
+            let (i, cmd) = worktree::pid_inside(pid, &dirs)?;
+            Some(format!(
+                "`{cmd}` (pid {pid}) runs in worktree {} but connects as the primary \
+                 checkout ({id}): use ${var} (a .env copied from the primary, or settings \
+                 that name its database?)",
+                worktrees[i].0
+            ))
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     /// Every registered checkout, without their runtimes.
     pub(super) fn all_checkouts(&self) -> Vec<Checkout> {
         self.checkouts().into_iter().map(|(_, o)| o).collect()
@@ -429,6 +545,10 @@ impl Daemon {
         }
         self.servers.stop_checkout(c).await;
         self.redis.remove(&c.id()).await;
+        if c.worktree.is_some() {
+            // Its DEVENV_RUNTIME and TMPDIR (`Checkout::worktree_isolation_env`).
+            let _ = std::fs::remove_dir_all(config::runtime_dir(&c.path));
+        }
         for rt in self.projects.lock().values() {
             rt.migrate_failures.lock().remove(&c.id());
             rt.migrating.lock().remove(&c.id());

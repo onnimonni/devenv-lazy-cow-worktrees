@@ -716,3 +716,21 @@ fn strict_ports_is_read_from_devenv_yaml() {
     std::fs::write(root.join("devenv.local.yaml"), "strict_ports: false\n").unwrap();
     assert!(!config::strict_ports(root));
 }
+
+#[test]
+fn tcp_clients_are_found_by_their_port() {
+    let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let server_port = server.local_addr().unwrap().port();
+    let client = std::net::TcpStream::connect(("127.0.0.1", server_port)).unwrap();
+    let (_accepted, peer) = server.accept().unwrap();
+    assert_eq!(peer.port(), client.local_addr().unwrap().port());
+    let me = std::process::id() as i32;
+    assert_eq!(tcp_client_pid(peer.port(), server_port), Some(me));
+    // Its own working directory is in no worktree here.
+    assert!(pid_inside(me, &[PathBuf::from("/nonexistent")]).is_none());
+    let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+    assert_eq!(
+        pid_inside(me, &[PathBuf::from("/x"), cwd]).map(|(i, _)| i),
+        Some(1)
+    );
+}

@@ -414,6 +414,7 @@ fn global() -> Global {
         devenv_proxy_socket: None,
         devenv_proxy_ca: false,
         postgres_durable: false,
+        postgres_role_connections: 200,
         redis_idle_timeout: None,
     }
 }

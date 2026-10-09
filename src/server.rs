@@ -129,8 +129,7 @@ pub fn command(
 /// DEVENV_* of a worktree: its own root, state and a short runtime dir (unix
 /// sockets must fit 104 bytes).
 pub fn devenv_vars(checkout: &Path) -> Vec<(String, String)> {
-    let h = hex::encode(&sha2::Sha256::digest(checkout.to_string_lossy().as_bytes())[..4]);
-    let runtime = PathBuf::from("/tmp").join(format!("lazy-cow-tree-{h}"));
+    let runtime = config::runtime_dir(checkout);
     let _ = std::fs::create_dir_all(&runtime);
     let dotfile = checkout.join(".devenv");
     vec![

@@ -222,7 +222,8 @@ it (and always with `instance = "unique"`) they are created empty, then migrated
 seeded. Setting both `instance = "unique"` and `copyOnWrite.enable = true` is an error.
 
 `dangerouslyDisableDurabilityForSpeed` runs PostgreSQL on a RAM disk with `fsync`,
-`synchronous_commit` and `full_page_writes` off. **Every database is lost on a reboot,
+`synchronous_commit` and `full_page_writes` off and the least WAL PostgreSQL allows
+(`wal_level = minimal`, no WAL senders or archiving; `max_wal_size` 256 MB, 30 min checkpoints); `jit` is off. **Every database is lost on a reboot,
 on `lazy-cow-tree down --eject`, and on a crash, which can also corrupt the cluster.**
 Only for data you can recreate (migrations and seeds). Off by default: the cluster is
 then on disk with PostgreSQL's normal durability.
@@ -370,6 +371,8 @@ FIXME: other language servers. devenv's `languages.*.lsp` has only `enable` and
 | `lazyCowTree.git.package` | `pkgs.git` | the real git it runs |
 | `lazyCowTree.gh.enable` | `true` | `gh` in the shell is a wrapper: after `gh pr merge` / `gh pr close` leaves the PR merged or closed, the worktree with its branch is removed (see below); `LAZY_COW_TREE_GH_DISABLE=1` for plain gh |
 | `lazyCowTree.gh.package` | `pkgs.gh` | the real gh the wrappers run |
+| `lazyCowTree.testSlots.count` | `null` | test suites running at once across every checkout; null: a quarter of the CPUs, at least 2; 0: off (see below) |
+| `lazyCowTree.testSlots.commands` | the enabled `languages.*`' test commands | `mix test`, `cargo test`, `pytest`, `npm test`, `npm run test*`, `bun test`, `npx vitest`, …: a program and the leading arguments (globs) that make it a test run |
 | `lazyCowTree.claude.lsp` | `true` | the language servers as Claude Code plugin `lazy-cow-tree-lsp` from a local marketplace in `.claude/settings.local.json` (step 8) |
 | `lazyCowTree.codex.lsp` | `true` | each supported language server as Codex MCP server `lsp-<binary>` (mcp-language-server) in `.codex/config.toml` (step 8) |
 | `lazyCowTree.codex.mcpLanguageServer` | `pkgs.mcp-language-server` | the LSP-to-MCP bridge (Codex and pi) |
@@ -382,6 +385,7 @@ FIXME: other language servers. devenv's `languages.*.lsp` has only `enable` and
 | `lazyCowTree.postgres.databases` | `[]` | more databases per checkout next to the main one, e.g. `[ "cms" ]` for a second Ecto repo: `<NAME>_DATABASE_URL`, `<NAME>_TEST_DATABASE_URL`, cloned from their own template like the main one |
 | `lazyCowTree.postgres.createExtensions` | `[]` | created as superuser in `template1` (so every database made afterwards) and the primaries' databases, for untrusted extensions checkout roles can't create, e.g. `[ "postgis" "vector" ]`; migrations' `CREATE EXTENSION IF NOT EXISTS` is then a no-op |
 | `lazyCowTree.postgres.settings` | `{}` | extra postgresql.conf settings, e.g. `shared_preload_libraries` |
+| `lazyCowTree.postgres.connectionsPerCheckout` | `200` | connections one checkout's role may hold (`CONNECTION LIMIT`; the cluster allows 1000), so one test suite can't starve the others |
 | `lazyCowTree.postgres.ramdiskMB` | `4096` | RAM disk size (used as it fills); resizing needs `lazy-cow-tree down --eject`, which empties every database |
 | `lazyCowTree.redis` | `pkgs.redis` | Redis build |
 
@@ -474,6 +478,7 @@ needed), e.g. for services `web` (default), `api` and `worker`:
 | named ports' `env`, `LAZY_COW_TREE_<SERVICE>_<NAME>_PORT`, `_URL` | every service's | every service's |
 | `LAZY_COW_TREE_SERVICE`, `LAZY_COW_TREE_WORKTREE`, `LAZY_COW_TREE_PROJECT` | | |
 | `NODE_EXTRA_CA_CERTS` | the local CA | |
+| `TMPDIR` | unchanged | `/tmp/lazy-cow-tree-<hash>/tmp/`, its own (unix sockets, browser profiles, temp files), deleted with it |
 
 Worktree roles were `<project>-<worktree>` before; the daemon renames an old role to
 the new name on its next start (or, if that name was shared by two checkouts, makes
@@ -554,6 +559,22 @@ left out of the merge; `FORCE_ALLOW_DIRTY_MERGE=1` merges anyway). One with unco
 changes stays (the command to delete them is printed); a
 closed PR's commits that aren't pushed stay as branch `<name>-kept-<sha>`. With
 `-R` it acts only when that is this repository.
+
+Test runs wait for a slot (`lazyCowTree.testSlots`): parallel agents' suites in every
+checkout share N slots, so they don't thrash the CPU into timeouts that look like
+flaky tests. Each program of `testSlots.commands` (`mix`, `cargo`, `npm`, …) is a
+wrapper in the devenv shell: a test run (`mix test …`) prints
+`waiting for a test slot (2 run at once: feat-a: mix test; …)` while all are taken and
+holds one until it exits; anything else, and a test run started by one, runs at once.
+`LAZY_COW_TREE_TEST_SLOTS=N` overrides the count for one command.
+
+A worktree's process that connects to PostgreSQL or Redis as the primary checkout (a
+`.env` copied from the primary, settings naming its database) is refused with what to
+use instead (`$DATABASE_URL`, `$REDIS_URL`): the proxies find the process from its
+TCP connection and check where it runs. Under 10% free on the database disk, idle
+worktree test databases are dropped (test runners create them again); under 5%, new
+clones are refused with the biggest databases named. `lazy-cow-tree status` shows the
+disk and each checkout's database size.
 
 Nothing watches the filesystem: a worktree made or deleted outside the wrapper (plain
 git elsewhere, `rm -rf`) is picked up by the daemon within a minute, and one made by

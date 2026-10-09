@@ -204,7 +204,7 @@ impl Daemon {
 
     pub(super) async fn status(&self) -> Result<Status> {
         let projects: Vec<Arc<ProjectRt>> = self.projects.lock().values().cloned().collect();
-        let dbs = self.pg.databases().await.unwrap_or_default();
+        let dbs = self.pg.sizes().await.unwrap_or_default();
         let mut out = Vec::new();
         for rt in projects {
             let root = rt.project.root.clone();
@@ -235,7 +235,16 @@ impl Daemon {
                 }
                 statuses.push(CheckoutStatus {
                     url: format!("https://{}", c.main_host()),
-                    databases: dbs.iter().filter(|d| c.owns_db(d)).cloned().collect(),
+                    databases: dbs
+                        .iter()
+                        .filter(|(d, _)| c.owns_db(d))
+                        .map(|(d, _)| d.clone())
+                        .collect(),
+                    database_bytes: dbs
+                        .iter()
+                        .filter(|(d, _)| c.owns_db(d))
+                        .map(|(_, b)| *b as u64)
+                        .sum(),
                     services,
                     redis: self.redis.running(&redis_key(&rt.project, &c)),
                     branch,
@@ -259,6 +268,7 @@ impl Daemon {
             pg_port: self.global.pg_port,
             redis_port: self.global.redis_port,
             https_port: self.global.https_port,
+            pg_disk: self.pg.disk(),
         })
     }
 }

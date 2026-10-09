@@ -24,7 +24,8 @@ use crate::{
 mod procs;
 
 pub use self::procs::{
-    MARKER, ancestors, drop_marker, fd_open_on, kill_processes_in, marker_path, processes_left,
+    MARKER, ancestors, drop_marker, fd_open_on, kill_processes_in, marker_path, pid_inside,
+    processes_left, tcp_client_pid,
 };
 
 #[derive(Debug, Clone)]

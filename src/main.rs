@@ -25,6 +25,7 @@ mod proxy;
 mod ramdisk;
 mod redis;
 mod server;
+mod slot;
 mod sync;
 mod tls;
 mod worktree;
@@ -134,6 +135,24 @@ enum Cmd {
     /// Claude Code hooks (JSON on stdin).
     #[command(subcommand)]
     Hook(HookCmd),
+    /// Test slots, for the devenv module's test command wrappers.
+    #[command(subcommand, hide = true)]
+    Slot(SlotCmd),
+}
+
+#[derive(Subcommand)]
+enum SlotCmd {
+    /// Print `<count> <dir>`: the wrapper opens `<dir>/<i>.lock` for i < count.
+    Info,
+    /// Lock one of the inherited slot fds (waiting for one); prints it.
+    Acquire {
+        /// The fds the wrapper opened.
+        #[arg(long, value_delimiter = ',', required = true)]
+        fds: Vec<i32>,
+        /// What runs (shown to those waiting).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -528,6 +547,14 @@ fn print_status(s: &daemon::Status) {
         "daemon {} · postgres 127.0.0.1:{} · redis 127.0.0.1:{} · https :{}",
         s.pid, s.pg_port, s.redis_port, s.https_port
     );
+    if let Some((free, total)) = s.pg_disk {
+        println!(
+            "database disk: {} of {} MB used ({}%)",
+            (total - free) >> 20,
+            total >> 20,
+            100 - free * 100 / total.max(1)
+        );
+    }
     for p in &s.projects {
         println!(
             "\n{} ({}) base {}{}",
@@ -541,11 +568,12 @@ fn print_status(s: &daemon::Status) {
         );
         for c in &p.checkouts {
             println!(
-                "  {:<24} {:<40} {} [{}]{}",
+                "  {:<24} {:<40} {} [{}] {} MB{}",
                 c.checkout.worktree.as_deref().unwrap_or("(primary)"),
                 c.url,
                 c.branch.as_deref().unwrap_or("-"),
                 c.databases.join(", "),
+                c.database_bytes >> 20,
                 if c.redis { " redis" } else { "" },
             );
             if let Some(e) = &c.migrate_error {
@@ -854,6 +882,19 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            Ok(())
+        }
+        Cmd::Slot(SlotCmd::Info) => {
+            println!("{} {}", slot::count(), slot::dir()?.display());
+            Ok(())
+        }
+        Cmd::Slot(SlotCmd::Acquire { fds, command }) => {
+            let here = std::env::var("LAZY_COW_TREE_WORKTREE")
+                .ok()
+                .filter(|w| !w.is_empty())
+                .unwrap_or_else(|| "primary".into());
+            let what = format!("{here}: {}", command.join(" "));
+            println!("{}", slot::acquire(&fds, &what)?);
             Ok(())
         }
         Cmd::Lsp { command } => {

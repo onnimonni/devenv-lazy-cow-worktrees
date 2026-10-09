@@ -281,6 +281,9 @@ pub struct CheckoutStatus {
     pub checkout: Checkout,
     pub url: String,
     pub databases: Vec<String>,
+    /// Their size together.
+    #[serde(default)]
+    pub database_bytes: u64,
     pub services: Vec<ServiceStatus>,
     /// Its redis-server is running.
     pub redis: bool,
@@ -321,6 +324,9 @@ pub struct Status {
     pub pg_port: u16,
     pub redis_port: u16,
     pub https_port: u16,
+    /// (free, total) bytes on the databases' disk (the RAM disk).
+    #[serde(default)]
+    pub pg_disk: Option<(u64, u64)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1042,11 +1048,11 @@ async fn lead(global: Global, project: Option<Project>, listener: UnixListener) 
     });
 
     let weak = Arc::downgrade(&d);
-    let resolve: crate::pgproxy::Resolve = Arc::new(move |user, db| {
+    let resolve: crate::pgproxy::Resolve = Arc::new(move |user, db, client_port| {
         let weak = weak.clone();
         Box::pin(async move {
             match weak.upgrade() {
-                Some(d) => d.resolve_pg(&user, &db).await,
+                Some(d) => d.resolve_pg(&user, &db, client_port).await,
                 None => Ok(()),
             }
         })
@@ -1060,6 +1066,20 @@ async fn lead(global: Global, project: Option<Project>, listener: UnixListener) 
 
     let redis = d.redis.clone();
     let redis_port = global.redis_port;
+    let weak = Arc::downgrade(&d);
+    let _ = redis.check.set(Arc::new(move |id, client_port| {
+        let weak = weak.clone();
+        Box::pin(async move {
+            let d = weak.upgrade()?;
+            let why = d
+                .primary_misused(&id, client_port, d.global.redis_port, "REDIS_URL")
+                .await;
+            if let Some(w) = &why {
+                warn!("{w}");
+            }
+            why
+        })
+    }));
     tokio::spawn(async move {
         if let Err(e) = redis.serve(redis_port).await {
             error!("Redis: {e:#}");

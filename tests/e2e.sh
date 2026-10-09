@@ -97,6 +97,8 @@ admin_psql() { PGUSER=postgres psql -h "$home/pg" -p 55500 -d postgres -tAc "$1"
 g() { git -c user.name=t -c user.email=t@t "$@"; }
 # `lazy-cow-tree shell-hook`'s value of <var> in <dir>.
 env_of() { (cd "$1" && unset LAZY_COW_TREE_SHELL && eval "$("$bin" shell-hook)" && printenv "$2"); }
+# Run in the primary checkout, its shell hook closing the worktree marker this script holds.
+in_primary() { (cd "$work/app" && unset LAZY_COW_TREE_SHELL && eval "$("$bin" shell-hook)" && "$@"); }
 
 cd "$work"
 git init -q --bare -b main origin.git
@@ -154,12 +156,24 @@ for sql in "DROP DATABASE demo_dev" "ALTER ROLE demo SUPERUSER" "COPY (SELECT 1)
 done
 [[ $(admin_psql "select 1 from pg_database where datname = 'demo_dev'") == 1 ]] || fail "primary's database gone"
 pass "worktree role owns its clone, can't touch other checkouts"
+[[ $(admin_psql "select rolconnlimit from pg_roles where rolname = 'demo--feat-a'") == 200 &&
+  $(admin_psql "show max_connections") == 1000 ]] || fail "connection limits not set"
+pass "connection limit per checkout role"
 
 redis-cli --no-auth-warning -u "$REDIS_URL" set k worktree >/dev/null
 primary_redis=$(env_of "$work/app" REDIS_URL)
-[[ -z $(redis-cli --no-auth-warning -u "$primary_redis" get k) ]] || fail "redis not isolated"
+[[ $(in_primary redis-cli --no-auth-warning -u "$primary_redis" get k 2>&1) == "" ]] || fail "redis not isolated"
 [[ $(redis-cli --no-auth-warning -u "$REDIS_URL" get k) == worktree ]] || fail "redis lost the key"
 pass "redis isolated per checkout"
+
+# A worktree's process with the primary's credentials (a copied .env): refused.
+primary_db=$(env_of "$work/app" DATABASE_URL)
+if out=$(cd "$wt" && psql "$primary_db" -tAc "select 1" 2>&1); then fail "worktree process reached the primary's database: $out"; fi
+[[ $out == *"runs in worktree feat-a"*'$DATABASE_URL'* ]] || fail "primary's credentials from a worktree not explained: $out"
+out=$(cd "$wt" && redis-cli --no-auth-warning -u "$primary_redis" get k 2>&1) || true
+[[ $out == *"runs in worktree feat-a"*'$REDIS_URL'* ]] || fail "primary's redis password from a worktree not refused: $out"
+[[ $(in_primary psql "$primary_db" -tAc "select 1") == 1 ]] || fail "primary refused its own database"
+pass "primary's credentials refused from a worktree's processes"
 
 base=$(env_of "$wt" PORT)
 [[ $DEBUGGER_PORT == $((base + 9)) && $TEST_PORT == $((base + 8)) ]] ||
@@ -217,8 +231,37 @@ out=$("$bin" worktree new feat/slash 2>&1) || fail "worktree new feat/slash: $ou
   fail "feat/slash not worktree feat-slash on its branch: $out"
 if out=$("$bin" worktree new feat-slash 2>&1); then fail "feat-slash shared feat/slash's worktree"; fi
 [[ $out == *"branch feat/slash"* ]] || fail "collision not explained: $out"
+tmp=$(env_of "$PWD/.claude/worktrees/feat-slash" TMPDIR)
+[[ $tmp == /tmp/lazy-cow-tree-*/tmp/ && -d $tmp && $(env_of "$PWD" TMPDIR) != "$tmp" ]] ||
+  fail "worktree TMPDIR: $tmp (primary: $(env_of "$PWD" TMPDIR))"
 "$bin" worktree rm --force feat/slash >/dev/null || fail "worktree rm feat/slash"
+[[ ! -d $tmp ]] || fail "worktree TMPDIR $tmp left behind"
 pass "worktree new feat/slash: worktree feat-slash; feat-slash refused"
+
+# A filling RAM disk (macOS: $home/pg is one): under 10% free idle worktree test
+# databases go; under 5% new clones are refused, naming the biggest databases.
+if [[ $(uname -s) == Darwin ]]; then
+  # fill <percent free to leave>
+  fill() {
+    local total free
+    read -r total free < <(df -k "$home/pg" | awk 'NR == 2 { print $2, $4 }')
+    dd if=/dev/zero of="$home/pg/fill$1" bs=1024 count=$((free - total * $1 / 100)) 2>/dev/null || true
+  }
+  [[ $(admin_psql "select 1 from pg_database where datname = 'demo_test_feat_a2'") == 1 ]] || fail "no partition database to drop"
+  fill 8
+  "$bin" worktree new low-x >/dev/null 2>&1 || fail "worktree new on a disk 92% full"
+  [[ -z $(admin_psql "select 1 from pg_database where datname = 'demo_test_feat_a2'") ]] || fail "idle test database not dropped"
+  [[ $(admin_psql "select 1 from pg_database where datname = 'demo_dev_low_x'") == 1 ]] || fail "clone refused on a disk 92% full"
+  fill 4
+  full=$("$bin" worktree new full-x 2>/dev/null | tail -1) || true
+  out=$(cd "$full" && eval "$("$bin" shell-hook)" && psql -tAc "select 1" 2>&1) || true
+  rm -f "$home"/pg/fill*
+  [[ $out == *"database disk"*"full"*"biggest"* ]] || fail "clone on a full disk not refused: $out"
+  [[ $("$bin" status) == *"database disk:"* ]] || fail "status lacks the database disk"
+  "$bin" worktree rm --force full-x >/dev/null
+  "$bin" worktree rm --force low-x >/dev/null
+  pass "filling database disk: idle test databases dropped, then clones refused"
+fi
 
 # The module's gh wrapper over a fake gh: the PR is in FAKE_PR ("<state> <branch>").
 cat >"$home/fake-gh" <<'EOF'
@@ -255,6 +298,32 @@ out=$(gh_wrapper "$PWD" "CLOSED closed-x" pr close closed-x)
 "$bin" worktree rm --force dirty-x >/dev/null
 pass "gh wrapper: merged/closed PR's worktree removed; open or dirty kept, unpushed commits kept; dirty merge refused"
 
+# The module's test slot wrapper over a fake runner logging when each run starts and ends.
+mkdir -p "$home/real" "$home/wrapped"
+cat >"$home/real/faketest" <<EOF
+#!/usr/bin/env bash
+echo "start \$1 \$\$" >>"$home/runs.log"; sleep 1; echo "end \$1 \$\$" >>"$home/runs.log"
+EOF
+chmod +x "$home/real/faketest"
+sed -e "s|@name@|faketest|" -e "s|@lazyCowTree@|$bin|" -e "s|@patterns@|'test'|" \
+  "$src/devenv-module/test-slot.sh" >"$home/wrapped/faketest"
+chmod +x "$home/wrapped/faketest"
+slotted() { PATH="$home/wrapped:$home/real:$PATH" LAZY_COW_TREE_TEST_SLOTS=1 faketest "$@"; }
+slotted test 2>"$work/slot1.err" & a=$!
+sleep 0.3
+slotted test 2>"$work/slot2.err" & b=$!
+slotted other 2>/dev/null
+wait "$a" "$b"
+[[ $(grep -c . "$home/runs.log") == 6 ]] || fail "test runs: $(cat "$home/runs.log")"
+# The two test runs one after the other; `other` didn't wait.
+[[ $(grep -v other "$home/runs.log" | awk '{print $1}' | tr '\n' ' ') == "start end start end " ]] ||
+  fail "test runs overlapped: $(cat "$home/runs.log")"
+[[ $(head -1 "$home/runs.log") == "start test"* && $(sed -n 2p "$home/runs.log") == "start other"* ]] ||
+  fail "non-test run waited: $(cat "$home/runs.log")"
+grep -q "waiting for a test slot (1 run at once: feat-a: faketest test)" "$work/slot2.err" ||
+  fail "no waiting message: $(cat "$work/slot2.err")"
+pass "test slots: test runs wait for each other, other runs don't"
+
 "$bin" worktree new broken >/dev/null 2>&1 || fail "worktree new failed on a failing migration"
 [[ $("$bin" status) == *"migrations failed"* ]] || fail "failed migration not in status"
 out=$(curl_lf "https://broken.web.demo.localhost:8443/" 2>&1) || true
@@ -279,8 +348,12 @@ out=$("$bin" worktree rm --force manual 2>&1) || fail "rm of a fresh worktree fa
 pass "fresh worktree removed without a gitignored-files warning"
 
 port=$(env_of "$wt" PORT)
+feat_tmp=$TMPDIR
 "$bin" worktree rm --force feat-a
 [[ ! -e $wt ]] || fail "worktree still there"
+# Back in the primary: the hook gives this shell its own TMPDIR again.
+eval "$("$bin" shell-hook)"
+[[ ${TMPDIR:-} != "$feat_tmp" ]] || fail "TMPDIR still the removed worktree's: $TMPDIR"
 for p in "$port" "$((port + 9))"; do
   if curl -s --max-time 2 "http://127.0.0.1:$p/" >/dev/null; then fail "its server on $p survived"; fi
 done
