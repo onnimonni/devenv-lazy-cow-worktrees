@@ -5,9 +5,11 @@
 # closed one whose branch has commits that aren't pushed or merged anywhere (`--force`
 # keeps them as `<name>-kept-<sha>`, then removes it). Every other command is the real gh.
 #
-# `gh pr merge` refuses while that worktree has uncommitted changes.
+# `gh pr merge` refuses while the PR has unresolved review conversations, or while that
+# worktree has uncommitted changes.
 #
 #   LAZY_COW_TREE_GH_DISABLE=1  plain gh
+#   FORCE_ALLOW_UNRESOLVED=1    `gh pr merge` even with unresolved review conversations
 #   FORCE_ALLOW_DIRTY_MERGE=1   `gh pr merge` even with uncommitted changes in its worktree
 
 real_gh=@gh@
@@ -35,6 +37,33 @@ for ((i = 0; i < ${#args[@]}; i++)); do
     *) [[ ${#selector[@]} -eq 0 ]] && selector=("$a") ;;
   esac
 done
+
+# Unresolved review conversations: as GitHub's own merge box, any repository. Unknown
+# (offline, not logged in): merged as usual.
+if [[ $2 == merge ]] && ! truthy "${FORCE_ALLOW_UNRESOLVED:-}" &&
+  url=$("$real_gh" pr view "${selector[@]}" ${repo_name:+--repo "$repo_name"} --json url -q .url 2>/dev/null) &&
+  [[ $url == http*://*/*/*/pull/* ]]; then
+  p=${url#*://}
+  host=${p%%/*} p=${p#*/}
+  owner=${p%%/*} p=${p#*/}
+  name=${p%%/*}
+  number=${p##*/}
+  # shellcheck disable=SC2016 # GraphQL variables
+  unresolved=$("$real_gh" api graphql --hostname "$host" -F owner="$owner" -F name="$name" -F number="$number" \
+    -f query='query($owner: String!, $name: String!, $number: Int!) {
+      repository(owner: $owner, name: $name) { pullRequest(number: $number) {
+        reviewThreads(first: 100) { nodes { isResolved path line
+          comments(first: 1) { nodes { author { login } body } } } } } } }' \
+    --jq '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved | not)
+      | "\(.path // "")\(if .line then ":\(.line)" else "" end) \(.comments.nodes[0].author.login // "?"): \((.comments.nodes[0].body // "") | split("\n")[0] | .[0:100])"' \
+    2>/dev/null)
+  if [[ -n $unresolved ]]; then
+    echo "error: a conversation must be resolved before this pull request can be merged ($url):" >&2
+    while IFS= read -r l; do echo "  $l"; done <<<"$unresolved" >&2
+    echo "resolve them on GitHub, or set FORCE_ALLOW_UNRESOLVED=1" >&2
+    exit 1
+  fi
+fi
 
 # Another repository's PR: its branch name says nothing about this one's worktrees.
 if [[ -n $repo_name ]]; then

@@ -265,10 +265,15 @@ if [[ $(uname -s) == Darwin ]]; then
   pass "filling database disk: idle test databases dropped, then clones refused"
 fi
 
-# The module's gh wrapper over a fake gh: the PR is in FAKE_PR ("<state> <branch>").
+# The module's gh wrapper over a fake gh: the PR is in FAKE_PR ("<state> <branch>"), its
+# URL in FAKE_URL, its unresolved review threads (as the wrapper's jq prints them) in
+# FAKE_THREADS.
 cat >"$home/fake-gh" <<'EOF'
 #!/usr/bin/env bash
-[[ "$1 $2" == "pr view" ]] && echo "$FAKE_PR"
+if [[ "$1 $2" == "pr view" ]]; then
+  if [[ " $* " == *" url "* ]]; then echo "${FAKE_URL:-}"; else echo "$FAKE_PR"; fi
+fi
+[[ "$1 $2" == "api graphql" ]] && printf '%s' "${FAKE_THREADS:-}"
 [[ "$1 $2" == "pr merge" ]] && echo merged >>"$(dirname "$0")/gh-merges"
 exit 0
 EOF
@@ -294,11 +299,20 @@ if out=$(gh_wrapper "$dirty" "OPEN dirty-x" pr merge --squash); then fail "merge
   fail "dirty merge not refused before gh: $out"
 out=$(FORCE_ALLOW_DIRTY_MERGE=1 gh_wrapper "$dirty" "OPEN dirty-x" pr merge --squash) ||
   fail "FORCE_ALLOW_DIRTY_MERGE=1 refused: $out"
+# Unresolved review conversations: refused before gh, as GitHub's merge box does.
+export FAKE_URL=https://github.com/o/r/pull/7 FAKE_THREADS="src/a.rs:3 bob: please rename this"
+merges=$(wc -l <"$home/gh-merges")
+if out=$(gh_wrapper "$PWD" "OPEN other" pr merge 7 --squash); then fail "merged with unresolved conversations: $out"; fi
+[[ $out == *"a conversation must be resolved before this pull request can be merged"*"src/a.rs:3 bob: please rename this"* &&
+  $(wc -l <"$home/gh-merges") == "$merges" ]] || fail "unresolved conversations not refused before gh: $out"
+out=$(FORCE_ALLOW_UNRESOLVED=1 gh_wrapper "$PWD" "OPEN other" pr merge 7 --squash) ||
+  fail "FORCE_ALLOW_UNRESOLVED=1 refused: $out"
+unset FAKE_URL FAKE_THREADS
 out=$(gh_wrapper "$PWD" "CLOSED closed-x" pr close closed-x)
 [[ ! -d $closed ]] || fail "closed PR's worktree not removed: $out"
 [[ -n $(git branch --list 'closed-x-kept-*') ]] || fail "closed PR's unpushed commit not kept: $out"
 "$bin" worktree rm --force dirty-x >/dev/null
-pass "gh wrapper: merged/closed PR's worktree removed; open or dirty kept, unpushed commits kept; dirty merge refused"
+pass "gh wrapper: merged/closed PR's worktree removed; open or dirty kept, unpushed commits kept; dirty or unresolved merge refused"
 
 # The module's test slot wrapper over a fake runner logging when each run starts and ends.
 mkdir -p "$home/real" "$home/wrapped"

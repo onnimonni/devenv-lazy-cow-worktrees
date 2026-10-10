@@ -1049,7 +1049,7 @@ in
       gh.enable = mkOption {
         type = types.bool;
         default = true;
-        description = "Replace `gh` in the shell with a wrapper: after `gh pr merge` or `gh pr close` leaves the pull request merged or closed, the worktree with its branch is removed (`lazy-cow-tree worktree rm`; one with uncommitted changes stays), and `gh pr merge` refuses while that worktree has uncommitted changes (`FORCE_ALLOW_DIRTY_MERGE=1` merges anyway). Everything else is the real gh.";
+        description = "Replace `gh` in the shell with a wrapper: after `gh pr merge` or `gh pr close` leaves the pull request merged or closed, the worktree with its branch is removed (`lazy-cow-tree worktree rm`; one with uncommitted changes stays), and `gh pr merge` refuses while the PR has unresolved review conversations (`FORCE_ALLOW_UNRESOLVED=1` merges anyway) or that worktree has uncommitted changes (`FORCE_ALLOW_DIRTY_MERGE=1`). Everything else is the real gh.";
       };
       testSlots = {
         count = mkOption {
