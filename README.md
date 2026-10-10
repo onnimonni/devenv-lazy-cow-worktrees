@@ -559,7 +559,10 @@ apps) ignore it, and daemons that close every fd lose the marker.
 `gh pr close` (a number, URL, branch, or the current branch's PR) leaves the PR merged
 or closed, the worktree with its branch goes right away (`lazy-cow-tree worktree rm`),
 without waiting for the daemon's merged-PR sweep. `gh pr merge --auto` waits for that
-sweep. `gh pr merge` refuses while that worktree has uncommitted changes (they would be
+sweep. `gh pr merge` refuses, before gh, while the PR has unresolved review
+conversations ("a conversation must be resolved before this pull request can be
+merged", listing each; `FORCE_ALLOW_UNRESOLVED=1` merges anyway; unchecked when GitHub
+can't be reached), and while that worktree has uncommitted changes (they would be
 left out of the merge; `FORCE_ALLOW_DIRTY_MERGE=1` merges anyway). One with uncommitted
 changes stays (the command to delete them is printed); a
 closed PR's commits that aren't pushed stay as branch `<name>-kept-<sha>`. With
